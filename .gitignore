@@ -1,0 +1,31 @@
+# Env and secrets
+.env
+.env.local
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+venv/
+.venv/
+
+# Logs and run records
+*.log
+backend/app/log/
+backend/app/.last_sync_run
+
+# Node / frontend (keep in sync with frontend/.gitignore)
+node_modules/
+frontend/dist/
+frontend/dist-ssr/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.sw?
+
+# Docker / local
+.docker/

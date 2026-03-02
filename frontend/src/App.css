@@ -1,0 +1,421 @@
+#root {
+  width: 100%;
+  max-width: 100%;
+  min-height: 100vh;
+  margin: 0;
+  padding: 1.5rem 2rem;
+  box-sizing: border-box;
+  background-color: #ffffff;
+}
+
+.app {
+  text-align: left;
+  width: 100%;
+  max-width: 100%;
+}
+
+.app h1 {
+  margin: 0 0 1rem 0;
+  text-align: left;
+  font-size: 1.75rem;
+  font-weight: 600;
+  color: #111;
+}
+
+.error {
+  color: #e74c3c;
+  margin-bottom: 1rem;
+}
+
+.error .retry-btn {
+  margin-left: 0.75rem;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.9rem;
+  background: #f0f0f0;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.error .retry-btn:hover {
+  background: #e0e0e0;
+}
+
+.empty-hint {
+  color: #666;
+  margin-bottom: 1rem;
+  font-size: 0.95rem;
+}
+
+.form {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.form input {
+  padding: 0.5rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+
+.form button {
+  padding: 0.5rem 1rem;
+  background: #646cff;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.form button:hover {
+  background: #535bf2;
+}
+
+/* 主页面表格：自适应宽度，表头清晰可见 */
+.main-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  margin-top: 0.5rem;
+}
+
+.app table {
+  width: 100%;
+  min-width: 480px;
+  border-collapse: collapse;
+  table-layout: auto;
+}
+
+.app th,
+.app td {
+  border: 1px solid #ddd;
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  background-color: #fff;
+  color: #333;
+}
+
+.app th {
+  background-color: #e8e8e8;
+  color: #1a1a1a;
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.toolbar {
+  margin-bottom: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.table-stats {
+  color: #888;
+  font-size: 0.9rem;
+}
+
+.week-stats {
+  color: #555;
+  font-size: 0.9rem;
+}
+
+.sync-check {
+  margin-bottom: 0.75rem;
+  font-size: 0.85rem;
+  color: #555;
+}
+
+.sync-ok {
+  color: #2ecc71;
+}
+
+.sync-warn {
+  color: #e67e22;
+}
+
+.sync-btn {
+  padding: 0.5rem 1rem;
+  background: #2ecc71;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.sync-btn:hover:not(:disabled) {
+  background: #27ae60;
+}
+
+.sync-btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.view-more-btn {
+  padding: 0.35rem 0.75rem;
+  background: #646cff;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.view-more-btn:hover {
+  background: #535bf2;
+}
+
+.loading-detail {
+  color: #666;
+  margin-top: 0.5rem;
+}
+
+/* Modal：放大尺寸并自适应屏幕 */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 1rem;
+  box-sizing: border-box;
+}
+
+.modal {
+  background: white;
+  border-radius: 8px;
+  width: min(96vw, 1400px);
+  height: min(92vh, 900px);
+  min-width: 320px;
+  min-height: 400px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid #eee;
+  flex-shrink: 0;
+}
+
+.modal-header h2 {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.modal-close {
+  background: none;
+  border: none;
+  font-size: 1.5rem;
+  cursor: pointer;
+  color: #666;
+  line-height: 1;
+  padding: 0 0.25rem;
+}
+
+.modal-close:hover {
+  color: #333;
+}
+
+.modal-body {
+  overflow: auto;
+  flex: 1;
+  min-height: 0;
+  padding: 0 1.25rem 1rem;
+}
+
+.detail-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem 1.5rem;
+  padding: 0.75rem 0;
+  margin-bottom: 0.5rem;
+  border-bottom: 1px solid #eee;
+  color: #333;
+  font-size: 0.95rem;
+}
+
+.detail-summary-item {
+  white-space: nowrap;
+}
+
+.detail-summary-item strong {
+  margin-right: 0.25rem;
+}
+
+.modal .detail-table {
+  margin: 0;
+}
+
+.modal .detail-table th,
+.modal .detail-table td {
+  color: #333;
+  padding: 0.5rem 0.75rem;
+}
+
+/* 出单的子 ASIN 文本高亮（黄色），仅标亮 ASIN 值 */
+.child-asin-with-order {
+  background-color: #fff9c4;
+  padding: 0.15em 0.35em;
+  border-radius: 3px;
+  font-weight: 500;
+}
+
+.cell-search-query {
+  max-width: 400px;
+  word-break: break-word;
+  color: #333;
+  vertical-align: top;
+}
+
+.cell-search-query-text {
+  display: inline;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.read-more-btn {
+  margin-left: 0.35rem;
+  padding: 0 0.25rem;
+  font-size: 0.85rem;
+  color: #646cff;
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.read-more-btn:hover {
+  color: #535bf2;
+}
+
+/* Search query table (图二格式) */
+.cell-search-query-wrap {
+  vertical-align: top;
+  max-width: 420px;
+}
+
+.search-query-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+  color: #333;
+  margin-top: 0.25rem;
+}
+
+.search-query-table th,
+.search-query-table td {
+  border: 1px solid #ddd;
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+}
+
+.search-query-table th {
+  background: #f5f5f5;
+  font-weight: 600;
+}
+
+.search-query-table--compact {
+  font-size: 0.8rem;
+}
+
+.search-query-table--compact th,
+.search-query-table--compact td {
+  padding: 0.2rem 0.35rem;
+}
+
+.zoom-btn {
+  margin-top: 0.35rem;
+  margin-left: 0.5rem;
+  padding: 0.25rem 0.6rem;
+  font-size: 0.85rem;
+  background: #646cff;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.zoom-btn:hover {
+  background: #535bf2;
+}
+
+.load-all-btn {
+  margin-top: 0.35rem;
+  padding: 0.25rem 0.6rem;
+  font-size: 0.85rem;
+  background: #f0f0f0;
+  color: #333;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.load-all-btn:hover {
+  background: #e0e0e0;
+}
+
+.text-muted {
+  color: #888;
+}
+
+/* 放大弹窗 */
+.zoom-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1100;
+}
+
+.zoom-modal {
+  background: white;
+  border-radius: 8px;
+  max-width: 90vw;
+  max-height: 85vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+}
+
+.zoom-modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid #eee;
+  flex-shrink: 0;
+}
+
+.zoom-modal-header h3 {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #333;
+}
+
+.zoom-modal-body {
+  overflow: auto;
+  padding: 1.25rem;
+  font-size: 1rem;
+}
+
+.zoom-modal-body .search-query-table {
+  font-size: 1rem;
+}
+
+.zoom-modal-body .search-query-table th,
+.zoom-modal-body .search-query-table td {
+  padding: 0.5rem 0.75rem;
+}
