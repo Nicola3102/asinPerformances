@@ -20,7 +20,26 @@ def get_db():
         db.close()
 
 
+def _ensure_order_id_column():
+    """若 asin_performances 表缺少 order_id 列则添加（兼容已有表）。"""
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        if engine.dialect.name == "mysql":
+            r = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'asin_performances' AND COLUMN_NAME = 'order_id'"
+                )
+            ).scalar()
+            if r == 0:
+                conn.execute(text("ALTER TABLE asin_performances ADD COLUMN order_id VARCHAR(512) NULL"))
+                conn.execute(text("CREATE INDEX ix_asin_performances_order_id ON asin_performances (order_id)"))
+                conn.commit()
+        # 其他 dialect 可在此扩展
+
+
 def init_db():
     """Create all tables. Called on startup."""
     from app.models import asin_performance  # noqa: F401
     Base.metadata.create_all(bind=engine)
+    _ensure_order_id_column()

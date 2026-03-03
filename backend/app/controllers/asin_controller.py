@@ -207,6 +207,7 @@ def list_detail_by_parent_week(
                 "child_impression_count": r.child_impression_count,
                 "child_session_count": r.child_session_count,
                 "order_num": r.order_num,
+                "order_id": r.order_id,
                 "search_queries": [],
             }
         by_child[key]["search_queries"].append(
@@ -236,6 +237,7 @@ def list_detail_by_parent_week(
                 child_impression_count=group["child_impression_count"],
                 child_session_count=group["child_session_count"],
                 order_num=group.get("order_num"),
+                order_id=group.get("order_id"),
                 search_queries=sorted_queries,
             )
         )

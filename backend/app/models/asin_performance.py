@@ -23,6 +23,7 @@ class AsinPerformance(Base):
     parent_asin_create_at = Column(DateTime, nullable=True)
     parent_order_total = Column(Numeric(20, 2), nullable=True)
     order_num = Column(Integer, nullable=True)
+    order_id = Column(String(512), nullable=True, index=True)  # 子 asin 的订单 id，多个用逗号分隔
     week_no = Column(Integer, nullable=True)  #使用订单表中的utc时间
     child_impression_count = Column(BigInteger, nullable=True)
     child_session_count = Column(BigInteger, nullable=True)

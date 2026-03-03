@@ -11,6 +11,7 @@ class AsinPerformanceBase(BaseModel):
     parent_asin_create_at: Optional[datetime] = None
     parent_order_total: Optional[Decimal] = None
     order_num: Optional[int] = None
+    order_id: Optional[str] = None  # 逗号分隔的订单 id
     week_no: Optional[int] = None
     child_impression_count: Optional[int] = None
     child_session_count: Optional[int] = None
@@ -69,6 +70,7 @@ class DetailChildRow(BaseModel):
     child_impression_count: Optional[int] = None
     child_session_count: Optional[int] = None
     order_num: Optional[int] = None
+    order_id: Optional[str] = None  # 逗号分隔的订单 id
     search_queries: List[SearchQueryRow] = []
 
 
