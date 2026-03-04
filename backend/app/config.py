@@ -1,5 +1,11 @@
+from pathlib import Path
+
 from pydantic import Field
 from pydantic_settings import BaseSettings
+
+# 固定从 backend 目录加载 .env，避免用 -m 从项目根运行时读不到
+_BACKEND_DIR = Path(__file__).resolve().parent.parent
+_ENV_FILE = _BACKEND_DIR / ".env"
 
 
 class Settings(BaseSettings):
@@ -36,7 +42,7 @@ class Settings(BaseSettings):
         )
 
     class Config:
-        env_file = ".env"
+        env_file = str(_ENV_FILE)
         extra = "ignore"
 
 

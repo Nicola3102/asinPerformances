@@ -1,4 +1,7 @@
+import time
+
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 from app.config import settings
@@ -39,7 +42,17 @@ def _ensure_order_id_column():
 
 
 def init_db():
-    """Create all tables. Called on startup."""
+    """Create all tables. Called on startup. Retries if MySQL not ready (e.g. in Docker)."""
     from app.models import asin_performance  # noqa: F401
-    Base.metadata.create_all(bind=engine)
-    _ensure_order_id_column()
+
+    max_attempts = 10
+    for attempt in range(1, max_attempts + 1):
+        try:
+            Base.metadata.create_all(bind=engine)
+            _ensure_order_id_column()
+            return
+        except OperationalError as e:
+            if attempt == max_attempts:
+                raise
+            time.sleep(2)
+            continue
