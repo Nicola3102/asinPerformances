@@ -434,6 +434,133 @@ def _step2_fetch_for_parents(
     return rows_out, parent_qualified_count
 
 
+def _step3_backfill_search_query(local_db: Session, online_engine, batch_size: int = 200) -> tuple:
+    """
+    对表中 search_query 为空的记录，从线上 amazon_search_data 查询并回填。
+    返回 (rows_inserted, rows_updated, rows_backfilled)。
+    """
+    # 查询表中 search_query 为空的 (child_asin, store_id, week_no)，并取该组第一条的父信息、order、impression/session
+    placeholders_q = (
+        local_db.query(
+            AsinPerformance.child_asin,
+            AsinPerformance.store_id,
+            AsinPerformance.week_no,
+            AsinPerformance.parent_asin,
+            AsinPerformance.parent_asin_create_at,
+            AsinPerformance.parent_order_total,
+            AsinPerformance.order_num,
+            AsinPerformance.order_id,
+            AsinPerformance.child_impression_count,
+            AsinPerformance.child_session_count,
+        )
+        .filter(
+            or_(AsinPerformance.search_query.is_(None), AsinPerformance.search_query == ""),
+            AsinPerformance.child_asin.isnot(None),
+            AsinPerformance.child_asin != "",
+        )
+        .distinct()
+        .all()
+    )
+    if not placeholders_q:
+        return 0, 0, 0
+
+    # 按 (child_asin, store_id, week_no) 去重，保留第一条（含父信息）
+    seen = set()
+    placeholders = []
+    for r in placeholders_q:
+        key = (r[0], r[1], r[2])
+        if key in seen:
+            continue
+        seen.add(key)
+        placeholders.append(r)
+
+    rows_out = []
+    for i in range(0, len(placeholders), batch_size):
+        batch = placeholders[i : i + batch_size]
+        placeholders_sql = ", ".join([f"(:a{j}, :s{j}, :w{j})" for j in range(len(batch))])
+        params_t = {}
+        for j, r in enumerate(batch):
+            params_t[f"a{j}"] = r[0]
+            params_t[f"s{j}"] = r[1]
+            params_t[f"w{j}"] = r[2]
+        try:
+            with online_engine.connect() as conn:
+                sda_rows = conn.execute(
+                    text(
+                        "SELECT asin, store_id, week_no, search_query, search_query_volume, impression_count, purchase_count, "
+                        "total_impression_count, click_count, total_click_count "
+                        f"FROM amazon_search_data WHERE (asin, store_id, week_no) IN ({placeholders_sql})"
+                    ),
+                    params_t,
+                ).fetchall()
+        except Exception as e:
+            logger.warning("Step 3 amazon_search_data query failed: %s", e)
+            continue
+
+        def _wk_key(a, s, w):
+            return (a, s, str(w) if w is not None else w)
+
+        sda_by_key = defaultdict(list)
+        for r in sda_rows:
+            extra = (r[7], r[8], r[9]) if len(r) >= 10 else (None, None, None)
+            sda_by_key[_wk_key(r[0], r[1], r[2])].append((r[3], r[4], r[5], r[6], extra[0], extra[1], extra[2]))
+
+        for r in batch:
+            child_asin, store_id, week_no, parent_asin, parent_asin_create_at, parent_order_total, order_num, order_id, imp, sess = (
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]
+            )
+            wk_key = _wk_key(child_asin, store_id, week_no)
+            list_sdata = sda_by_key.get(wk_key, [])
+            if not list_sdata:
+                continue
+            try:
+                week_no_int = int(week_no) if week_no is not None else None
+            except (TypeError, ValueError):
+                week_no_int = week_no
+            try:
+                order_val = int(order_num) if order_num is not None else 0
+            except (TypeError, ValueError):
+                order_val = int(float(order_num)) if order_num is not None else 0
+            try:
+                pot_float = float(parent_order_total) if parent_order_total is not None else None
+            except (TypeError, ValueError):
+                pot_float = None
+            order_ids_str = (order_id or "").strip() or None
+            for sdata in list_sdata:
+                sq, sqv, sqi, sqp = sdata[0], sdata[1], sdata[2], sdata[3]
+                total_imp = sdata[4] if len(sdata) > 4 else None
+                click_cnt = sdata[5] if len(sdata) > 5 else None
+                total_click = sdata[6] if len(sdata) > 6 else None
+                if sq is None or (isinstance(sq, str) and not sq.strip()):
+                    continue
+                row = (
+                    child_asin,
+                    store_id,
+                    parent_asin,
+                    parent_asin_create_at,
+                    pot_float,
+                    order_val,
+                    order_ids_str,
+                    week_no_int,
+                    imp,
+                    sess,
+                    sq,
+                    sqv,
+                    sqi,
+                    sqp,
+                    total_imp,
+                    click_cnt,
+                    total_click,
+                )
+                rows_out.append(row)
+
+    if not rows_out:
+        return 0, 0, 0
+    progress_interval = max(1, len(rows_out) // 10)
+    ins, upd = _upsert_batch(local_db, rows_out, "step3_backfill", progress_interval)
+    return ins, upd, len(rows_out)
+
+
 def _normalize_search_query(v):
     """统一 search_query 格式以便去重：strip 空白，空串视为 None。"""
     if v is None:
@@ -560,19 +687,116 @@ _METRIC_FIELDS_TO_MERGE = (
     "search_query_total_click",
 )
 
+# 用于比对「线上一条」与「表中已有行」是否数据内容完全一致（一致则跳过更新）
+_CONTENT_COMPARE_FIELDS = (
+    "parent_asin_create_at",
+    "parent_order_total",
+    "order_num",
+    "order_id",
+    "child_impression_count",
+    "child_session_count",
+    "search_query",
+    "search_query_volume",
+    "search_query_impression_count",
+    "search_query_purchase_count",
+    "search_query_total_impression",
+    "search_query_click_count",
+    "search_query_total_click",
+)
+
+
+def _normalize_value_for_compare(v):
+    """比对时统一格式：None/空串一致，数值与 Decimal 可比较。"""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        s = v.strip()
+        return s if s else None
+    if hasattr(v, "__float__"):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return v
+    return v
+
+
+def _row_content_equal(d: dict, existing: AsinPerformance) -> bool:
+    """判断 incoming 字典 d 与表中已有行 existing 在 _CONTENT_COMPARE_FIELDS 上是否一致（一致则跳过更新）。"""
+    for k in _CONTENT_COMPARE_FIELDS:
+        inc = _normalize_value_for_compare(d.get(k))
+        cur = _normalize_value_for_compare(getattr(existing, k, None))
+        if inc != cur:
+            return False
+    return True
+
+
+def _has_search_query_data(orm_rows: list) -> bool:
+    """判断表中该组是否已有非空 search_query 的记录（有则按条比对/更新，无则删占位后按条插入）。"""
+    for row in orm_rows:
+        sq = getattr(row, "search_query", None)
+        if sq is not None and isinstance(sq, str) and sq.strip():
+            return True
+    return False
+
 
 def _upsert_batch(local_db: Session, rows: list, table_name: str, progress_interval: int) -> tuple:
     """
     按 (store_id, parent_asin, child_asin, week_no, search_query) 去重；同一子 asin 多条 search_query 会保留多条，一条 search_query 一条记录。
-    使用 order_id 判断是否已写入：同组内合并 order_id（逗号分隔），仅对新增的 order_id 累加 order_num；同组所有记录的 order_id/order_num 一致。
-    更新时对指标类字段做补全：若表中原字段无数据而本次从 online_db 取到有数据，则写入/更新；若本次为空则保留表中原值。
-    Step2 的 order_num=0 不覆盖已有 order_id/order_num。
+    search_query 逻辑：若线上该 asin 有多条 search_query，
+      - 库里该组无 search_query 数据（仅 NULL 占位）：删掉占位记录，按条插入线上数据；
+      - 库里该组已有 search_query 数据：按条比对条数与内容，相同则跳过，不同则补缺或按线上数据更新。
+    使用 order_id 判断是否已写入：同组内合并 order_id；更新时对指标类字段做补全。
     """
     key_to_row = {_upsert_key(_row_to_dict(r)): r for r in rows}
     original_count = len(rows)
     rows = list(key_to_row.values())
     if len(rows) < original_count:
         logger.info("Upsert batch deduped: %s -> %s rows by (store_id, parent_asin, child_asin, week_no, search_query)", original_count, len(rows))
+
+    # 本批中「有非空 search_query」的 (store_id, parent_asin, child_asin, week_no) 组
+    groups_with_incoming_search = set()
+    for r in rows:
+        d = _row_to_dict(r)
+        sq = d.get("search_query")
+        if sq is not None and isinstance(sq, str) and sq.strip():
+            groups_with_incoming_search.add((d.get("store_id"), d.get("parent_asin"), d.get("child_asin"), d.get("week_no")))
+
+    # 若库里该组无 search_query 数据（仅 NULL 占位），则删掉占位记录，后续按条插入；若库里已有 search_query 数据则不删，后续按条比对/更新
+    deleted_placeholders = 0
+    for gkey in groups_with_incoming_search:
+        sid, pa, ca, wn = gkey
+        existing_rows = (
+            local_db.query(AsinPerformance)
+            .filter(
+                AsinPerformance.store_id == sid,
+                AsinPerformance.parent_asin == pa,
+                AsinPerformance.child_asin == ca,
+                AsinPerformance.week_no == wn,
+            )
+            .all()
+        )
+        if not existing_rows:
+            continue
+        if not _has_search_query_data(existing_rows):
+            n = (
+                local_db.query(AsinPerformance)
+                .filter(
+                    AsinPerformance.store_id == sid,
+                    AsinPerformance.parent_asin == pa,
+                    AsinPerformance.child_asin == ca,
+                    AsinPerformance.week_no == wn,
+                    or_(AsinPerformance.search_query.is_(None), AsinPerformance.search_query == ""),
+                )
+                .delete(synchronize_session=False)
+            )
+            deleted_placeholders += n
+    if deleted_placeholders:
+        local_db.flush()
+        logger.info(
+            "Upsert %s: deleted %s placeholder row(s) (empty search_query) for groups that now have search_query data from online",
+            table_name,
+            deleted_placeholders,
+        )
 
     # 按 (store_id, parent_asin, child_asin, week_no) 预计算合并后的 order_id 与 order_num（与库中已有合并、仅新 id 累加）
     group_key_to_order = {}
@@ -628,6 +852,12 @@ def _upsert_batch(local_db: Session, rows: list, table_name: str, progress_inter
             q = q.filter(AsinPerformance.search_query == sq)
         existing = q.first()
         if existing:
+            # 若本行带非空 search_query：比对内容；相同则跳过，不同则按线上更新
+            if sq is not None and isinstance(sq, str) and sq.strip():
+                if _row_content_equal(d, existing):
+                    if progress_interval and ((i + 1) % progress_interval == 0 or (i + 1) == total):
+                        logger.info("Upsert %s: %s / %s (inserted=%s, updated=%s)", table_name, i + 1, total, rows_inserted, rows_updated)
+                    continue
             if incoming_order > 0:
                 existing.order_num = d["order_num"]
                 existing.order_id = d.get("order_id")
@@ -724,8 +954,8 @@ def sync_from_online_db() -> dict:
 
     init_db()
 
-    # date_start_str, date_end_str = _get_sync_date_range()
-    date_start_str, date_end_str = "2026-03-01", "2026-03-02"
+    date_start_str, date_end_str = _get_sync_date_range()
+    # date_start_str, date_end_str = "2026-03-01", "2026-03-02"
     logger.info("Sync date range: date_start=%s, date_end=%s", date_start_str, date_end_str)
 
     # week_no 以 date_end 减 1 天为参考日，保证 02-21～02-22 写入 202607（02-15～02-21 所在周）
@@ -896,6 +1126,17 @@ def sync_from_online_db() -> dict:
             step2_error = str(e)
             logger.warning("Step 2 failed: %s; 仅保留 Step 1 数据。", step2_error)
         local_db.commit()
+
+        # 第三步：对表中 search_query 为空的记录，从线上 amazon_search_data 回填
+        try:
+            ins3, upd3, backfill_count = _step3_backfill_search_query(local_db, online_engine, batch_size=200)
+            if backfill_count > 0:
+                total_inserted += ins3
+                total_updated += upd3
+                local_db.commit()
+                logger.info("Step 3 backfill: %s rows from amazon_search_data, inserted=%s, updated=%s", backfill_count, ins3, upd3)
+        except Exception as e:
+            logger.warning("Step 3 backfill failed: %s", e)
 
         local_count = local_db.query(AsinPerformance).count()
         insert_ok = (total_inserted + total_updated) == total_fetched
