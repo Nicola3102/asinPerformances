@@ -119,6 +119,24 @@ export async function listSummary(): Promise<SummaryRow[]> {
   return res.json()
 }
 
+export async function listSummaryByWeek(week_no: number): Promise<SummaryRow[]> {
+  const res = await fetch(`${API_BASE}/asin-performances/summary?week_no=${encodeURIComponent(String(week_no))}`)
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(parseErrorResponse(text, res.status) || 'Failed to fetch summary')
+  }
+  return res.json()
+}
+
+export async function listWeeks(): Promise<number[]> {
+  const res = await fetch(`${API_BASE}/asin-performances/weeks`)
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(parseErrorResponse(text, res.status) || 'Failed to fetch weeks')
+  }
+  return res.json()
+}
+
 export async function getSummaryStats(): Promise<SummaryStatsResponse> {
   const res = await fetch(`${API_BASE}/asin-performances/summary-stats`)
   if (!res.ok) {
@@ -134,6 +152,23 @@ export async function getDetail(parent_asin: string, week_no: number, store_id?:
   const res = await fetch(`${API_BASE}/asin-performances/detail?${params}`);
   if (!res.ok) throw new Error('Failed to fetch detail');
   return res.json();
+}
+
+export async function downloadWeekData(week_no: number): Promise<void> {
+  const res = await fetch(`${API_BASE}/asin-performances/export?week_no=${encodeURIComponent(String(week_no))}`)
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(parseErrorResponse(text, res.status) || 'Failed to export data')
+  }
+  const blob = await res.blob()
+  const url = window.URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `asin_performances_week_${week_no}.csv`
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  window.URL.revokeObjectURL(url)
 }
 
 export interface SyncCheck {

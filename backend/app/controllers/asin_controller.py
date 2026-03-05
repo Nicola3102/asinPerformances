@@ -1,11 +1,15 @@
+import csv
 import logging
+from io import StringIO
 from decimal import Decimal
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import create_engine, func, text
 
+from app.config import settings
 from app.database import get_db
 from app.models import AsinPerformance
 from app.views import (
@@ -22,6 +26,74 @@ from app.views import (
 
 router = APIRouter(prefix="/api/asin-performances", tags=["asin-performances"])
 logger = logging.getLogger(__name__)
+
+
+def _fetch_listing_meta_for_export(rows: list[AsinPerformance]) -> dict:
+    """
+    通过 (child_asin, store_id) 从 online 库补齐 pid/title/search_term。
+    返回 key=(child_asin, store_id) -> {"pid": ..., "title": ..., "search_term": ...}
+    """
+    key_pairs = {
+        (r.child_asin, int(r.store_id))
+        for r in rows
+        if r.child_asin and r.store_id is not None
+    }
+    if not key_pairs or not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
+        return {}
+
+    store_ids = sorted({sid for _, sid in key_pairs})
+    asins = sorted({asin for asin, _ in key_pairs})
+    if not store_ids or not asins:
+        return {}
+
+    # 兼容不同环境中表名/字段名差异
+    table_candidates = [
+        ("ai_generated_amazon_listings", "search_terms"),
+    ]
+    connect_args = {"connect_timeout": 15, "read_timeout": 60, "write_timeout": 60}
+    online_engine = create_engine(settings.online_database_url, pool_pre_ping=True, connect_args=connect_args)
+    try:
+        for agal_table, search_col in table_candidates:
+            meta_map = {}
+            try:
+                with online_engine.connect() as conn:
+                    store_ph = ", ".join([f":s{i}" for i in range(len(store_ids))])
+                    store_params = {f"s{i}": sid for i, sid in enumerate(store_ids)}
+                    batch_size = 300
+                    for i in range(0, len(asins), batch_size):
+                        asin_batch = asins[i:i + batch_size]
+                        asin_ph = ", ".join([f":a{j}" for j in range(len(asin_batch))])
+                        params = dict(store_params)
+                        for j, asin in enumerate(asin_batch):
+                            params[f"a{j}"] = asin
+                        q = text(
+                            f"SELECT al.asin, al.store_id, MIN(al.pid) AS pid, "
+                            f"MAX(agal.title) AS title, MAX(agal.{search_col}) AS search_term "
+                            f"FROM amazon_listing al "
+                            f"LEFT JOIN {agal_table} agal ON al.pid = agal.id "
+                            f"WHERE al.store_id IN ({store_ph}) AND al.asin IN ({asin_ph}) "
+                            f"GROUP BY al.asin, al.store_id"
+                        )
+                        result = conn.execute(q, params).fetchall()
+                        for r in result:
+                            key = (r[0], int(r[1]) if r[1] is not None else None)
+                            if key[0] is None or key[1] is None:
+                                continue
+                            meta_map[key] = {
+                                "pid": r[2],
+                                "title": r[3],
+                                "search_term": r[4],
+                            }
+                return meta_map
+            except Exception as e:
+                logger.warning("Export listing meta query failed with %s.%s: %s", agal_table, search_col, e)
+                continue
+    finally:
+        try:
+            online_engine.dispose()
+        except Exception:
+            pass
+    return {}
 
 
 @router.get("/stats")
@@ -104,12 +176,34 @@ def list_asin_performances(
     return items
 
 
+@router.get("/weeks", response_model=List[int])
+def list_weeks(db: Session = Depends(get_db)):
+    """返回表中存在的 week_no（降序，去重，过滤空值）。"""
+    rows = (
+        db.query(AsinPerformance.week_no)
+        .filter(AsinPerformance.week_no.isnot(None))
+        .distinct()
+        .order_by(AsinPerformance.week_no.desc())
+        .all()
+    )
+    out: List[int] = []
+    for r in rows:
+        try:
+            out.append(int(r[0]))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 @router.get("/summary", response_model=List[SummaryRow])
-def list_summary(db: Session = Depends(get_db)):
-    """按 parent_asin + week_no + store_id 去重，仅返回最新一周且有订单的父 ASIN。"""
+def list_summary(
+    week_no: Optional[int] = Query(None, description="Week number, default latest week"),
+    db: Session = Depends(get_db),
+):
+    """按 parent_asin + week_no + store_id 去重，返回指定周（默认最新一周）且有订单的父 ASIN。"""
     try:
-        latest_week = db.query(func.max(AsinPerformance.week_no)).scalar()
-        if latest_week is None:
+        selected_week = week_no if week_no is not None else db.query(func.max(AsinPerformance.week_no)).scalar()
+        if selected_week is None:
             return []
         sub = (
             db.query(
@@ -122,7 +216,7 @@ def list_summary(db: Session = Depends(get_db)):
             .filter(
                 AsinPerformance.parent_asin.isnot(None),
                 AsinPerformance.parent_asin != "",
-                AsinPerformance.week_no == latest_week,
+                AsinPerformance.week_no == selected_week,
             )
             .group_by(AsinPerformance.parent_asin, AsinPerformance.week_no, AsinPerformance.store_id)
             .having(func.max(AsinPerformance.parent_order_total) > 0)
@@ -172,6 +266,82 @@ def list_summary(db: Session = Depends(get_db)):
     except Exception as e:
         logger.exception("Summary query failed: %s", e)
         raise HTTPException(status_code=500, detail=f"查询 summary 失败: {e!s}")
+
+
+@router.get("/export")
+def export_week_data(
+    week_no: int = Query(..., description="Week number"),
+    db: Session = Depends(get_db),
+):
+    """下载指定 week_no 的 asin_performances 全量数据（CSV）。"""
+    rows = (
+        db.query(AsinPerformance)
+        .filter(AsinPerformance.week_no == week_no)
+        .order_by(AsinPerformance.parent_asin, AsinPerformance.child_asin, AsinPerformance.store_id, AsinPerformance.id)
+        .all()
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"week_no={week_no} 无可导出数据")
+
+    headers = [
+        "id",
+        "store_id",
+        "parent_asin",
+        "child_asin",
+        "pid",
+        "search_term",
+        "title",
+        "parent_asin_create_at",
+        "parent_order_total",
+        "order_num",
+        "order_id",
+        "week_no",
+        "child_impression_count",
+        "child_session_count",
+        "search_query",
+        "search_query_volume",
+        "search_query_impression_count",
+        "search_query_purchase_count",
+        "search_query_total_impression",
+        "search_query_click_count",
+        "search_query_total_click",
+    ]
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(headers)
+    meta_map = _fetch_listing_meta_for_export(rows)
+    for r in rows:
+        meta = meta_map.get((r.child_asin, int(r.store_id) if r.store_id is not None else None), {})
+        writer.writerow([
+            r.id,
+            r.store_id,
+            r.parent_asin,
+            r.child_asin,
+            meta.get("pid"),
+            meta.get("search_term"),
+            meta.get("title"),
+            r.parent_asin_create_at.isoformat() if r.parent_asin_create_at else None,
+            r.parent_order_total,
+            r.order_num,
+            r.order_id,
+            r.week_no,
+            r.child_impression_count,
+            r.child_session_count,
+            r.search_query,
+            r.search_query_volume,
+            r.search_query_impression_count,
+            r.search_query_purchase_count,
+            r.search_query_total_impression,
+            r.search_query_click_count,
+            r.search_query_total_click,
+        ])
+    output.seek(0)
+    filename = f"asin_performances_week_{week_no}.csv"
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/detail", response_model=DetailResponse)

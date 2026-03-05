@@ -1,15 +1,15 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
-  listSummary,
+  listSummaryByWeek,
+  listWeeks,
   getDetail,
   getTableStats,
-  getSummaryStats,
+  downloadWeekData,
   syncFromOnline,
   type SummaryRow,
   type DetailResponse,
   type DetailChildRow,
   type SearchQueryRow,
-  type WeekStatsRow,
 } from './api/client'
 import './App.css'
 
@@ -198,10 +198,12 @@ function DetailModal({
 
 function App() {
   const [summary, setSummary] = useState<SummaryRow[]>([])
+  const [availableWeeks, setAvailableWeeks] = useState<number[]>([])
+  const [selectedWeek, setSelectedWeek] = useState<number | ''>('')
   const [tableCount, setTableCount] = useState<number | null>(null)
-  const [weekStats, setWeekStats] = useState<WeekStatsRow[]>([])
   const [loading, setLoading] = useState(true)
   const [syncing, setSyncing] = useState(false)
+  const [downloading, setDownloading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [detail, setDetail] = useState<DetailResponse | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
@@ -214,8 +216,19 @@ function App() {
     step2_error?: string | null
     message?: string | null
   } | null>(null)
+  const selectedWeekStats = useMemo(() => {
+    const totalOrders = summary.reduce((acc, row) => {
+      const n = Number(row.parent_order_total)
+      return Number.isNaN(n) ? acc : acc + n
+    }, 0)
+    return {
+      week_no: selectedWeek,
+      parent_asin_count: summary.length,
+      total_orders: totalOrders,
+    }
+  }, [summary, selectedWeek])
 
-  const loadSummary = async () => {
+  const loadSummary = async (weekOverride?: number | '') => {
     setLoading(true)
     setError(null)
     const timeoutMs = 15000
@@ -224,22 +237,45 @@ function App() {
       timeoutId = setTimeout(() => reject(new Error('请求超时，请确认后端已启动（如 docker compose up）')), timeoutMs)
     })
     try {
-      const [summaryData, stats, summaryStats] = await Promise.race([
-        Promise.all([listSummary(), getTableStats(), getSummaryStats()]),
+      const [weeksData, stats] = await Promise.race([
+        Promise.all([listWeeks(), getTableStats()]),
         timeoutPromise,
-      ]) as [Awaited<ReturnType<typeof listSummary>>, Awaited<ReturnType<typeof getTableStats>>, Awaited<ReturnType<typeof getSummaryStats>>]
+      ]) as [Awaited<ReturnType<typeof listWeeks>>, Awaited<ReturnType<typeof getTableStats>>]
       clearTimeout(timeoutId!)
+      const fallbackWeek = weeksData.length > 0 ? weeksData[0] : ''
+      const effectiveWeek = weekOverride !== undefined ? weekOverride : (selectedWeek !== '' ? selectedWeek : fallbackWeek)
+      const summaryData = typeof effectiveWeek === 'number' ? await listSummaryByWeek(effectiveWeek) : []
+      setAvailableWeeks(weeksData)
+      setSelectedWeek(effectiveWeek)
       setSummary(summaryData)
       setTableCount(stats.count)
-      setWeekStats(summaryStats.by_week ?? [])
     } catch (e) {
       clearTimeout(timeoutId!)
       setError(e instanceof Error ? e.message : 'Failed to load')
       setSummary([])
+      setAvailableWeeks([])
+      setSelectedWeek('')
       setTableCount(null)
-      setWeekStats([])
     } finally {
       setLoading(false)
+    }
+  }
+
+  const handleWeekChange = async (v: string) => {
+    const nextWeek = v ? Number(v) : ''
+    setSelectedWeek(nextWeek)
+    await loadSummary(nextWeek)
+  }
+
+  const handleDownload = async () => {
+    if (typeof selectedWeek !== 'number') return
+    setDownloading(true)
+    try {
+      await downloadWeekData(selectedWeek)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Download failed')
+    } finally {
+      setDownloading(false)
     }
   }
 
@@ -313,17 +349,38 @@ function App() {
         >
           {syncing ? 'Syncing...' : 'Sync from online DB'}
         </button>
+        <label className="week-filter">
+          week_no:
+          <select
+            value={selectedWeek === '' ? '' : String(selectedWeek)}
+            onChange={(e) => { void handleWeekChange(e.target.value) }}
+            disabled={loading || syncing}
+          >
+            {availableWeeks.length === 0 ? (
+              <option value="">暂无 week_no</option>
+            ) : (
+              availableWeeks.map((w) => (
+                <option key={w} value={String(w)}>
+                  {w}
+                </option>
+              ))
+            )}
+          </select>
+        </label>
+        <button
+          type="button"
+          className="download-btn"
+          onClick={() => { void handleDownload() }}
+          disabled={downloading || typeof selectedWeek !== 'number'}
+        >
+          {downloading ? 'Downloading...' : 'Download'}
+        </button>
         {tableCount !== null && (
           <span className="table-stats">数据表 asin_performances 共 {tableCount} 条</span>
         )}
-        {weekStats.length > 0 && (
+        {typeof selectedWeekStats.week_no === 'number' && (
           <span className="week-stats">
-            {weekStats.map((w, i) => (
-              <span key={w.week_no ?? i}>
-                {i > 0 && ' · '}
-                week_no: {formatNum(w.week_no)} | 父 ASIN 共 {formatNum(w.parent_asin_count)} 个 | 总订单 {formatParentOrderTotal(w.total_orders)} 笔
-              </span>
-            ))}
+            week_no: {formatNum(selectedWeekStats.week_no)} | 父 ASIN 共 {formatNum(selectedWeekStats.parent_asin_count)} 个 | 总订单 {formatParentOrderTotal(selectedWeekStats.total_orders)} 笔
           </span>
         )}
       </div>
