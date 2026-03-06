@@ -1,10 +1,12 @@
 import csv
 import logging
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from decimal import Decimal
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import create_engine, func, text
@@ -212,6 +214,8 @@ def list_summary(
                 AsinPerformance.store_id,
                 func.max(AsinPerformance.parent_order_total).label("parent_order_total"),
                 func.max(AsinPerformance.parent_asin_create_at).label("parent_asin_create_at"),
+                func.max(AsinPerformance.operation_status).label("operation_status"),
+                func.max(AsinPerformance.operated_at).label("operated_at"),
             )
             .filter(
                 AsinPerformance.parent_asin.isnot(None),
@@ -230,6 +234,8 @@ def list_summary(
                 sub.c.parent_order_total,
                 sub.c.week_no,
                 sub.c.store_id,
+                sub.c.operation_status,
+                sub.c.operated_at,
             )
             .all()
         )
@@ -253,6 +259,9 @@ def list_summary(
                     parent_order_total = Decimal(str(parent_order_total))
                 except Exception:
                     parent_order_total = None
+            op_status = r[5]
+            if op_status is not None and not isinstance(op_status, bool):
+                op_status = bool(int(op_status)) if op_status is not None else False
             out.append(
                 SummaryRow(
                     parent_asin=r[0] if r[0] is not None else None,
@@ -260,6 +269,8 @@ def list_summary(
                     parent_order_total=parent_order_total,
                     week_no=week_no,
                     store_id=store_id,
+                    operation_status=op_status,
+                    operated_at=r[6],
                 )
             )
         return out
@@ -268,18 +279,60 @@ def list_summary(
         raise HTTPException(status_code=500, detail=f"查询 summary 失败: {e!s}")
 
 
+class OperateBody(BaseModel):
+    parent_asin: str
+    week_no: int | str
+
+
+@router.post("/operate")
+def operate_by_parent_week(
+    body: OperateBody,
+    db: Session = Depends(get_db),
+):
+    """按 parent_asin 和 week_no 将符合条件的所有记录的 operation_status 置为 True，operated_at 置为当前时间。"""
+    parent_asin = (body.parent_asin or "").strip()
+    if parent_asin == "":
+        raise HTTPException(status_code=400, detail="parent_asin 不能为空")
+    # 接口兼容 "202609" / "202,609" 两种格式
+    week_raw = str(body.week_no).strip().replace(",", "")
+    if not week_raw.isdigit():
+        raise HTTPException(status_code=400, detail="week_no 格式不合法")
+    week_no = int(week_raw)
+    # 存储为 UTC+8（Asia/Shanghai）本地时间
+    now = datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None)
+    n = (
+        db.query(AsinPerformance)
+        .filter(
+            func.trim(AsinPerformance.parent_asin) == parent_asin,
+            AsinPerformance.week_no == week_no,
+        )
+        .update(
+            {"operation_status": True, "operated_at": now},
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    return {"updated": n, "parent_asin": parent_asin, "week_no": week_no, "operated_at": now.isoformat()}
+
+
 @router.get("/export")
 def export_week_data(
     week_no: int = Query(..., description="Week number"),
+    parent_asins: Optional[List[str]] = Query(None, description="Optional parent ASIN filters"),
     db: Session = Depends(get_db),
 ):
     """下载指定 week_no 的 asin_performances 全量数据（CSV）。"""
-    rows = (
-        db.query(AsinPerformance)
-        .filter(AsinPerformance.week_no == week_no)
-        .order_by(AsinPerformance.parent_asin, AsinPerformance.child_asin, AsinPerformance.store_id, AsinPerformance.id)
-        .all()
-    )
+    q = db.query(AsinPerformance).filter(AsinPerformance.week_no == week_no)
+    if parent_asins:
+        normalized = [x.strip() for x in parent_asins if x and x.strip()]
+        if normalized:
+            q = q.filter(AsinPerformance.parent_asin.in_(normalized))
+    rows = q.order_by(
+        AsinPerformance.parent_asin,
+        AsinPerformance.child_asin,
+        AsinPerformance.store_id,
+        AsinPerformance.id,
+    ).all()
     if not rows:
         raise HTTPException(status_code=404, detail=f"week_no={week_no} 无可导出数据")
 

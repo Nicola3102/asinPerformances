@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, BigInteger, Numeric, DateTime, UniqueConstraint
+from sqlalchemy import Boolean, Column, Integer, String, BigInteger, Numeric, DateTime, UniqueConstraint
 
 from app.database import Base
 
@@ -34,3 +34,5 @@ class AsinPerformance(Base):
     search_query_total_impression = Column(BigInteger, nullable=True)
     search_query_click_count = Column(BigInteger, nullable=True)
     search_query_total_click = Column(BigInteger, nullable=True)
+    operation_status = Column(Boolean, default=False, nullable=False, server_default="0")
+    operated_at = Column(DateTime, nullable=True)

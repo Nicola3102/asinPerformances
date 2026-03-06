@@ -5,6 +5,7 @@ import {
   getDetail,
   getTableStats,
   downloadWeekData,
+  operateSummary,
   syncFromOnline,
   type SummaryRow,
   type DetailResponse,
@@ -200,10 +201,12 @@ function App() {
   const [summary, setSummary] = useState<SummaryRow[]>([])
   const [availableWeeks, setAvailableWeeks] = useState<number[]>([])
   const [selectedWeek, setSelectedWeek] = useState<number | ''>('')
+  const [selectedParentAsins, setSelectedParentAsins] = useState<Set<string>>(new Set())
   const [tableCount, setTableCount] = useState<number | null>(null)
   const [loading, setLoading] = useState(true)
   const [syncing, setSyncing] = useState(false)
   const [downloading, setDownloading] = useState(false)
+  const [operatingKey, setOperatingKey] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [detail, setDetail] = useState<DetailResponse | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
@@ -245,6 +248,14 @@ function App() {
       const fallbackWeek = weeksData.length > 0 ? weeksData[0] : ''
       const effectiveWeek = weekOverride !== undefined ? weekOverride : (selectedWeek !== '' ? selectedWeek : fallbackWeek)
       const summaryData = typeof effectiveWeek === 'number' ? await listSummaryByWeek(effectiveWeek) : []
+      const asinSet = new Set(summaryData.map((r) => (r.parent_asin || '').trim()).filter((x) => x !== ''))
+      setSelectedParentAsins((prev) => {
+        const next = new Set<string>()
+        for (const asin of prev) {
+          if (asinSet.has(asin)) next.add(asin)
+        }
+        return next
+      })
       setAvailableWeeks(weeksData)
       setSelectedWeek(effectiveWeek)
       setSummary(summaryData)
@@ -253,6 +264,7 @@ function App() {
       clearTimeout(timeoutId!)
       setError(e instanceof Error ? e.message : 'Failed to load')
       setSummary([])
+      setSelectedParentAsins(new Set())
       setAvailableWeeks([])
       setSelectedWeek('')
       setTableCount(null)
@@ -271,11 +283,50 @@ function App() {
     if (typeof selectedWeek !== 'number') return
     setDownloading(true)
     try {
-      await downloadWeekData(selectedWeek)
+      const selected = Array.from(selectedParentAsins)
+      await downloadWeekData(selectedWeek, selected.length > 0 ? selected : undefined)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Download failed')
     } finally {
       setDownloading(false)
+    }
+  }
+
+  const toggleParentAsin = (asin: string | null) => {
+    const key = (asin || '').trim()
+    if (!key) return
+    setSelectedParentAsins((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  const handleSelectAll = () => {
+    const all = summary.map((r) => (r.parent_asin || '').trim()).filter((x) => x !== '')
+    setSelectedParentAsins(new Set(all))
+  }
+
+  const handleClearAll = () => {
+    setSelectedParentAsins(new Set())
+  }
+
+  const handleOperate = async (parent_asin: string | null, week_no: number | null) => {
+    if (parent_asin == null || week_no == null) return
+    const key = `${parent_asin}-${week_no}`
+    setOperatingKey(key)
+    setError(null)
+    try {
+      const res = await operateSummary(parent_asin, week_no)
+      if (!res.updated || res.updated <= 0) {
+        setError(`未匹配到可更新记录（parent_asin=${parent_asin}, week_no=${week_no}）`)
+      }
+      await loadSummary(selectedWeek)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '操作失败')
+    } finally {
+      setOperatingKey(null)
     }
   }
 
@@ -375,9 +426,26 @@ function App() {
         >
           {downloading ? 'Downloading...' : 'Download'}
         </button>
-        {tableCount !== null && (
+        <button
+          type="button"
+          className="select-btn"
+          onClick={handleSelectAll}
+          disabled={summary.length === 0}
+        >
+          全选
+        </button>
+        <button
+          type="button"
+          className="select-btn"
+          onClick={handleClearAll}
+          disabled={selectedParentAsins.size === 0}
+        >
+          取消全选
+        </button>
+        <span className="table-stats">已选父 ASIN {selectedParentAsins.size} 个</span>
+        {/* {tableCount !== null && (
           <span className="table-stats">数据表 asin_performances 共 {tableCount} 条</span>
-        )}
+        )} */}
         {typeof selectedWeekStats.week_no === 'number' && (
           <span className="week-stats">
             week_no: {formatNum(selectedWeekStats.week_no)} | 父 ASIN 共 {formatNum(selectedWeekStats.parent_asin_count)} 个 | 总订单 {formatParentOrderTotal(selectedWeekStats.total_orders)} 笔
@@ -410,31 +478,56 @@ function App() {
           <table>
             <thead>
               <tr>
+                <th></th>
                 <th>Parent ASIN</th>
                 <th>Parent ASIN Create At</th>
                 <th>Parent Order Total</th>
                 <th>store_id</th>
+                <th>operation_status</th>
                 <th></th>
               </tr>
             </thead>
             <tbody>
-              {summary.map((row, i) => (
-                <tr key={`${row.parent_asin}-${row.week_no}-${row.store_id ?? ''}-${i}`}>
-                  <td>{row.parent_asin ?? '-'}</td>
-                  <td>{row.parent_asin_create_at != null ? String(row.parent_asin_create_at).slice(0, 19) : '–'}</td>
-                  <td>{formatParentOrderTotal(row.parent_order_total)}</td>
-                  <td>{formatNum(row.store_id)}</td>
-                  <td>
-                    <button
-                      type="button"
-                      className="view-more-btn"
-                      onClick={() => handleViewMore(row.parent_asin, row.week_no, row.store_id)}
-                    >
-                      View more
-                    </button>
-                  </td>
-                </tr>
-              ))}
+              {summary.map((row, i) => {
+                const opDone = row.operation_status === true || (row.operated_at != null && row.operated_at !== '')
+                const opKey = `${row.parent_asin}-${row.week_no}`
+                const isOperating = operatingKey === opKey
+                return (
+                  <tr key={`${row.parent_asin}-${row.week_no}-${row.store_id ?? ''}-${i}`}>
+                    <td>
+                      <input
+                        type="checkbox"
+                        checked={selectedParentAsins.has((row.parent_asin || '').trim())}
+                        onChange={() => toggleParentAsin(row.parent_asin)}
+                      />
+                    </td>
+                    <td>{row.parent_asin ?? '-'}</td>
+                    <td>{row.parent_asin_create_at != null ? String(row.parent_asin_create_at).slice(0, 19) : '–'}</td>
+                    <td>{formatParentOrderTotal(row.parent_order_total)}</td>
+                    <td>{formatNum(row.store_id)}</td>
+                    <td>
+                      <button
+                        type="button"
+                        className={opDone ? 'operate-btn operate-btn--done' : 'operate-btn'}
+                        onClick={() => { void handleOperate(row.parent_asin, row.week_no) }}
+                        disabled={isOperating}
+                        title={opDone ? (row.operated_at ? `已操作于 ${String(row.operated_at).slice(0, 19)}` : '已操作') : '点击将该父 ASIN 在本周下的记录标记为已操作'}
+                      >
+                        {isOperating ? '处理中...' : (opDone ? '已操作' : '操作')}
+                      </button>
+                    </td>
+                    <td>
+                      <button
+                        type="button"
+                        className="view-more-btn"
+                        onClick={() => handleViewMore(row.parent_asin, row.week_no, row.store_id)}
+                      >
+                        View more
+                      </button>
+                    </td>
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
         </div>

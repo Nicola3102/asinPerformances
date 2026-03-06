@@ -186,6 +186,24 @@
   cursor: not-allowed;
 }
 
+.select-btn {
+  padding: 0.4rem 0.8rem;
+  background: #f0f0f0;
+  color: #333;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.select-btn:hover:not(:disabled) {
+  background: #e6e6e6;
+}
+
+.select-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .view-more-btn {
   padding: 0.35rem 0.75rem;
   background: #646cff;
@@ -197,6 +215,34 @@
 
 .view-more-btn:hover {
   background: #535bf2;
+}
+
+.operate-btn {
+  padding: 0.35rem 0.75rem;
+  background: #95a5a6;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.operate-btn:hover:not(:disabled) {
+  background: #7f8c8d;
+}
+
+.operate-btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.operate-btn--done {
+  background: #27ae60;
+  cursor: default;
+}
+
+.operate-btn--done:hover:not(:disabled) {
+  background: #27ae60;
 }
 
 .loading-detail {

@@ -41,6 +41,27 @@ def _ensure_order_id_column():
         # 其他 dialect 可在此扩展
 
 
+def _ensure_operation_columns():
+    """若 asin_performances 表缺少 operation_status / operated_at 列则添加（兼容已有表）。"""
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        if engine.dialect.name == "mysql":
+            for col, ddl in [
+                ("operation_status", "ALTER TABLE asin_performances ADD COLUMN operation_status TINYINT(1) NOT NULL DEFAULT 0"),
+                ("operated_at", "ALTER TABLE asin_performances ADD COLUMN operated_at DATETIME NULL"),
+            ]:
+                r = conn.execute(
+                    text(
+                        "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'asin_performances' AND COLUMN_NAME = :col"
+                    ),
+                    {"col": col},
+                ).scalar()
+                if r == 0:
+                    conn.execute(text(ddl))
+                    conn.commit()
+
+
 def init_db():
     """Create all tables. Called on startup. Retries if MySQL not ready (e.g. in Docker)."""
     from app.models import asin_performance  # noqa: F401
@@ -50,6 +71,7 @@ def init_db():
         try:
             Base.metadata.create_all(bind=engine)
             _ensure_order_id_column()
+            _ensure_operation_columns()
             return
         except OperationalError as e:
             if attempt == max_attempts:

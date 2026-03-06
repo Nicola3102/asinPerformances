@@ -43,6 +43,8 @@ class SummaryRow(BaseModel):
     parent_order_total: Optional[Decimal] = None
     week_no: Optional[int] = None
     store_id: Optional[int] = None
+    operation_status: Optional[bool] = False
+    operated_at: Optional[datetime] = None
 
 
 class WeekStatsRow(BaseModel):

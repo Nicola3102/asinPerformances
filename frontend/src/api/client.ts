@@ -35,6 +35,8 @@ export interface SummaryRow {
   parent_order_total: string | number | null;
   week_no: number | null;
   store_id: number | null;
+  operation_status?: boolean | null;
+  operated_at?: string | null;
 }
 
 export interface SearchQueryRow {
@@ -154,8 +156,15 @@ export async function getDetail(parent_asin: string, week_no: number, store_id?:
   return res.json();
 }
 
-export async function downloadWeekData(week_no: number): Promise<void> {
-  const res = await fetch(`${API_BASE}/asin-performances/export?week_no=${encodeURIComponent(String(week_no))}`)
+export async function downloadWeekData(week_no: number, parentAsins?: string[]): Promise<void> {
+  const params = new URLSearchParams({ week_no: String(week_no) })
+  if (parentAsins && parentAsins.length > 0) {
+    for (const asin of parentAsins) {
+      const v = (asin || '').trim()
+      if (v) params.append('parent_asins', v)
+    }
+  }
+  const res = await fetch(`${API_BASE}/asin-performances/export?${params.toString()}`)
   if (!res.ok) {
     const text = await res.text()
     throw new Error(parseErrorResponse(text, res.status) || 'Failed to export data')
@@ -169,6 +178,19 @@ export async function downloadWeekData(week_no: number): Promise<void> {
   a.click()
   a.remove()
   window.URL.revokeObjectURL(url)
+}
+
+export async function operateSummary(parent_asin: string, week_no: number): Promise<{ updated: number }> {
+  const res = await fetch(`${API_BASE}/asin-performances/operate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ parent_asin, week_no }),
+  })
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(parseErrorResponse(text, res.status) || '操作失败')
+  }
+  return res.json()
 }
 
 export interface SyncCheck {
