@@ -1,4 +1,5 @@
 import logging
+import threading
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -80,11 +81,12 @@ async def lifespan(app: FastAPI):
             now = now_asia()
             if is_even_hour(now) and should_run_scheduled_sync():
                 logger.info(
-                    "Scheduled sync: current hour %s is even (Asia/Shanghai), no run yet this hour — running once now.",
+                    "Scheduled sync: current hour %s is even (Asia/Shanghai), no run yet this hour — running once in background.",
                     now.hour,
                 )
                 try:
-                    _run_scheduled_sync()
+                    t = threading.Thread(target=_run_scheduled_sync, daemon=True)
+                    t.start()
                 except Exception as e:
                     logger.exception("Startup sync failed: %s", e)
             logger.info(

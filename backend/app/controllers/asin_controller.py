@@ -216,6 +216,8 @@ def list_summary(
                 func.max(AsinPerformance.parent_asin_create_at).label("parent_asin_create_at"),
                 func.max(AsinPerformance.operation_status).label("operation_status"),
                 func.max(AsinPerformance.operated_at).label("operated_at"),
+                func.max(AsinPerformance.checked_status).label("checked_status"),
+                func.max(AsinPerformance.checked_at).label("checked_at"),
             )
             .filter(
                 AsinPerformance.parent_asin.isnot(None),
@@ -236,6 +238,8 @@ def list_summary(
                 sub.c.store_id,
                 sub.c.operation_status,
                 sub.c.operated_at,
+                sub.c.checked_status,
+                sub.c.checked_at,
             )
             .all()
         )
@@ -271,6 +275,8 @@ def list_summary(
                     store_id=store_id,
                     operation_status=op_status,
                     operated_at=r[6],
+                    checked_status=r[7],
+                    checked_at=r[8],
                 )
             )
         return out
@@ -313,6 +319,141 @@ def operate_by_parent_week(
     )
     db.commit()
     return {"updated": n, "parent_asin": parent_asin, "week_no": week_no, "operated_at": now.isoformat()}
+
+
+class RefreshQueryStatusBody(BaseModel):
+    week_no: int | str
+
+
+@router.post("/query-status/refresh")
+def refresh_query_status(
+    body: RefreshQueryStatusBody,
+    db: Session = Depends(get_db),
+):
+    """
+    轮询查询状态：
+    - 针对指定 week_no 下各 (parent_asin, store_id)；
+    - 仅检查该父 ASIN 下 impression>0 的子 ASIN；
+    - 若子 ASIN 在 online.amazon_search 中状态全部为 3，则标记 completed；
+    - completed 的父 ASIN 后续跳过；
+    - 未 completed 的父 ASIN 每 8 分钟最多检查一次。
+    """
+    week_raw = str(body.week_no).strip().replace(",", "")
+    if not week_raw.isdigit():
+        raise HTTPException(status_code=400, detail="week_no 格式不合法")
+    week_no = int(week_raw)
+
+    if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
+        raise HTTPException(status_code=400, detail="online_db 配置缺失，无法刷新查询状态")
+
+    now = datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None)
+    threshold = now - timedelta(minutes=8)
+
+    groups = (
+        db.query(
+            AsinPerformance.parent_asin,
+            AsinPerformance.store_id,
+            func.max(AsinPerformance.checked_status).label("checked_status"),
+            func.max(AsinPerformance.checked_at).label("checked_at"),
+        )
+        .filter(
+            AsinPerformance.week_no == week_no,
+            AsinPerformance.parent_asin.isnot(None),
+            AsinPerformance.parent_asin != "",
+        )
+        .group_by(AsinPerformance.parent_asin, AsinPerformance.store_id)
+        .all()
+    )
+
+    connect_args = {"connect_timeout": 20, "read_timeout": 60, "write_timeout": 60}
+    online_engine = create_engine(settings.online_database_url, pool_pre_ping=True, connect_args=connect_args)
+    checked_groups = 0
+    completed_groups = 0
+    skipped_completed = 0
+    skipped_by_interval = 0
+    try:
+        with online_engine.connect() as conn:
+            for pa, sid, q_status, checked_at in groups:
+                if str(q_status or "").lower() == "completed":
+                    skipped_completed += 1
+                    continue
+                if checked_at is not None and checked_at > threshold:
+                    skipped_by_interval += 1
+                    continue
+
+                child_rows = (
+                    db.query(AsinPerformance.child_asin)
+                    .filter(
+                        AsinPerformance.week_no == week_no,
+                        AsinPerformance.parent_asin == pa,
+                        AsinPerformance.store_id == sid,
+                        AsinPerformance.child_impression_count > 0,
+                        AsinPerformance.child_asin.isnot(None),
+                        AsinPerformance.child_asin != "",
+                    )
+                    .distinct()
+                    .all()
+                )
+                child_asins = [r[0] for r in child_rows if r[0]]
+                if not child_asins:
+                    # 无 impression 子 ASIN，保持 pending，只记录检查时间
+                    db.query(AsinPerformance).filter(
+                        AsinPerformance.week_no == week_no,
+                        AsinPerformance.parent_asin == pa,
+                        AsinPerformance.store_id == sid,
+                    ).update(
+                        {"checked_status": "pending", "checked_at": now},
+                        synchronize_session=False,
+                    )
+                    checked_groups += 1
+                    continue
+
+                status_map = {}
+                batch_size = 200
+                for i in range(0, len(child_asins), batch_size):
+                    batch = child_asins[i:i + batch_size]
+                    asin_ph = ", ".join([f":a{j}" for j in range(len(batch))])
+                    params = {"sid": sid, "week_no": str(week_no)}
+                    for j, asin in enumerate(batch):
+                        params[f"a{j}"] = asin
+                    rows = conn.execute(
+                        text(
+                            f"SELECT asin, status FROM amazon_search "
+                            f"WHERE store_id = :sid AND week_no = :week_no AND asin IN ({asin_ph})"
+                        ),
+                        params,
+                    ).fetchall()
+                    for r in rows:
+                        status_map[str(r[0])] = r[1]
+
+                done = all((asin in status_map and int(status_map[asin]) == 3) for asin in child_asins)
+                new_status = "completed" if done else "pending"
+                db.query(AsinPerformance).filter(
+                    AsinPerformance.week_no == week_no,
+                    AsinPerformance.parent_asin == pa,
+                    AsinPerformance.store_id == sid,
+                ).update(
+                    {"checked_status": new_status, "checked_at": now},
+                    synchronize_session=False,
+                )
+                checked_groups += 1
+                if done:
+                    completed_groups += 1
+        db.commit()
+    finally:
+        try:
+            online_engine.dispose()
+        except Exception:
+            pass
+
+    return {
+        "week_no": week_no,
+        "checked_groups": checked_groups,
+        "completed_groups": completed_groups,
+        "skipped_completed": skipped_completed,
+        "skipped_by_interval": skipped_by_interval,
+        "checked_at": now.isoformat(),
+    }
 
 
 @router.get("/export")

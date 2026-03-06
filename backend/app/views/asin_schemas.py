@@ -45,6 +45,8 @@ class SummaryRow(BaseModel):
     store_id: Optional[int] = None
     operation_status: Optional[bool] = False
     operated_at: Optional[datetime] = None
+    checked_status: Optional[str] = None
+    checked_at: Optional[datetime] = None
 
 
 class WeekStatsRow(BaseModel):

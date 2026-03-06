@@ -6,6 +6,7 @@ import {
   getTableStats,
   downloadWeekData,
   operateSummary,
+  refreshQueryStatus,
   syncFromOnline,
   type SummaryRow,
   type DetailResponse,
@@ -207,6 +208,7 @@ function App() {
   const [syncing, setSyncing] = useState(false)
   const [downloading, setDownloading] = useState(false)
   const [operatingKey, setOperatingKey] = useState<string | null>(null)
+  const [refreshingQueryStatus, setRefreshingQueryStatus] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [detail, setDetail] = useState<DetailResponse | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
@@ -283,7 +285,7 @@ function App() {
     if (typeof selectedWeek !== 'number') return
     setDownloading(true)
     try {
-      const selected = Array.from(selectedParentAsins)
+      const selected: string[] = Array.from(selectedParentAsins)
       await downloadWeekData(selectedWeek, selected.length > 0 ? selected : undefined)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Download failed')
@@ -312,6 +314,22 @@ function App() {
     setSelectedParentAsins(new Set())
   }
 
+  const triggerRefreshQueryStatus = async (week: number) => {
+    setRefreshingQueryStatus(true)
+    try {
+      const out = await refreshQueryStatus(week)
+      if ((out.checked_groups ?? 0) > 0 || (out.completed_groups ?? 0) > 0) {
+        const fresh = await listSummaryByWeek(week)
+        setSummary(fresh)
+      }
+    } catch (e) {
+      // 不打断主流程，状态刷新失败仅轻量提示
+      setError((prev) => prev ?? (e instanceof Error ? e.message : '状态刷新失败'))
+    } finally {
+      setRefreshingQueryStatus(false)
+    }
+  }
+
   const handleOperate = async (parent_asin: string | null, week_no: number | null) => {
     if (parent_asin == null || week_no == null) return
     const key = `${parent_asin}-${week_no}`
@@ -333,6 +351,15 @@ function App() {
   useEffect(() => {
     loadSummary()
   }, [])
+
+  useEffect(() => {
+    if (typeof selectedWeek !== 'number') return
+    void triggerRefreshQueryStatus(selectedWeek)
+    const timer = setInterval(() => {
+      void triggerRefreshQueryStatus(selectedWeek)
+    }, 60000)
+    return () => clearInterval(timer)
+  }, [selectedWeek])
 
   const handleSync = async () => {
     setSyncing(true)
@@ -451,6 +478,9 @@ function App() {
             week_no: {formatNum(selectedWeekStats.week_no)} | 父 ASIN 共 {formatNum(selectedWeekStats.parent_asin_count)} 个 | 总订单 {formatParentOrderTotal(selectedWeekStats.total_orders)} 笔
           </span>
         )}
+        {refreshingQueryStatus && (
+          <span className="week-stats">checked_status 刷新中...</span>
+        )}
       </div>
       {lastSyncCheck && (
         <div className="sync-check">
@@ -484,6 +514,7 @@ function App() {
                 <th>Parent Order Total</th>
                 <th>store_id</th>
                 <th>operation_status</th>
+                <th>checked_status</th>
                 <th></th>
               </tr>
             </thead>
@@ -515,6 +546,11 @@ function App() {
                       >
                         {isOperating ? '处理中...' : (opDone ? '已操作' : '操作')}
                       </button>
+                    </td>
+                    <td>
+                      <span className={row.checked_status === 'completed' ? 'query-status query-status--completed' : 'query-status query-status--pending'}>
+                        {row.checked_status === 'completed' ? 'completed' : 'pending'}
+                      </span>
                     </td>
                     <td>
                       <button

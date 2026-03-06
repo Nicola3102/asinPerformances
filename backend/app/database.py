@@ -42,13 +42,15 @@ def _ensure_order_id_column():
 
 
 def _ensure_operation_columns():
-    """若 asin_performances 表缺少 operation_status / operated_at 列则添加（兼容已有表）。"""
+    """若 asin_performances 表缺少 operation_status / operated_at / query_* 列则添加（兼容已有表）。"""
     from sqlalchemy import text
     with engine.connect() as conn:
         if engine.dialect.name == "mysql":
             for col, ddl in [
                 ("operation_status", "ALTER TABLE asin_performances ADD COLUMN operation_status TINYINT(1) NOT NULL DEFAULT 0"),
                 ("operated_at", "ALTER TABLE asin_performances ADD COLUMN operated_at DATETIME NULL"),
+                ("checked_status", "ALTER TABLE asin_performances ADD COLUMN checked_status VARCHAR(32) NOT NULL DEFAULT 'pending'"),
+                ("checked_at", "ALTER TABLE asin_performances ADD COLUMN checked_at DATETIME NULL"),
             ]:
                 r = conn.execute(
                     text(

@@ -36,3 +36,5 @@ class AsinPerformance(Base):
     search_query_total_click = Column(BigInteger, nullable=True)
     operation_status = Column(Boolean, default=False, nullable=False, server_default="0")
     operated_at = Column(DateTime, nullable=True)
+    checked_status = Column(String(32), default="pending", nullable=False, server_default="pending")
+    checked_at = Column(DateTime, nullable=True)

@@ -37,6 +37,8 @@ export interface SummaryRow {
   store_id: number | null;
   operation_status?: boolean | null;
   operated_at?: string | null;
+  checked_status?: string | null;
+  checked_at?: string | null;
 }
 
 export interface SearchQueryRow {
@@ -189,6 +191,24 @@ export async function operateSummary(parent_asin: string, week_no: number): Prom
   if (!res.ok) {
     const text = await res.text()
     throw new Error(parseErrorResponse(text, res.status) || '操作失败')
+  }
+  return res.json()
+}
+
+export async function refreshQueryStatus(week_no: number): Promise<{
+  checked_groups: number
+  completed_groups: number
+  skipped_completed: number
+  skipped_by_interval: number
+}> {
+  const res = await fetch(`${API_BASE}/asin-performances/query-status/refresh`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ week_no }),
+  })
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(parseErrorResponse(text, res.status) || '状态刷新失败')
   }
   return res.json()
 }
