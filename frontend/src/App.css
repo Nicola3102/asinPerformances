@@ -3,7 +3,7 @@
   max-width: 100%;
   min-height: 100vh;
   margin: 0;
-  padding: 1.5rem 2rem;
+  padding: 0;
   box-sizing: border-box;
   background-color: #ffffff;
 }
@@ -20,6 +20,82 @@
   font-size: 1.75rem;
   font-weight: 600;
   color: #111;
+}
+
+.app-shell {
+  width: 100%;
+}
+
+.app-shell-content {
+  width: 100%;
+  padding: 1.5rem 2rem;
+  box-sizing: border-box;
+}
+
+.top-nav {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin: 0;
+  padding: 0.65rem 2rem;
+  border: none;
+  border-radius: 0;
+  background: #2563eb;
+}
+
+.top-nav-link {
+  color: #ffffff;
+  text-decoration: none;
+  font-size: 0.95rem;
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+}
+
+.top-nav-link.is-active,
+.top-nav-link:hover {
+  background: rgba(255, 255, 255, 0.18);
+  color: #ffffff;
+}
+
+.top-nav-group {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.top-nav-group-toggle {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.top-nav-menu {
+  position: absolute;
+  top: calc(100% + 0.2rem);
+  left: 0;
+  min-width: 120px;
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  display: none;
+  z-index: 50;
+}
+
+.top-nav-menu.is-open {
+  display: block;
+}
+
+.top-nav-menu-link {
+  display: block;
+  padding: 0.5rem 0.7rem;
+  color: #1f2937;
+  text-decoration: none;
+}
+
+.top-nav-menu-link:hover {
+  background: #f4f6ff;
+  color: #3f51b5;
 }
 
 .error {

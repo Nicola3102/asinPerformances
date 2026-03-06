@@ -3,14 +3,18 @@ import time
 from sqlalchemy import create_engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.pool import NullPool
 
 from app.config import settings
 
-engine = create_engine(
-    settings.database_url,
-    pool_pre_ping=True,
-    echo=False,
-)
+_engine_kwargs = {
+    "pool_pre_ping": True,
+    "echo": False,
+    # 使用 NullPool 避免 QueuePool 在高并发轮询场景下被打满
+    "poolclass": NullPool,
+}
+
+engine = create_engine(settings.database_url, **_engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 

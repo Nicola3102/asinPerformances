@@ -1,5 +1,6 @@
 import csv
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from decimal import Decimal
@@ -28,6 +29,7 @@ from app.views import (
 
 router = APIRouter(prefix="/api/asin-performances", tags=["asin-performances"])
 logger = logging.getLogger(__name__)
+_query_refresh_lock = threading.Lock()
 
 
 def _fetch_listing_meta_for_export(rows: list[AsinPerformance]) -> dict:
@@ -365,12 +367,23 @@ def refresh_query_status(
         .all()
     )
 
-    connect_args = {"connect_timeout": 20, "read_timeout": 60, "write_timeout": 60}
-    online_engine = create_engine(settings.online_database_url, pool_pre_ping=True, connect_args=connect_args)
     checked_groups = 0
     completed_groups = 0
     skipped_completed = 0
     skipped_by_interval = 0
+    lock_acquired = _query_refresh_lock.acquire(blocking=False)
+    if not lock_acquired:
+        return {
+            "week_no": week_no,
+            "checked_groups": 0,
+            "completed_groups": 0,
+            "skipped_completed": 0,
+            "skipped_by_interval": 0,
+            "checked_at": now.isoformat(),
+            "message": "refresh already running, skip this request",
+        }
+    connect_args = {"connect_timeout": 20, "read_timeout": 60, "write_timeout": 60}
+    online_engine = create_engine(settings.online_database_url, pool_pre_ping=True, connect_args=connect_args)
     try:
         with online_engine.connect() as conn:
             for pa, sid, q_status, checked_at in groups:
@@ -445,6 +458,8 @@ def refresh_query_status(
             online_engine.dispose()
         except Exception:
             pass
+        if lock_acquired:
+            _query_refresh_lock.release()
 
     return {
         "week_no": week_no,

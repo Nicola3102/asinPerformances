@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { NavLink, Navigate, Outlet, Route, Routes } from 'react-router-dom'
 import {
   listSummaryByWeek,
   listWeeks,
@@ -198,7 +199,7 @@ function DetailModal({
   )
 }
 
-function App() {
+function AsinHomePage() {
   const [summary, setSummary] = useState<SummaryRow[]>([])
   const [availableWeeks, setAvailableWeeks] = useState<number[]>([])
   const [selectedWeek, setSelectedWeek] = useState<number | ''>('')
@@ -209,6 +210,7 @@ function App() {
   const [downloading, setDownloading] = useState(false)
   const [operatingKey, setOperatingKey] = useState<string | null>(null)
   const [refreshingQueryStatus, setRefreshingQueryStatus] = useState(false)
+  const queryRefreshInFlightRef = useRef(false)
   const [error, setError] = useState<string | null>(null)
   const [detail, setDetail] = useState<DetailResponse | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
@@ -315,6 +317,8 @@ function App() {
   }
 
   const triggerRefreshQueryStatus = async (week: number) => {
+    if (queryRefreshInFlightRef.current) return
+    queryRefreshInFlightRef.current = true
     setRefreshingQueryStatus(true)
     try {
       const out = await refreshQueryStatus(week)
@@ -327,6 +331,7 @@ function App() {
       setError((prev) => prev ?? (e instanceof Error ? e.message : '状态刷新失败'))
     } finally {
       setRefreshingQueryStatus(false)
+      queryRefreshInFlightRef.current = false
     }
   }
 
@@ -357,7 +362,7 @@ function App() {
     void triggerRefreshQueryStatus(selectedWeek)
     const timer = setInterval(() => {
       void triggerRefreshQueryStatus(selectedWeek)
-    }, 60000)
+    }, 120000)
     return () => clearInterval(timer)
   }, [selectedWeek])
 
@@ -470,9 +475,7 @@ function App() {
           取消全选
         </button>
         <span className="table-stats">已选父 ASIN {selectedParentAsins.size} 个</span>
-        {/* {tableCount !== null && (
-          <span className="table-stats">数据表 asin_performances 共 {tableCount} 条</span>
-        )} */}
+        
         {typeof selectedWeekStats.week_no === 'number' && (
           <span className="week-stats">
             week_no: {formatNum(selectedWeekStats.week_no)} | 父 ASIN 共 {formatNum(selectedWeekStats.parent_asin_count)} 个 | 总订单 {formatParentOrderTotal(selectedWeekStats.total_orders)} 笔
@@ -575,4 +578,70 @@ function App() {
   )
 }
 
-export default App
+function PagePlaceholder({ title }: { title: string }) {
+  return (
+    <div className="app">
+      <h1>{title}</h1>
+      <p className="empty-hint">This page is ready.</p>
+    </div>
+  )
+}
+
+function AppLayout() {
+  const [groupOpen, setGroupOpen] = useState(false)
+  const groupRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    const onDocMouseDown = (e: MouseEvent) => {
+      if (!groupRef.current) return
+      if (!groupRef.current.contains(e.target as Node)) {
+        setGroupOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', onDocMouseDown)
+    return () => document.removeEventListener('mousedown', onDocMouseDown)
+  }, [])
+
+  return (
+    <div className="app-shell">
+      <nav className="top-nav">
+        <div className="top-nav-group" ref={groupRef}>
+          <button
+            type="button"
+            className={`top-nav-link top-nav-group-toggle ${groupOpen ? 'is-active' : ''}`}
+            onClick={() => setGroupOpen((v) => !v)}
+          >
+            Group
+          </button>
+          <div className={`top-nav-menu ${groupOpen ? 'is-open' : ''}`}>
+            <NavLink to="/" className="top-nav-menu-link" onClick={() => setGroupOpen(false)}>S</NavLink>
+            <NavLink to="/group/A" className="top-nav-menu-link" onClick={() => setGroupOpen(false)}>A</NavLink>
+            <NavLink to="/group/B" className="top-nav-menu-link" onClick={() => setGroupOpen(false)}>B</NavLink>
+            <NavLink to="/group/F" className="top-nav-menu-link" onClick={() => setGroupOpen(false)}>F</NavLink>
+          </div>
+        </div>
+        <NavLink to="/tasks" className={({ isActive }) => `top-nav-link ${isActive ? 'is-active' : ''}`}>
+          Tasks
+        </NavLink>
+      </nav>
+      <div className="app-shell-content">
+        <Outlet />
+      </div>
+    </div>
+  )
+}
+
+export default function App() {
+  return (
+    <Routes>
+      <Route element={<AppLayout />}>
+        <Route path="/" element={<AsinHomePage />} />
+        <Route path="/group/A" element={<PagePlaceholder title="Group A" />} />
+        <Route path="/group/B" element={<PagePlaceholder title="Group B" />} />
+        <Route path="/group/F" element={<PagePlaceholder title="Group F" />} />
+        <Route path="/grpup/A" element={<Navigate to="/group/A" replace />} />
+        <Route path="/tasks" element={<PagePlaceholder title="Tasks" />} />
+      </Route>
+    </Routes>
+  )
+}
