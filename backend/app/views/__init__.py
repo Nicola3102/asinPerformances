@@ -8,6 +8,8 @@ from app.views.asin_schemas import (
     SearchQueryRow,
     DetailChildRow,
     DetailResponse,
+    GroupFRow,
+    GroupFResponse,
 )
 
 __all__ = [
@@ -20,4 +22,6 @@ __all__ = [
     "SearchQueryRow",
     "DetailChildRow",
     "DetailResponse",
+    "GroupFRow",
+    "GroupFResponse",
 ]

@@ -7,10 +7,10 @@ from sqlalchemy.pool import NullPool
 
 from app.config import settings
 
+# 本地库：保持 NullPool，不建立连接池
 _engine_kwargs = {
     "pool_pre_ping": True,
     "echo": False,
-    # 使用 NullPool 避免 QueuePool 在高并发轮询场景下被打满
     "poolclass": NullPool,
 }
 

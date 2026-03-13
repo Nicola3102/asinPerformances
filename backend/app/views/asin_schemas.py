@@ -83,3 +83,19 @@ class DetailResponse(BaseModel):
     parent_order_total: Optional[Decimal] = None
     week_no: Optional[int] = None
     children: List[DetailChildRow] = []
+
+
+class GroupFRow(BaseModel):
+    """Group F 接口单行：指定周所有父 ASIN 的完整数据。"""
+    parent_asin: Optional[str] = None
+    created_at: Optional[datetime] = None
+    store_id: Optional[int] = None
+    impression_count_asin: Optional[str] = None  # 有 impression 的任意子 ASIN，无则空
+    order_asin: Optional[str] = None  # 有订单的任意子 ASIN，无则空
+    sessions_asin: Optional[str] = None  # 有 sessions 的任意子 ASIN，无则空
+
+
+class GroupFResponse(BaseModel):
+    """Group F 接口响应"""
+    weeks: List[int] = []
+    rows: List[GroupFRow] = []

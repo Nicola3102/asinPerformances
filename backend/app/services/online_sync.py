@@ -6,13 +6,14 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 
 import pymysql
-from sqlalchemy import create_engine, or_, text
+from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
 from app.config import settings
 from app.database import SessionLocal, init_db
+from app.online_engine import get_online_engine
 from app.models import AsinPerformance
 
 
@@ -44,16 +45,18 @@ WITH
 target_weeks AS (
     SELECT CONCAT(YEAR(:reference_date), LPAD(GREATEST(1, WEEK(:reference_date, 0)), 2, '0')) AS week_no
 ),
-unique_listing AS (
-    SELECT store_id, asin, MIN(variation_id) AS variation_id
-    FROM amazon_listing
-    WHERE store_id IN (1, 7)
-    GROUP BY store_id, asin
-),
+-- 先取本期有订单的 (asin, store_id)，再查 listing，避免全表扫描 amazon_listing
 ordered_child_raw AS (
     SELECT asin, store_id, purchase_utc_date, order_id
     FROM order_item
     WHERE store_id IN (1, 7) AND purchase_utc_date BETWEEN :date_start AND :date_end
+),
+unique_listing AS (
+    SELECT al.store_id, al.asin, MIN(al.variation_id) AS variation_id
+    FROM amazon_listing al
+    INNER JOIN (SELECT DISTINCT asin, store_id FROM ordered_child_raw) oc ON al.asin = oc.asin AND al.store_id = oc.store_id
+    WHERE al.store_id IN (1, 7)
+    GROUP BY al.store_id, al.asin
 ),
 -- 本批同步统一使用 reference_date 所在周为 week_no，按 (asin, store_id) 聚合订单数并收集 order_id（逗号分隔）
 ordered_child AS (
@@ -966,17 +969,7 @@ def sync_from_online_db() -> dict:
     logger.info("week_no reference date (date_end-1): %s -> week_no=%s", reference_date_str, target_week_no[0])
 
     table_name = settings.MYSQL_DB_NAME
-    # 长查询时避免被服务端断开：提高读/写超时；Step 2 使用独立 engine 并重试
-    connect_args = {
-        "connect_timeout": 30,
-        "read_timeout": 600,
-        "write_timeout": 600,
-    }
-    online_engine = create_engine(
-        settings.online_database_url,
-        pool_pre_ping=True,
-        connect_args=connect_args,
-    )
+    online_engine = get_online_engine()
     local_db: Session = SessionLocal()
     params = {"date_start": date_start_str, "date_end": date_end_str, "reference_date": reference_date_str}
     total_fetched = 0
@@ -1162,10 +1155,6 @@ def sync_from_online_db() -> dict:
         }
     finally:
         local_db.close()
-        try:
-            online_engine.dispose()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":

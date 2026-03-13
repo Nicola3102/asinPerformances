@@ -9,10 +9,13 @@ import {
   operateSummary,
   refreshQueryStatus,
   syncFromOnline,
+  getGroupFData,
   type SummaryRow,
   type DetailResponse,
   type DetailChildRow,
   type SearchQueryRow,
+  type GroupFResponse,
+  type GroupFRow,
 } from './api/client'
 import './App.css'
 
@@ -23,9 +26,56 @@ function formatParentOrderTotal(v: string | number | null | undefined): string {
   return String(Math.round(n))
 }
 
+function formatCreatedAt(v: string | null | undefined): string {
+  if (v == null || v === '') return '–'
+  try {
+    const d = new Date(v)
+    if (Number.isNaN(d.getTime())) return v
+    return d.toLocaleString('zh-CN', { dateStyle: 'short', timeStyle: 'short' })
+  } catch {
+    return v
+  }
+}
+
 function formatNum(v: number | null | undefined): string {
   if (v == null) return '–'
   return String(v)
+}
+
+function escapeCsvCell(val: string | number): string {
+  const s = String(val)
+  if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`
+  return s
+}
+
+function groupFRowsToCsv(rows: GroupFRow[]): string {
+  const header = ['Parent ASIN', 'Created At', 'store_id', 'impression_count_asin', 'order_asin', 'sessions_asin']
+  const lines = [header.map(escapeCsvCell).join(',')]
+  for (const r of rows) {
+    const created = formatCreatedAt(r.created_at)
+    lines.push(
+      [
+        r.parent_asin ?? '',
+        created,
+        r.store_id ?? '',
+        r.impression_count_asin ?? '',
+        r.order_asin ?? '',
+        r.sessions_asin ?? '',
+      ].map(escapeCsvCell).join(',')
+    )
+  }
+  return lines.join('\r\n')
+}
+
+function downloadGroupFCsv(rows: GroupFRow[], filename?: string): void {
+  const csv = groupFRowsToCsv(rows)
+  const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename ?? `group-f-${new Date().toISOString().slice(0, 10)}.csv`
+  a.click()
+  URL.revokeObjectURL(url)
 }
 
 function SearchQueryTable({
@@ -578,6 +628,266 @@ function AsinHomePage() {
   )
 }
 
+const GROUP_F_PAGE_SIZE = 30
+
+type AsinFilter = 'all' | 'has' | 'empty'
+
+function GroupFPage() {
+  const [scanWeeks, setScanWeeks] = useState(2)
+  const [specificWeeks, setSpecificWeeks] = useState('')
+  const [submittedSpecificWeeks, setSubmittedSpecificWeeks] = useState('')
+  const [page, setPage] = useState(1)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [data, setData] = useState<GroupFResponse | null>(null)
+  const hasDataRef = useRef(false)
+
+  const [storeIdFilter, setStoreIdFilter] = useState('')
+  const [impressionFilter, setImpressionFilter] = useState<AsinFilter>('all')
+  const [orderFilter, setOrderFilter] = useState<AsinFilter>('all')
+  const [sessionsFilter, setSessionsFilter] = useState<AsinFilter>('all')
+
+  const weekNos = useMemo(() => {
+    if (!submittedSpecificWeeks.trim()) return null
+    const nums = submittedSpecificWeeks
+      .split(/[,，\s]+/)
+      .map((s) => parseInt(s.trim(), 10))
+      .filter((n) => !Number.isNaN(n) && n >= 100000 && n <= 999999)
+    return nums.length > 0 ? nums : null
+  }, [submittedSpecificWeeks])
+
+  useEffect(() => {
+    setPage(1)
+  }, [scanWeeks, submittedSpecificWeeks])
+
+  useEffect(() => {
+    setPage(1)
+  }, [storeIdFilter, impressionFilter, orderFilter, sessionsFilter])
+
+  useEffect(() => {
+    hasDataRef.current = false
+    const ctrl = new AbortController()
+    setLoading(true)
+    setError(null)
+    getGroupFData(scanWeeks, weekNos ?? undefined, ctrl.signal)
+      .then((res) => {
+        hasDataRef.current = true
+        setData(res)
+        setError(null)
+      })
+      .catch((e) => {
+        if (e?.name !== 'AbortError' && !hasDataRef.current) {
+          setError(e instanceof Error ? e.message : 'Failed to load')
+        }
+      })
+      .finally(() => setLoading(false))
+    return () => ctrl.abort()
+  }, [scanWeeks, weekNos === null ? null : JSON.stringify(weekNos)])
+
+  const handleSpecificWeeksKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      e.preventDefault()
+      setSubmittedSpecificWeeks(specificWeeks.trim())
+    }
+  }
+
+  const rawRows = data?.rows ?? []
+  const filteredRows = useMemo(() => {
+    let filtered = rawRows
+    if (storeIdFilter.trim()) {
+      const ids = new Set(
+        storeIdFilter.split(/[,，\s]+/).map((s) => parseInt(s.trim(), 10)).filter((n) => !Number.isNaN(n))
+      )
+      if (ids.size > 0) {
+        filtered = filtered.filter((r) => r.store_id != null && ids.has(r.store_id))
+      }
+    }
+    const hasValue = (v: string | null | undefined) => v != null && String(v).trim() !== ''
+    if (impressionFilter === 'has') filtered = filtered.filter((r) => hasValue(r.impression_count_asin))
+    else if (impressionFilter === 'empty') filtered = filtered.filter((r) => !hasValue(r.impression_count_asin))
+    if (orderFilter === 'has') filtered = filtered.filter((r) => hasValue(r.order_asin))
+    else if (orderFilter === 'empty') filtered = filtered.filter((r) => !hasValue(r.order_asin))
+    if (sessionsFilter === 'has') filtered = filtered.filter((r) => hasValue(r.sessions_asin))
+    else if (sessionsFilter === 'empty') filtered = filtered.filter((r) => !hasValue(r.sessions_asin))
+    return filtered
+  }, [rawRows, storeIdFilter, impressionFilter, orderFilter, sessionsFilter])
+
+  const rows = filteredRows
+  const totalPages = Math.max(1, Math.ceil(rows.length / GROUP_F_PAGE_SIZE))
+  const currentPage = Math.min(Math.max(1, page), totalPages)
+  const startIdx = (currentPage - 1) * GROUP_F_PAGE_SIZE
+  const pageRows = rows.slice(startIdx, startIdx + GROUP_F_PAGE_SIZE)
+
+  return (
+    <div className="app">
+      <h1>Group F</h1>
+      <div className="group-f-controls">
+        <label>
+          指定周：
+          <input
+            type="text"
+            placeholder="如 202607 或 202607,202606，回车查询"
+            value={specificWeeks}
+            onChange={(e) => setSpecificWeeks(e.target.value)}
+            onKeyDown={handleSpecificWeeksKeyDown}
+            disabled={loading}
+            className="group-f-filter-input"
+          />
+          <span className="group-f-hint">（回车执行，留空则按扫描周数）</span>
+        </label>
+        <label>
+          扫描周数：
+          <select
+            value={scanWeeks}
+            onChange={(e) => setScanWeeks(Number(e.target.value))}
+            disabled={loading || !!submittedSpecificWeeks.trim()}
+          >
+            {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map((n) => (
+              <option key={n} value={n}>{n}</option>
+            ))}
+          </select>
+        </label>
+        <span className="group-f-weeks">
+          活动周数：{loading ? '计算中...' : data?.weeks?.length ? data.weeks.join(', ') : '–'}
+        </span>
+      </div>
+      {!loading && !error && data && rawRows.length > 0 && (
+        <div className="group-f-filters">
+          <label>
+            store_id：
+            <input
+              type="text"
+              placeholder="1,7,12 留空全部"
+              value={storeIdFilter}
+              onChange={(e) => setStoreIdFilter(e.target.value)}
+              className="group-f-filter-input"
+            />
+          </label>
+          <label>
+            impression_count_asin：
+            <select value={impressionFilter} onChange={(e) => setImpressionFilter(e.target.value as AsinFilter)}>
+              <option value="all">全部</option>
+              <option value="has">有值</option>
+              <option value="empty">无值</option>
+            </select>
+          </label>
+          <label>
+            order_asin：
+            <select value={orderFilter} onChange={(e) => setOrderFilter(e.target.value as AsinFilter)}>
+              <option value="all">全部</option>
+              <option value="has">有值</option>
+              <option value="empty">无值</option>
+            </select>
+          </label>
+          <label>
+            sessions_asin：
+            <select value={sessionsFilter} onChange={(e) => setSessionsFilter(e.target.value as AsinFilter)}>
+              <option value="all">全部</option>
+              <option value="has">有值</option>
+              <option value="empty">无值</option>
+            </select>
+          </label>
+          {(storeIdFilter || impressionFilter !== 'all' || orderFilter !== 'all' || sessionsFilter !== 'all') && (
+            <button
+              type="button"
+              className="group-f-clear-filters"
+              onClick={() => {
+                setStoreIdFilter('')
+                setImpressionFilter('all')
+                setOrderFilter('all')
+                setSessionsFilter('all')
+              }}
+            >
+              清除筛选
+            </button>
+          )}
+          <button
+            type="button"
+            className="group-f-download-csv"
+            onClick={() => downloadGroupFCsv(rows)}
+            disabled={rows.length === 0}
+          >
+            下载 CSV
+          </button>
+        </div>
+      )}
+      {error && <p className="error">{error}</p>}
+      <div className="group-f-table-wrap">
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>Parent ASIN</th>
+              <th>Created At</th>
+              <th>store_id</th>
+              <th>impression_count_asin</th>
+              <th>order_asin</th>
+              <th>sessions_asin</th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading ? (
+              <tr>
+                <td colSpan={6} className="empty-hint">
+                  加载中... Group F 查询可能需要 5–6 分钟，请耐心等待。
+                </td>
+              </tr>
+            ) : error ? (
+              <tr>
+                <td colSpan={6} className="error">{error}</td>
+              </tr>
+            ) : rows.length === 0 ? (
+              <tr>
+                <td colSpan={6} className="empty-hint">
+                  {!data ? '正在加载...' : rawRows.length === 0 ? '暂无符合条件的数据。' : '暂无符合筛选条件的数据，请调整筛选条件。'}
+                </td>
+              </tr>
+            ) : (
+              pageRows.map((r: GroupFRow, i: number) => (
+                <tr key={`${r.parent_asin ?? ''}-${r.store_id ?? ''}-${startIdx + i}`}>
+                  <td>{r.parent_asin ?? '–'}</td>
+                  <td>{formatCreatedAt(r.created_at)}</td>
+                  <td>{r.store_id ?? '–'}</td>
+                  <td>{r.impression_count_asin ?? '–'}</td>
+                  <td>{r.order_asin ?? '–'}</td>
+                  <td>{r.sessions_asin ?? '–'}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+        {!loading && !error && data && rows.length > 0 && (
+            <div className="group-f-pagination">
+              <p className="empty-hint">
+                共 {rows.length} 个父 ASIN
+                {rows.length !== rawRows.length ? `（已筛选，原始 ${rawRows.length} 条）` : '（指定周全部）'}
+                ，每页 {GROUP_F_PAGE_SIZE} 条
+              </p>
+              {totalPages > 1 && (
+                <div className="pagination-btns">
+                  <button
+                    type="button"
+                    disabled={currentPage <= 1}
+                    onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  >
+                    上一页
+                  </button>
+                  <span>第 {currentPage} / {totalPages} 页</span>
+                  <button
+                    type="button"
+                    disabled={currentPage >= totalPages}
+                    onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                  >
+                    下一页
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+      </div>
+    </div>
+  )
+}
+
 function PagePlaceholder({ title }: { title: string }) {
   return (
     <div className="app">
@@ -638,7 +948,7 @@ export default function App() {
         <Route path="/" element={<AsinHomePage />} />
         <Route path="/group/A" element={<PagePlaceholder title="Group A" />} />
         <Route path="/group/B" element={<PagePlaceholder title="Group B" />} />
-        <Route path="/group/F" element={<PagePlaceholder title="Group F" />} />
+        <Route path="/group/F" element={<GroupFPage />} />
         <Route path="/grpup/A" element={<Navigate to="/group/A" replace />} />
         <Route path="/tasks" element={<PagePlaceholder title="Tasks" />} />
       </Route>

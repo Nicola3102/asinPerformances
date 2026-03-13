@@ -81,6 +81,20 @@ export interface SummaryStatsResponse {
   by_week: WeekStatsRow[];
 }
 
+export interface GroupFRow {
+  parent_asin: string | null;
+  created_at: string | null;
+  store_id: number | null;
+  impression_count_asin: string | null;
+  order_asin: string | null;
+  sessions_asin: string | null;
+}
+
+export interface GroupFResponse {
+  weeks: number[];
+  rows: GroupFRow[];
+}
+
 function parseErrorResponse(text: string, status: number): string {
   try {
     const err = text ? JSON.parse(text) : {}
@@ -250,6 +264,25 @@ export async function syncFromOnline(): Promise<{
       else if (res.status >= 500) msg = `后端错误 (${res.status})，请查看后端日志`
     }
     throw new Error(msg)
+  }
+  return res.json()
+}
+
+export async function getGroupFData(
+  scanWeeks: number,
+  weekNos?: number[] | null,
+  signal?: AbortSignal
+): Promise<GroupFResponse> {
+  const params = new URLSearchParams()
+  if (weekNos != null && weekNos.length > 0) {
+    weekNos.forEach((w) => params.append('week_nos', String(w)))
+  } else {
+    params.set('scan_weeks', String(scanWeeks))
+  }
+  const res = await fetch(`${API_BASE}/asin-performances/group-f?${params.toString()}`, { signal })
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(parseErrorResponse(text, res.status) || 'Failed to fetch Group F data')
   }
   return res.json()
 }

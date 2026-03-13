@@ -1,6 +1,8 @@
 import csv
 import logging
 import threading
+import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from decimal import Decimal
@@ -10,7 +12,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import create_engine, func, text
+from sqlalchemy import func, text
+
+from app.online_engine import get_online_engine
 
 from app.config import settings
 from app.database import get_db
@@ -25,11 +29,25 @@ from app.views import (
     DetailChildRow,
     DetailResponse,
     SearchQueryRow,
+    GroupFRow,
+    GroupFResponse,
+)
+from app.services.group_f_spark import (
+    get_group_f,
+    compute_scan_weeks_list_for_api,
+    _group_f_current_week_no,
+    _group_f_to_mysql_week_no,
 )
 
 router = APIRouter(prefix="/api/asin-performances", tags=["asin-performances"])
 logger = logging.getLogger(__name__)
 _query_refresh_lock = threading.Lock()
+
+# Group F 槽位：同一时刻只允许一个请求执行；可查询占用者与时长，支持手动释放
+_group_f_slot = {"started_at": None, "request_id": None}
+_group_f_slot_lock = threading.Lock()
+_GROUP_F_STALE_SEC = 25 * 60   # 超过此时长视为过期，允许新请求
+_GROUP_F_STUCK_SEC = 20 * 60   # 超过此时长在 status 中标记为 is_stuck
 
 
 def _fetch_listing_meta_for_export(rows: list[AsinPerformance]) -> dict:
@@ -54,10 +72,8 @@ def _fetch_listing_meta_for_export(rows: list[AsinPerformance]) -> dict:
     table_candidates = [
         ("ai_generated_amazon_listings", "search_terms"),
     ]
-    connect_args = {"connect_timeout": 15, "read_timeout": 60, "write_timeout": 60}
-    online_engine = create_engine(settings.online_database_url, pool_pre_ping=True, connect_args=connect_args)
-    try:
-        for agal_table, search_col in table_candidates:
+    online_engine = get_online_engine()
+    for agal_table, search_col in table_candidates:
             meta_map = {}
             try:
                 with online_engine.connect() as conn:
@@ -92,11 +108,6 @@ def _fetch_listing_meta_for_export(rows: list[AsinPerformance]) -> dict:
             except Exception as e:
                 logger.warning("Export listing meta query failed with %s.%s: %s", agal_table, search_col, e)
                 continue
-    finally:
-        try:
-            online_engine.dispose()
-        except Exception:
-            pass
     return {}
 
 
@@ -382,8 +393,7 @@ def refresh_query_status(
             "checked_at": now.isoformat(),
             "message": "refresh already running, skip this request",
         }
-    connect_args = {"connect_timeout": 20, "read_timeout": 60, "write_timeout": 60}
-    online_engine = create_engine(settings.online_database_url, pool_pre_ping=True, connect_args=connect_args)
+    online_engine = get_online_engine()
     try:
         with online_engine.connect() as conn:
             for pa, sid, q_status, checked_at in groups:
@@ -454,10 +464,6 @@ def refresh_query_status(
                     completed_groups += 1
         db.commit()
     finally:
-        try:
-            online_engine.dispose()
-        except Exception:
-            pass
         if lock_acquired:
             _query_refresh_lock.release()
 
@@ -469,6 +475,178 @@ def refresh_query_status(
         "skipped_by_interval": skipped_by_interval,
         "checked_at": now.isoformat(),
     }
+
+
+@router.get("/db-status")
+def get_online_db_status():
+    """
+    查询 online 库连接状态：Threads_connected、Max_used_connections、当前运行中的查询数。
+    用于排查 Group F 等长查询时的连接数问题。
+    """
+    if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
+        return {"error": "online_db 未配置", "threads_connected": None, "max_used_connections": None}
+    try:
+        engine = get_online_engine()
+        with engine.connect() as conn:
+            threads = conn.execute(text("SHOW GLOBAL STATUS LIKE 'Threads_connected'")).fetchone()
+            max_used = conn.execute(text("SHOW GLOBAL STATUS LIKE 'Max_used_connections'")).fetchone()
+            procs = conn.execute(text("SHOW PROCESSLIST")).fetchall()
+        threads_connected = int(threads[1]) if threads and len(threads) > 1 else None
+        max_used_connections = int(max_used[1]) if max_used and len(max_used) > 1 else None
+        running = sum(1 for p in procs if p and len(p) >= 5 and str(p[4]).strip().lower() in ("query", "execute"))
+        return {
+            "threads_connected": threads_connected,
+            "max_used_connections": max_used_connections,
+            "processlist_count": len(procs),
+            "running_queries": running,
+        }
+    except Exception as e:
+        logger.exception("db-status failed: %s", e)
+        return {"error": str(e), "threads_connected": None, "max_used_connections": None}
+
+
+def _group_f_acquire_slot():
+    """若当前无占用或已过期则占用槽位并返回 (request_id, True)，否则返回 (None, False)。"""
+    with _group_f_slot_lock:
+        now = time.time()
+        if _group_f_slot["started_at"] is not None:
+            age = now - _group_f_slot["started_at"]
+            if age < _GROUP_F_STALE_SEC:
+                return None, False
+        rid = uuid.uuid4().hex[:12]
+        _group_f_slot["started_at"] = now
+        _group_f_slot["request_id"] = rid
+        return rid, True
+
+
+def _group_f_release_slot(request_id: str):
+    """仅当槽位属于本 request_id 时清空。"""
+    with _group_f_slot_lock:
+        if _group_f_slot.get("request_id") == request_id:
+            _group_f_slot["started_at"] = None
+            _group_f_slot["request_id"] = None
+
+
+@router.get("/group-f/status")
+def get_group_f_lock_status():
+    """
+    查询 Group F 锁状态：谁占用、从何时开始、已运行多久、是否卡住。
+    用于排查 429 与长时间无响应。
+    """
+    with _group_f_slot_lock:
+        started_at = _group_f_slot.get("started_at")
+        request_id = _group_f_slot.get("request_id")
+    if started_at is None:
+        return {
+            "lock_held": False,
+            "request_id": None,
+            "started_at": None,
+            "duration_seconds": None,
+            "is_stuck": False,
+            "message": "当前无占用",
+        }
+    duration = time.time() - started_at
+    started_iso = datetime.fromtimestamp(started_at, tz=timezone.utc).isoformat()
+    return {
+        "lock_held": True,
+        "request_id": request_id,
+        "started_at": started_iso,
+        "duration_seconds": round(duration, 1),
+        "is_stuck": duration > _GROUP_F_STUCK_SEC,
+        "message": "有请求在执行中" + ("（已超时，可能卡住）" if duration > _GROUP_F_STUCK_SEC else ""),
+    }
+
+
+@router.post("/group-f/release-lock")
+def release_group_f_lock():
+    """
+    手动释放 Group F 槽位，允许新请求进入。
+    注意：原请求若仍在执行会继续在后台跑直至完成或超时，不会中断。
+    """
+    with _group_f_slot_lock:
+        had = _group_f_slot["started_at"] is not None
+        req_id = _group_f_slot.get("request_id")
+        _group_f_slot["started_at"] = None
+        _group_f_slot["request_id"] = None
+    logger.info("[Group F] 手动释放槽位，原 request_id=%s", req_id)
+    return {
+        "released": True,
+        "had_lock": had,
+        "previous_request_id": req_id,
+        "message": "槽位已释放，新请求可发起" if had else "槽位本就空闲",
+    }
+
+
+@router.get("/group-f", response_model=GroupFResponse)
+def get_group_f_candidates(
+    scan_weeks: int = Query(4, ge=1, le=12, description="扫描周数（指定周为空时生效）"),
+    week_nos: Optional[List[int]] = Query(None, description="指定周，如 202607，可多值；有值时忽略扫描周数"),
+):
+    """
+    Group F：查询指定周或按扫描周数计算的周内创建的父 ASIN 状态。
+    指定周：week_nos=202607 或 week_nos=202607&week_nos=202606；留空则按 scan_weeks 计算。
+    """
+    logger.info("[Group F] 请求已到达: scan_weeks=%s, week_nos=%s", scan_weeks, week_nos)
+    if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
+        raise HTTPException(status_code=400, detail="online_db 配置缺失，无法查询 Group F 数据")
+
+    request_id, acquired = _group_f_acquire_slot()
+    if not acquired:
+        logger.warning("[Group F] 请求被拒绝：已有查询在执行中，返回 429")
+        raise HTTPException(
+            status_code=429,
+            detail="Group F 查询已在进行中，请等待完成或调用 POST /group-f/release-lock 后重试",
+        )
+    logger.info("[Group F] 已占用槽位 request_id=%s，开始执行", request_id)
+
+    online_engine = get_online_engine()
+    try:
+        if week_nos:
+            scan_weeks_list = [int(w) for w in week_nos]
+        else:
+            with online_engine.connect() as conn:
+                search_max = conn.execute(
+                    text(
+                        "SELECT MAX(week_no) FROM amazon_search_data"
+                        " WHERE store_id IN (1,7,12,25) AND week_no IS NOT NULL"
+                    )
+                ).scalar()
+                traffic_max = conn.execute(
+                    text(
+                        "SELECT MAX(week_no) FROM amazon_sales_traffic"
+                        " WHERE store_id IN (1,7,12,25) AND week_no IS NOT NULL"
+                    )
+                ).scalar()
+            cands = [int(w) for w in (search_max, traffic_max) if w is not None]
+            if not cands:
+                return GroupFResponse(weeks=[], rows=[])
+            db_max = max(cands)
+            current_week = max(db_max, _group_f_current_week_no())
+            scan_weeks_list = compute_scan_weeks_list_for_api(current_week, scan_weeks)
+        mysql_weeks = [_group_f_to_mysql_week_no(w) for w in scan_weeks_list]
+        logger.info("[Group F] request_id=%s 创建周（Group F）=%s，mysql_weeks=%s，调用 get_group_f...", request_id, scan_weeks_list, mysql_weeks)
+        rows = get_group_f(mysql_weeks)
+        logger.info("[Group F] request_id=%s 查询成功，返回 %d 条", request_id, len(rows))
+        return GroupFResponse(
+            weeks=scan_weeks_list,
+            rows=[
+                GroupFRow(
+                    parent_asin=r[0],
+                    created_at=r[1],
+                    store_id=int(r[2]) if r[2] is not None else None,
+                    impression_count_asin=str(r[3]) if r[3] else None,
+                    order_asin=str(r[4]) if r[4] else None,
+                    sessions_asin=str(r[5]) if r[5] else None,
+                )
+                for r in rows
+            ],
+        )
+    except Exception as e:
+        logger.exception("[Group F] request_id=%s 查询失败: %s", request_id, e)
+        raise HTTPException(status_code=500, detail=f"查询 Group F 失败: {e!s}")
+    finally:
+        _group_f_release_slot(request_id)
+        logger.info("[Group F] request_id=%s 槽位已释放", request_id)
 
 
 @router.get("/export")

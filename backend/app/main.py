@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import settings
+from app.online_engine import dispose_online_engine
 from app.controllers import asin_router
 from app.controllers.sync_controller import router as sync_router
 from app.database import init_db
@@ -105,6 +106,10 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
         _scheduler = None
+    try:
+        dispose_online_engine()
+    except Exception:
+        pass
     logger.info("Application shutdown")
 
 
