@@ -34,7 +34,7 @@ def _get_sync_date_range():
 
 
 # 店铺（与 online 库各表索引匹配）
-STORE_IDS = "(1, 7)"
+STORE_IDS = "(1, 7,12,25)"
 
 # 依赖 online 库各表已有索引（如 store_id, week_no, purchase_utc_date 等）以加速执行
 # 第一步拆为：1) 轻量核心查询只取有订单子 ASIN+父 ASIN 信息；2) 分批查 traffic/search/search_data 并合并，避免单次大 JOIN 超时
@@ -49,13 +49,13 @@ target_weeks AS (
 ordered_child_raw AS (
     SELECT asin, store_id, purchase_utc_date, order_id
     FROM order_item
-    WHERE store_id IN (1, 7) AND purchase_utc_date BETWEEN :date_start AND :date_end
+    WHERE store_id IN (1, 7,12,25) AND purchase_utc_date BETWEEN :date_start AND :date_end
 ),
 unique_listing AS (
     SELECT al.store_id, al.asin, MIN(al.variation_id) AS variation_id
     FROM amazon_listing al
     INNER JOIN (SELECT DISTINCT asin, store_id FROM ordered_child_raw) oc ON al.asin = oc.asin AND al.store_id = oc.store_id
-    WHERE al.store_id IN (1, 7)
+    WHERE al.store_id IN (1, 7,12,25)
     GROUP BY al.store_id, al.asin
 ),
 -- 本批同步统一使用 reference_date 所在周为 week_no，按 (asin, store_id) 聚合订单数并收集 order_id（逗号分隔）
@@ -115,7 +115,7 @@ def _get_active_asins(online_conn, asins: list) -> set:
             # 仅保留：在 listing 中且所有记录的 status 均为 'active' 的 asin
             rows = online_conn.execute(
                 text(
-                    f"SELECT asin FROM amazon_listing WHERE store_id IN (1, 7) AND asin IN ({placeholders}) GROUP BY asin "
+                    f"SELECT asin FROM amazon_listing WHERE store_id IN (1, 7,12,25) AND asin IN ({placeholders}) GROUP BY asin "
                     "HAVING SUM(CASE WHEN COALESCE(status, '') != 'active' THEN 1 ELSE 0 END) = 0"
                 ),
                 params,
@@ -270,6 +270,92 @@ def _date_to_week_no(d: date):
     return (week_no_str, week_no_int)
 
 
+def _step1_fallback_recover(online_engine, params: dict, included_pairs: set, reference_date_str: str):
+    """
+    对 order_item 本期有订单但未进入 Step1 核心结果的 (asin, store_id)，用「任意 store 的 listing」解析 parent_asin，
+    仍以订单的 store_id 写入，避免同一父 ASIN 在 store_id=7 的订单被漏记（仅 listing 在 store_id=12 存在时）。
+    返回与 core_rows 同格式的 list[(child_asin, store_id, parent_asin, parent_asin_create_at, parent_order_total, order_num, order_ids, week_no)]。
+    """
+    from sqlalchemy import text as sql_text
+    week_no_str, _ = _date_to_week_no(datetime.strptime(reference_date_str, "%Y-%m-%d").date())
+    fallback_rows = []
+    with online_engine.connect() as conn:
+        order_agg = conn.execute(
+            sql_text(
+                "SELECT asin, store_id, "
+                "COUNT(DISTINCT order_id) AS order_num, "
+                "GROUP_CONCAT(DISTINCT order_id ORDER BY order_id SEPARATOR ',') AS order_ids "
+                "FROM order_item "
+                "WHERE store_id IN (1, 7, 12, 25) AND purchase_utc_date BETWEEN :date_start AND :date_end "
+                "GROUP BY asin, store_id"
+            ),
+            params,
+        ).fetchall()
+        excluded_triples = [
+            (r[0], r[1], int(r[2]) if r[2] is not None else 0, r[3] or "")
+            for r in order_agg
+            if (r[0], r[1]) not in included_pairs
+        ]
+        if not excluded_triples:
+            return fallback_rows
+        unique_asins = list({t[0] for t in excluded_triples})
+        asin_to_parent = {}
+        batch = 200
+        for i in range(0, len(unique_asins), batch):
+            chunk = unique_asins[i : i + batch]
+            placeholders = ", ".join([f"(:a{j})" for j in range(len(chunk))])
+            prm = {f"a{j}": a for j, a in enumerate(chunk)}
+            try:
+                rows = conn.execute(
+                    sql_text(
+                        "SELECT al.asin, av.id AS variation_id, av.asin AS parent_asin, av.created_at AS parent_asin_create_at "
+                        "FROM amazon_listing al "
+                        "INNER JOIN amazon_variation av ON av.id = al.variation_id "
+                        f"WHERE al.asin IN ({placeholders}) AND al.store_id IN (1, 7, 12, 25) "
+                        "GROUP BY al.asin, av.id, av.asin, av.created_at"
+                    ),
+                    prm,
+                ).fetchall()
+            except Exception as e:
+                logger.warning("Step1 fallback: lookup parent from listing failed for batch: %s", e)
+                continue
+            for r in rows:
+                asin = r[0]
+                if asin and asin not in asin_to_parent:
+                    asin_to_parent[asin] = (r[2], r[3])
+        # (parent_asin, store_id) -> sum(order_num)
+        pot_by_key = {}
+        for asin, store_id, order_num, order_ids in excluded_triples:
+            parent_info = asin_to_parent.get(asin)
+            if not parent_info:
+                continue
+            parent_asin, parent_asin_create_at = parent_info
+            key = (parent_asin, store_id)
+            pot_by_key[key] = pot_by_key.get(key, 0) + order_num
+        for asin, store_id, order_num, order_ids in excluded_triples:
+            parent_info = asin_to_parent.get(asin)
+            if not parent_info:
+                continue
+            parent_asin, parent_asin_create_at = parent_info
+            parent_order_total = pot_by_key.get((parent_asin, store_id), 0)
+            fallback_rows.append((
+                asin,
+                store_id,
+                parent_asin,
+                parent_asin_create_at,
+                parent_order_total,
+                order_num,
+                (order_ids or "").strip() or None,
+                week_no_str,
+            ))
+    if fallback_rows:
+        logger.info(
+            "Step1 fallback: recovered %s rows for (asin, store_id) excluded from main core (parent from any store, store_id kept from order)",
+            len(fallback_rows),
+        )
+    return fallback_rows
+
+
 def _get_target_weeks(date_start: str, date_end: str):
     """一周为周日至周六，第1周=当年第一个周日，与 MySQL WEEK(..., 0) 一致，返回 (week_no_str, week_no_int) 列表。"""
     start = datetime.strptime(date_start, "%Y-%m-%d").date()
@@ -290,7 +376,7 @@ def _step2_fetch_for_parents(
     parent_asins: list,
     parent_lookup: dict,
     target_weeks: list,
-    store_ids: tuple = (1, 7),
+    store_ids: tuple = (1, 7,12,25),
     batch_size: int = 200,
 ):
     """
@@ -317,7 +403,7 @@ def _step2_fetch_for_parents(
         # online: (store_id, asin) 该父下所有子
         listing = online_conn.execute(
             text(
-                "SELECT store_id, asin FROM amazon_listing WHERE variation_id = :pid AND store_id IN (1, 7)"
+                "SELECT store_id, asin FROM amazon_listing WHERE variation_id = :pid AND store_id IN (1, 7,12,25)"
             ),
             {"pid": parent_id},
         ).fetchall()
@@ -988,7 +1074,7 @@ def sync_from_online_db() -> dict:
             try:
                 period_order_rows = conn.execute(
                     text(
-                        "SELECT COUNT(*) FROM order_item WHERE store_id IN (1, 7) AND purchase_utc_date BETWEEN :date_start AND :date_end"
+                        "SELECT COUNT(*) FROM order_item WHERE store_id IN (1, 7,12,25) AND purchase_utc_date BETWEEN :date_start AND :date_end"
                     ),
                     params,
                 ).scalar()
@@ -999,7 +1085,7 @@ def sync_from_online_db() -> dict:
                     text(
                         "SELECT COUNT(*) FROM ("
                         "SELECT asin, store_id FROM order_item "
-                        "WHERE store_id IN (1, 7) AND purchase_utc_date BETWEEN :date_start AND :date_end"
+                        "WHERE store_id IN (1, 7,12,25) AND purchase_utc_date BETWEEN :date_start AND :date_end"
                         " GROUP BY asin, store_id"
                         ") t"
                     ),
@@ -1008,7 +1094,7 @@ def sync_from_online_db() -> dict:
             except Exception:
                 period_distinct_triples = None
         logger.info(
-            "Sync period: date_start=%s, date_end=%s; order_item rows(store 1,7)=%s; distinct(asin,store_id)=%s",
+            "Sync period: date_start=%s, date_end=%s; order_item rows(store 1,7,12,25)=%s; distinct(asin,store_id)=%s",
             date_start_str, date_end_str, period_order_rows, period_distinct_triples,
         )
 
@@ -1027,12 +1113,35 @@ def sync_from_online_db() -> dict:
             n_core,
             core_sum_order_num,
         )
-        if period_order_rows is not None and core_sum_order_num is not None and period_order_rows != core_sum_order_num:
+        included_pairs = {(r[0], r[1]) for r in core_rows}
+        excluded_count = 0
+        if period_order_rows is not None and core_sum_order_num is not None:
+            excluded_count = period_order_rows - core_sum_order_num
+        if excluded_count != 0:
+            excluded_asins_for_log = []
+            try:
+                with online_engine.connect() as conn:
+                    order_item_pairs = conn.execute(
+                        text(
+                            "SELECT asin, store_id FROM order_item "
+                            "WHERE store_id IN (1, 7,12,25) AND purchase_utc_date BETWEEN :date_start AND :date_end "
+                            "GROUP BY asin, store_id"
+                        ),
+                        params,
+                    ).fetchall()
+                    for row in order_item_pairs:
+                        key = (row[0], row[1])
+                        if key not in included_pairs:
+                            excluded_asins_for_log.append(f"{row[0]}(store_id={row[1]})")
+            except Exception as e:
+                logger.warning("Could not fetch excluded (asin, store_id) for log: %s", e)
+                excluded_asins_for_log = []
             logger.warning(
-                "Order count mismatch: order_item rows in period=%s, core sum(order_num)=%s, excluded=%s (asin not in listing or no parent in amazon_variation)",
+                "Order count mismatch: order_item rows in period=%s, core sum(order_num)=%s, excluded=%s (asin not in listing or no parent in amazon_variation). Excluded ASINs: %s",
                 period_order_rows,
                 core_sum_order_num,
-                period_order_rows - core_sum_order_num,
+                excluded_count,
+                excluded_asins_for_log if excluded_asins_for_log else "(failed to list)",
             )
         rows1 = []
         if core_rows:
@@ -1053,6 +1162,28 @@ def sync_from_online_db() -> dict:
             local_db.flush()
             groups_updated = _recompute_parent_order_totals(local_db)
             logger.info("Recomputed parent_order_total for %s (parent_asin, week_no, store_id) groups", groups_updated)
+        if excluded_count > 0:
+            fallback_core_rows = _step1_fallback_recover(
+                online_engine, params, included_pairs, reference_date_str
+            )
+            if fallback_core_rows:
+                with online_engine.connect() as conn:
+                    fallback_rows1 = _step1_attach_metrics(
+                        conn, fallback_core_rows, set(), batch_size=200
+                    )
+                if fallback_rows1:
+                    progress_interval_fb = max(1, len(fallback_rows1) // 5)
+                    ins_fb, upd_fb = _upsert_batch(
+                        local_db, fallback_rows1, "step1_fallback", progress_interval_fb
+                    )
+                    total_inserted += ins_fb
+                    total_updated += upd_fb
+                    local_db.flush()
+                    groups_updated_fb = _recompute_parent_order_totals(local_db)
+                    logger.info(
+                        "Step1 fallback: inserted=%s, updated=%s; recomputed %s groups",
+                        ins_fb, upd_fb, groups_updated_fb,
+                    )
         local_db.commit()
 
         # 第二步：复用同一 online_engine，从本地 asin_performances 读 parent_asin，按父 ASIN 分批在 online 查子 ASIN

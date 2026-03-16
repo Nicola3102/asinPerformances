@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { NavLink, Navigate, Outlet, Route, Routes } from 'react-router-dom'
 import {
-  listSummaryByWeek,
+  listSummaryConsolidatedByWeek,
   listWeeks,
   getDetail,
   getTableStats,
@@ -10,12 +10,16 @@ import {
   refreshQueryStatus,
   syncFromOnline,
   getGroupFData,
-  type SummaryRow,
+  getMonitorParents,
+  getMonitorTrack,
+  type SummaryRowConsolidated,
   type DetailResponse,
   type DetailChildRow,
   type SearchQueryRow,
   type GroupFResponse,
   type GroupFRow,
+  type MonitorParentItem,
+  type MonitorTrackResponse,
 } from './api/client'
 import './App.css'
 
@@ -250,7 +254,7 @@ function DetailModal({
 }
 
 function AsinHomePage() {
-  const [summary, setSummary] = useState<SummaryRow[]>([])
+  const [summary, setSummary] = useState<SummaryRowConsolidated[]>([])
   const [availableWeeks, setAvailableWeeks] = useState<number[]>([])
   const [selectedWeek, setSelectedWeek] = useState<number | ''>('')
   const [selectedParentAsins, setSelectedParentAsins] = useState<Set<string>>(new Set())
@@ -301,7 +305,7 @@ function AsinHomePage() {
       clearTimeout(timeoutId!)
       const fallbackWeek = weeksData.length > 0 ? weeksData[0] : ''
       const effectiveWeek = weekOverride !== undefined ? weekOverride : (selectedWeek !== '' ? selectedWeek : fallbackWeek)
-      const summaryData = typeof effectiveWeek === 'number' ? await listSummaryByWeek(effectiveWeek) : []
+      const summaryData = typeof effectiveWeek === 'number' ? await listSummaryConsolidatedByWeek(effectiveWeek) : []
       const asinSet = new Set(summaryData.map((r) => (r.parent_asin || '').trim()).filter((x) => x !== ''))
       setSelectedParentAsins((prev) => {
         const next = new Set<string>()
@@ -373,7 +377,7 @@ function AsinHomePage() {
     try {
       const out = await refreshQueryStatus(week)
       if ((out.checked_groups ?? 0) > 0 || (out.completed_groups ?? 0) > 0) {
-        const fresh = await listSummaryByWeek(week)
+        const fresh = await listSummaryConsolidatedByWeek(week)
         setSummary(fresh)
       }
     } catch (e) {
@@ -576,8 +580,9 @@ function AsinHomePage() {
                 const opDone = row.operation_status === true || (row.operated_at != null && row.operated_at !== '')
                 const opKey = `${row.parent_asin}-${row.week_no}`
                 const isOperating = operatingKey === opKey
+                const storeIdsStr = (row.store_ids ?? []).length > 0 ? (row.store_ids as number[]).join(', ') : '–'
                 return (
-                  <tr key={`${row.parent_asin}-${row.week_no}-${row.store_id ?? ''}-${i}`}>
+                  <tr key={`${row.parent_asin}-${row.week_no}-${i}`}>
                     <td>
                       <input
                         type="checkbox"
@@ -588,7 +593,7 @@ function AsinHomePage() {
                     <td>{row.parent_asin ?? '-'}</td>
                     <td>{row.parent_asin_create_at != null ? String(row.parent_asin_create_at).slice(0, 19) : '–'}</td>
                     <td>{formatParentOrderTotal(row.parent_order_total)}</td>
-                    <td>{formatNum(row.store_id)}</td>
+                    <td>{storeIdsStr}</td>
                     <td>
                       <button
                         type="button"
@@ -609,7 +614,7 @@ function AsinHomePage() {
                       <button
                         type="button"
                         className="view-more-btn"
-                        onClick={() => handleViewMore(row.parent_asin, row.week_no, row.store_id)}
+                        onClick={() => handleViewMore(row.parent_asin, row.week_no, undefined)}
                       >
                         View more
                       </button>
@@ -631,6 +636,146 @@ function AsinHomePage() {
 const GROUP_F_PAGE_SIZE = 30
 
 type AsinFilter = 'all' | 'has' | 'empty'
+
+/** 按 child_asin 分组，每组内按 search_query 建表：行=search_query，列=week_no，单元格=volume/impression/click */
+function buildChildTables(track: MonitorTrackResponse): Map<string, { queries: string[]; cell: Map<string, { v: number | null; i: number | null; c: number | null }> }> {
+  const byChild = new Map<string, Map<string, Map<number, { v: number | null; i: number | null; c: number | null }>>>()
+  for (const r of track.rows) {
+    const c = r.child_asin ?? ''
+    const q = r.search_query ?? ''
+    const w = r.week_no ?? 0
+    if (!byChild.has(c)) byChild.set(c, new Map())
+    const byQuery = byChild.get(c)!
+    if (!byQuery.has(q)) byQuery.set(q, new Map())
+    const byWeek = byQuery.get(q)!
+    byWeek.set(w, {
+      v: r.search_query_volume ?? null,
+      i: r.search_query_impression_count ?? null,
+      c: r.search_query_click_count ?? null,
+    })
+  }
+  const out = new Map<string, { queries: string[]; cell: Map<string, { v: number | null; i: number | null; c: number | null }> }>()
+  for (const [child, byQuery] of byChild) {
+    const queries = Array.from(byQuery.keys()).sort()
+    const cell = new Map<string, { v: number | null; i: number | null; c: number | null }>()
+    for (const [q, byWeek] of byQuery) {
+      for (const [week, vals] of byWeek) {
+        cell.set(`${q}\t${week}`, vals)
+      }
+    }
+    out.set(child, { queries, cell })
+  }
+  return out
+}
+
+function MonitorPage() {
+  const [parents, setParents] = useState<MonitorParentItem[]>([])
+  const [selectedParent, setSelectedParent] = useState('')
+  const [track, setTrack] = useState<MonitorTrackResponse | null>(null)
+  const [loadingParents, setLoadingParents] = useState(true)
+  const [loadingTrack, setLoadingTrack] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    setLoadingParents(true)
+    setError(null)
+    getMonitorParents()
+      .then((list) => {
+        setParents(list)
+        if (list.length > 0 && !selectedParent) setSelectedParent(list[0].parent_asin ?? '')
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : 'Failed to load parents'))
+      .finally(() => setLoadingParents(false))
+  }, [])
+
+  useEffect(() => {
+    if (!selectedParent.trim()) {
+      setTrack(null)
+      return
+    }
+    setLoadingTrack(true)
+    setError(null)
+    getMonitorTrack(selectedParent)
+      .then(setTrack)
+      .catch((e) => setError(e instanceof Error ? e.message : 'Failed to load track'))
+      .finally(() => setLoadingTrack(false))
+  }, [selectedParent])
+
+  const childTables = track ? buildChildTables(track) : new Map()
+  const weeks = track?.weeks ?? []
+
+  return (
+    <div className="app">
+      <h1>Monitor</h1>
+      <p className="monitor-desc">追踪 operation_status=1 的父 ASIN 下各子 ASIN 的 search_query 按周数据（volume / impression / click）。</p>
+      {loadingParents && <p className="loading-hint">加载父 ASIN 列表...</p>}
+      {error && <p className="error">{error}</p>}
+      {!loadingParents && parents.length === 0 && <p className="empty-hint">暂无已操作（operation_status=1）的父 ASIN。</p>}
+      {!loadingParents && parents.length > 0 && (
+        <div className="monitor-controls">
+          <label>
+            父 ASIN：
+            <select
+              value={selectedParent}
+              onChange={(e) => setSelectedParent(e.target.value)}
+              disabled={loadingTrack}
+              className="monitor-select"
+            >
+              {parents.map((p) => (
+                <option key={p.parent_asin ?? ''} value={p.parent_asin ?? ''}>{p.parent_asin ?? '–'}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+      )}
+      {loadingTrack && <p className="loading-hint">加载追踪数据...</p>}
+      {!loadingTrack && track && childTables.size === 0 && <p className="empty-hint">该父 ASIN 暂无子 ASIN 或 search_query 数据。</p>}
+      {!loadingTrack && track && childTables.size > 0 && (
+        <div className="monitor-tables">
+          {Array.from(childTables.entries()).map(([childAsin, { queries, cell }]) => (
+            <div key={childAsin} className="monitor-child-block">
+              <h3>子 ASIN: {childAsin}</h3>
+              <div className="monitor-table-wrap">
+                <table className="data-table monitor-track-table">
+                  <thead>
+                    <tr>
+                      <th rowSpan={2} className="monitor-col-query">search_query</th>
+                      {weeks.map((w) => (
+                        <th key={w} colSpan={3} className="monitor-week-col">week {w}</th>
+                      ))}
+                    </tr>
+                    <tr>
+                      {weeks.flatMap((w) => [
+                        <th key={`${w}-v`}>volume</th>,
+                        <th key={`${w}-i`}>impression</th>,
+                        <th key={`${w}-c`}>click</th>,
+                      ])}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {queries.map((q: string) => (
+                      <tr key={q}>
+                        <td className="monitor-query-cell">{q || '–'}</td>
+                        {weeks.flatMap((w) => {
+                          const val = cell.get(`${q}\t${w}`) ?? { v: null, i: null, c: null }
+                          return [
+                            <td key={`${q}-${w}-v`}>{formatNum(val.v)}</td>,
+                            <td key={`${q}-${w}-i`}>{formatNum(val.i)}</td>,
+                            <td key={`${q}-${w}-c`}>{formatNum(val.c)}</td>,
+                          ]
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
 
 function GroupFPage() {
   const [scanWeeks, setScanWeeks] = useState(2)
@@ -933,6 +1078,9 @@ function AppLayout() {
         <NavLink to="/tasks" className={({ isActive }) => `top-nav-link ${isActive ? 'is-active' : ''}`}>
           Tasks
         </NavLink>
+        <NavLink to="/monitor" className={({ isActive }) => `top-nav-link ${isActive ? 'is-active' : ''}`}>
+          Monitor
+        </NavLink>
       </nav>
       <div className="app-shell-content">
         <Outlet />
@@ -951,6 +1099,7 @@ export default function App() {
         <Route path="/group/F" element={<GroupFPage />} />
         <Route path="/grpup/A" element={<Navigate to="/group/A" replace />} />
         <Route path="/tasks" element={<PagePlaceholder title="Tasks" />} />
+        <Route path="/monitor" element={<MonitorPage />} />
       </Route>
     </Routes>
   )

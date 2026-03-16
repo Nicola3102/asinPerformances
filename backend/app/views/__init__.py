@@ -3,6 +3,7 @@ from app.views.asin_schemas import (
     AsinPerformanceResponse,
     AsinPerformanceUpdate,
     SummaryRow,
+    SummaryRowConsolidated,
     SummaryStatsResponse,
     WeekStatsRow,
     SearchQueryRow,
@@ -10,6 +11,9 @@ from app.views.asin_schemas import (
     DetailResponse,
     GroupFRow,
     GroupFResponse,
+    MonitorParentItem,
+    MonitorTrackRow,
+    MonitorTrackResponse,
 )
 
 __all__ = [
@@ -17,6 +21,7 @@ __all__ = [
     "AsinPerformanceResponse",
     "AsinPerformanceUpdate",
     "SummaryRow",
+    "SummaryRowConsolidated",
     "SummaryStatsResponse",
     "WeekStatsRow",
     "SearchQueryRow",
@@ -24,4 +29,7 @@ __all__ = [
     "DetailResponse",
     "GroupFRow",
     "GroupFResponse",
+    "MonitorParentItem",
+    "MonitorTrackRow",
+    "MonitorTrackResponse",
 ]

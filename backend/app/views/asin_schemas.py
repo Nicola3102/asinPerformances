@@ -49,6 +49,20 @@ class SummaryRow(BaseModel):
     checked_at: Optional[datetime] = None
 
 
+class SummaryRowConsolidated(BaseModel):
+    """同一 parent_asin + week_no 下多 store 汇总：parent_order_total 为各 store 之和，store_ids 罗列有订单的 store，child_asins_with_orders 罗列有订单的子 ASIN。"""
+    parent_asin: Optional[str] = None
+    parent_asin_create_at: Optional[datetime] = None
+    parent_order_total: Optional[Decimal] = None
+    week_no: Optional[int] = None
+    store_ids: List[int] = []
+    child_asins_with_orders: List[str] = []
+    operation_status: Optional[bool] = False
+    operated_at: Optional[datetime] = None
+    checked_status: Optional[str] = None
+    checked_at: Optional[datetime] = None
+
+
 class WeekStatsRow(BaseModel):
     week_no: Optional[int] = None
     parent_asin_count: int = 0
@@ -99,3 +113,25 @@ class GroupFResponse(BaseModel):
     """Group F 接口响应"""
     weeks: List[int] = []
     rows: List[GroupFRow] = []
+
+
+class MonitorParentItem(BaseModel):
+    """operation_status=1 的父 ASIN 列表项"""
+    parent_asin: Optional[str] = None
+
+
+class MonitorTrackRow(BaseModel):
+    """监控追踪单行：子 ASIN + 周 + search_query 及三指标"""
+    child_asin: Optional[str] = None
+    week_no: Optional[int] = None
+    search_query: Optional[str] = None
+    search_query_volume: Optional[int] = None
+    search_query_impression_count: Optional[int] = None
+    search_query_click_count: Optional[int] = None
+
+
+class MonitorTrackResponse(BaseModel):
+    """监控追踪响应：某父 ASIN 下所有子 ASIN 各周的 search_query 数据"""
+    parent_asin: Optional[str] = None
+    weeks: List[int] = []
+    rows: List[MonitorTrackRow] = []

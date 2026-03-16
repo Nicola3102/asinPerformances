@@ -3,6 +3,7 @@ import logging
 import threading
 import time
 import uuid
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from decimal import Decimal
@@ -24,6 +25,7 @@ from app.views import (
     AsinPerformanceResponse,
     AsinPerformanceUpdate,
     SummaryRow,
+    SummaryRowConsolidated,
     SummaryStatsResponse,
     WeekStatsRow,
     DetailChildRow,
@@ -31,6 +33,9 @@ from app.views import (
     SearchQueryRow,
     GroupFRow,
     GroupFResponse,
+    MonitorParentItem,
+    MonitorTrackRow,
+    MonitorTrackResponse,
 )
 from app.services.group_f_spark import (
     get_group_f,
@@ -296,6 +301,137 @@ def list_summary(
     except Exception as e:
         logger.exception("Summary query failed: %s", e)
         raise HTTPException(status_code=500, detail=f"查询 summary 失败: {e!s}")
+
+
+@router.get("/summary/consolidated", response_model=List[SummaryRowConsolidated])
+def list_summary_consolidated(
+    week_no: Optional[int] = Query(None, description="Week number, default latest week"),
+    db: Session = Depends(get_db),
+):
+    """按 parent_asin + week_no 汇总：同一父 ASIN 同周下多 store 合并为一行，parent_order_total 为各 store 之和，store_ids 罗列有订单的 store，child_asins_with_orders 罗列有订单的子 ASIN。"""
+    try:
+        selected_week = week_no if week_no is not None else db.query(func.max(AsinPerformance.week_no)).scalar()
+        if selected_week is None:
+            return []
+        sub = (
+            db.query(
+                AsinPerformance.parent_asin,
+                AsinPerformance.week_no,
+                AsinPerformance.store_id,
+                func.max(AsinPerformance.parent_order_total).label("parent_order_total"),
+                func.max(AsinPerformance.parent_asin_create_at).label("parent_asin_create_at"),
+                func.max(AsinPerformance.operation_status).label("operation_status"),
+                func.max(AsinPerformance.operated_at).label("operated_at"),
+                func.max(AsinPerformance.checked_status).label("checked_status"),
+                func.max(AsinPerformance.checked_at).label("checked_at"),
+            )
+            .filter(
+                AsinPerformance.parent_asin.isnot(None),
+                AsinPerformance.parent_asin != "",
+                AsinPerformance.week_no == selected_week,
+            )
+            .group_by(AsinPerformance.parent_asin, AsinPerformance.week_no, AsinPerformance.store_id)
+            .having(func.max(AsinPerformance.parent_order_total) > 0)
+            .subquery()
+        )
+        rows = (
+            db.query(
+                sub.c.parent_asin,
+                sub.c.parent_asin_create_at,
+                sub.c.parent_order_total,
+                sub.c.week_no,
+                sub.c.store_id,
+                sub.c.operation_status,
+                sub.c.operated_at,
+                sub.c.checked_status,
+                sub.c.checked_at,
+            )
+            .order_by(sub.c.parent_order_total.desc())
+            .all()
+        )
+        child_rows = (
+            db.query(
+                AsinPerformance.parent_asin,
+                AsinPerformance.week_no,
+                AsinPerformance.child_asin,
+            )
+            .filter(
+                AsinPerformance.parent_asin.isnot(None),
+                AsinPerformance.parent_asin != "",
+                AsinPerformance.week_no == selected_week,
+                AsinPerformance.child_asin.isnot(None),
+                AsinPerformance.child_asin != "",
+                AsinPerformance.order_num > 0,
+            )
+            .distinct()
+            .all()
+        )
+        child_by_key = defaultdict(list)
+        for r in child_rows:
+            k = (r[0], r[1])
+            if r[2] and r[2] not in child_by_key[k]:
+                child_by_key[k].append(r[2])
+        by_key = {}
+        for r in rows:
+            pa, create_at, pot, wn, sid, op_status, op_at, chk_status, chk_at = (
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]
+            )
+            key = (pa, wn)
+            if key not in by_key:
+                week_no_int = int(wn) if wn is not None else None
+                if pot is not None and not isinstance(pot, Decimal):
+                    try:
+                        pot = Decimal(str(pot))
+                    except Exception:
+                        pot = None
+                op = op_status if isinstance(op_status, bool) else (bool(int(op_status)) if op_status is not None else False)
+                by_key[key] = {
+                    "parent_asin": pa,
+                    "parent_asin_create_at": create_at,
+                    "parent_order_total": pot or Decimal(0),
+                    "week_no": week_no_int,
+                    "store_ids": [int(sid)] if sid is not None else [],
+                    "operation_status": op,
+                    "operated_at": op_at,
+                    "checked_status": chk_status,
+                    "checked_at": chk_at,
+                    "child_asins_with_orders": child_by_key.get(key, []),
+                }
+            else:
+                g = by_key[key]
+                g["parent_order_total"] = (g["parent_order_total"] or Decimal(0)) + (pot if isinstance(pot, Decimal) else (Decimal(str(pot)) if pot is not None else Decimal(0)))
+                if sid is not None and int(sid) not in g["store_ids"]:
+                    g["store_ids"].append(int(sid))
+                if op_status is not None and (isinstance(op_status, bool) and op_status or (not isinstance(op_status, bool) and int(op_status))):
+                    g["operation_status"] = True
+                if op_at is not None and (g["operated_at"] is None or (op_at > g["operated_at"])):
+                    g["operated_at"] = op_at
+                if chk_status == "completed":
+                    g["checked_status"] = "completed"
+                if chk_at is not None and (g["checked_at"] is None or (chk_at > g["checked_at"])):
+                    g["checked_at"] = chk_at
+        out = []
+        for g in by_key.values():
+            g["store_ids"].sort()
+            out.append(
+                SummaryRowConsolidated(
+                    parent_asin=g["parent_asin"],
+                    parent_asin_create_at=g["parent_asin_create_at"],
+                    parent_order_total=g["parent_order_total"],
+                    week_no=g["week_no"],
+                    store_ids=g["store_ids"],
+                    child_asins_with_orders=g["child_asins_with_orders"],
+                    operation_status=g["operation_status"],
+                    operated_at=g["operated_at"],
+                    checked_status=g["checked_status"] or "pending",
+                    checked_at=g["checked_at"],
+                )
+            )
+        out.sort(key=lambda x: (-(x.parent_order_total or 0), x.parent_asin or ""))
+        return out
+    except Exception as e:
+        logger.exception("Summary consolidated query failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"查询 summary 汇总失败: {e!s}")
 
 
 class OperateBody(BaseModel):
@@ -806,6 +942,60 @@ def list_detail_by_parent_week(
         week_no=week_no,
         children=children,
     )
+
+
+@router.get("/monitor/parents")
+def list_monitor_parents(db: Session = Depends(get_db)):
+    """返回所有 operation_status=1 的父 ASIN 列表（去重）。"""
+    rows = (
+        db.query(AsinPerformance.parent_asin)
+        .filter(AsinPerformance.operation_status == True)
+        .filter(AsinPerformance.parent_asin.isnot(None), AsinPerformance.parent_asin != "")
+        .distinct()
+        .order_by(AsinPerformance.parent_asin)
+        .all()
+    )
+    return [MonitorParentItem(parent_asin=r[0]) for r in rows]
+
+
+@router.get("/monitor/track", response_model=MonitorTrackResponse)
+def get_monitor_track(
+    parent_asin: str = Query(..., description="父 ASIN"),
+    db: Session = Depends(get_db),
+):
+    """返回指定父 ASIN 下所有子 ASIN、所有 week_no 的 search_query 及 volume/impression/click，用于监控表格。"""
+    parent_asin = (parent_asin or "").strip()
+    if not parent_asin:
+        raise HTTPException(status_code=400, detail="parent_asin 不能为空")
+    rows = (
+        db.query(
+            AsinPerformance.child_asin,
+            AsinPerformance.week_no,
+            AsinPerformance.search_query,
+            AsinPerformance.search_query_volume,
+            AsinPerformance.search_query_impression_count,
+            AsinPerformance.search_query_click_count,
+        )
+        .filter(
+            AsinPerformance.parent_asin == parent_asin,
+            AsinPerformance.child_asin.isnot(None),
+        )
+        .order_by(AsinPerformance.child_asin, AsinPerformance.week_no, AsinPerformance.search_query)
+        .all()
+    )
+    weeks = sorted({r[1] for r in rows if r[1] is not None})
+    out_rows = [
+        MonitorTrackRow(
+            child_asin=r[0],
+            week_no=r[1],
+            search_query=r[2],
+            search_query_volume=r[3],
+            search_query_impression_count=r[4],
+            search_query_click_count=r[5],
+        )
+        for r in rows
+    ]
+    return MonitorTrackResponse(parent_asin=parent_asin, weeks=weeks, rows=out_rows)
 
 
 @router.get("/{item_id}", response_model=AsinPerformanceResponse)

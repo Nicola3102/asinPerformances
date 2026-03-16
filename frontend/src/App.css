@@ -238,6 +238,57 @@
   gap: 1rem;
 }
 
+.monitor-desc {
+  color: #555;
+  font-size: 0.9rem;
+  margin-bottom: 1rem;
+}
+
+.monitor-controls {
+  margin-bottom: 1rem;
+}
+
+.monitor-controls label { margin-right: 0.5rem; }
+
+.monitor-select {
+  padding: 0.35rem 0.6rem;
+  min-width: 12rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+
+.monitor-tables {
+  display: flex;
+  flex-direction: column;
+  gap: 2rem;
+}
+
+.monitor-child-block h3 {
+  font-size: 1rem;
+  margin-bottom: 0.5rem;
+  color: #333;
+}
+
+.monitor-table-wrap {
+  overflow-x: auto;
+  margin-bottom: 1rem;
+}
+
+.monitor-track-table { font-size: 0.85rem; }
+
+.monitor-track-table th,
+.monitor-track-table td {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid #ddd;
+  white-space: nowrap;
+}
+
+.monitor-col-query { min-width: 10rem; text-align: left; }
+
+.monitor-week-col { text-align: center; }
+
+.monitor-query-cell { max-width: 14rem; overflow: hidden; text-overflow: ellipsis; }
+
 .group-f-pagination .pagination-btns button {
   padding: 0.4rem 0.8rem;
   border: 1px solid #ccc;

@@ -41,6 +41,19 @@ export interface SummaryRow {
   checked_at?: string | null;
 }
 
+export interface SummaryRowConsolidated {
+  parent_asin: string | null;
+  parent_asin_create_at: string | null;
+  parent_order_total: string | number | null;
+  week_no: number | null;
+  store_ids: number[];
+  child_asins_with_orders: string[];
+  operation_status?: boolean | null;
+  operated_at?: string | null;
+  checked_status?: string | null;
+  checked_at?: string | null;
+}
+
 export interface SearchQueryRow {
   search_query: string | null;
   search_query_volume: number | null;
@@ -95,6 +108,25 @@ export interface GroupFResponse {
   rows: GroupFRow[];
 }
 
+export interface MonitorParentItem {
+  parent_asin: string | null;
+}
+
+export interface MonitorTrackRow {
+  child_asin: string | null;
+  week_no: number | null;
+  search_query: string | null;
+  search_query_volume: number | null;
+  search_query_impression_count: number | null;
+  search_query_click_count: number | null;
+}
+
+export interface MonitorTrackResponse {
+  parent_asin: string | null;
+  weeks: number[];
+  rows: MonitorTrackRow[];
+}
+
 function parseErrorResponse(text: string, status: number): string {
   try {
     const err = text ? JSON.parse(text) : {}
@@ -139,6 +171,15 @@ export async function listSummary(): Promise<SummaryRow[]> {
 
 export async function listSummaryByWeek(week_no: number): Promise<SummaryRow[]> {
   const res = await fetch(`${API_BASE}/asin-performances/summary?week_no=${encodeURIComponent(String(week_no))}`)
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(parseErrorResponse(text, res.status) || 'Failed to fetch summary')
+  }
+  return res.json()
+}
+
+export async function listSummaryConsolidatedByWeek(week_no: number): Promise<SummaryRowConsolidated[]> {
+  const res = await fetch(`${API_BASE}/asin-performances/summary/consolidated?week_no=${encodeURIComponent(String(week_no))}`)
   if (!res.ok) {
     const text = await res.text()
     throw new Error(parseErrorResponse(text, res.status) || 'Failed to fetch summary')
@@ -283,6 +324,26 @@ export async function getGroupFData(
   if (!res.ok) {
     const text = await res.text()
     throw new Error(parseErrorResponse(text, res.status) || 'Failed to fetch Group F data')
+  }
+  return res.json()
+}
+
+export async function getMonitorParents(): Promise<MonitorParentItem[]> {
+  const res = await fetch(`${API_BASE}/asin-performances/monitor/parents`)
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(parseErrorResponse(text, res.status) || 'Failed to fetch monitor parents')
+  }
+  return res.json()
+}
+
+export async function getMonitorTrack(parent_asin: string): Promise<MonitorTrackResponse> {
+  const res = await fetch(
+    `${API_BASE}/asin-performances/monitor/track?${new URLSearchParams({ parent_asin })}`
+  )
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(parseErrorResponse(text, res.status) || 'Failed to fetch monitor track')
   }
   return res.json()
 }

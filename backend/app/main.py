@@ -58,6 +58,16 @@ def _run_scheduled_sync():
         logger.exception("Scheduled sync failed: %s", e)
 
 
+def _run_monitor_daily_track():
+    """
+    每天东八区 8:00 执行：为 operation_status=1 的父 ASIN 做监控追踪标记。
+    数据更新仍由偶数整点 sync 完成，此处仅做日志与后续扩展（如仅同步已操作父 ASIN）。
+    """
+    logger.info(
+        "[Monitor] Daily track at 8:00 UTC+8 (Asia/Shanghai): tick."
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _scheduler
@@ -73,6 +83,15 @@ async def lifespan(app: FastAPI):
                 hour="0,2,4,6,8,10,12,14,16,18,20,22",
                 minute=0,
                 id="online_sync",
+                misfire_grace_time=300,
+            )
+            # 每天东八区 8:00 执行 monitor 追踪（与 8 点 sync 同刻，先打点再 sync 或仅打点）
+            _scheduler.add_job(
+                _run_monitor_daily_track,
+                "cron",
+                hour=8,
+                minute=0,
+                id="monitor_daily_track",
                 misfire_grace_time=300,
             )
             _scheduler.start()
