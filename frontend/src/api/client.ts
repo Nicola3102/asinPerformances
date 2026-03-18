@@ -108,6 +108,46 @@ export interface GroupFResponse {
   rows: GroupFRow[];
 }
 
+export interface GroupASummaryRow {
+  parent_asin: string | null;
+  store_id: number | null;
+  created_at: string | null;
+  week_no: number | null;
+  total_impression_count: number;
+  total_cart_count: number;
+  total_session_count: number;
+  operation_status?: boolean | null;
+  operated_at?: string | null;
+}
+
+export interface GroupASummaryResponse {
+  week_no: number | null;
+  page: number;
+  page_size: number;
+  total: number;
+  total_pages: number;
+  rows: GroupASummaryRow[];
+}
+
+export interface GroupADetailChildRow {
+  child_asin: string | null;
+  child_impression_count: number | null;
+  child_cart: number | null;
+  child_session_count: number | null;
+  search_queries: SearchQueryRow[];
+}
+
+export interface GroupADetailResponse {
+  parent_asin: string | null;
+  store_id: number | null;
+  created_at: string | null;
+  week_no: number | null;
+  total_impression_count: number;
+  total_cart_count: number;
+  total_session_count: number;
+  children: GroupADetailChildRow[];
+}
+
 export interface MonitorParentItem {
   parent_asin: string | null;
 }
@@ -326,6 +366,92 @@ export async function getGroupFData(
     throw new Error(parseErrorResponse(text, res.status) || 'Failed to fetch Group F data')
   }
   return res.json()
+}
+
+export async function listGroupAWeeks(): Promise<number[]> {
+  const res = await fetch(`${API_BASE}/asin-performances/group-a/weeks`)
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(parseErrorResponse(text, res.status) || 'Failed to fetch Group A weeks')
+  }
+  return res.json()
+}
+
+export async function getGroupASummary(
+  week_no?: number | null,
+  page = 1,
+  page_size = 30
+): Promise<GroupASummaryResponse> {
+  const params = new URLSearchParams({
+    page: String(page),
+    page_size: String(page_size),
+  })
+  if (week_no != null) params.set('week_no', String(week_no))
+  const res = await fetch(`${API_BASE}/asin-performances/group-a/summary?${params.toString()}`)
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(parseErrorResponse(text, res.status) || 'Failed to fetch Group A summary')
+  }
+  return res.json()
+}
+
+export async function getGroupADetail(
+  parent_asin: string,
+  week_no: number,
+  store_id: number
+): Promise<GroupADetailResponse> {
+  const params = new URLSearchParams({
+    parent_asin,
+    week_no: String(week_no),
+    store_id: String(store_id),
+  })
+  const res = await fetch(`${API_BASE}/asin-performances/group-a/detail?${params.toString()}`)
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(parseErrorResponse(text, res.status) || 'Failed to fetch Group A detail')
+  }
+  return res.json()
+}
+
+export async function operateGroupA(
+  parent_asin: string,
+  store_id: number,
+  week_no: number
+): Promise<{ updated: number; operated_at?: string | null }> {
+  const res = await fetch(`${API_BASE}/asin-performances/group-a/operate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ parent_asin, store_id, week_no }),
+  })
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(parseErrorResponse(text, res.status) || '操作失败')
+  }
+  return res.json()
+}
+
+export async function downloadGroupAData(week_no: number, parentStoreKeys?: string[]): Promise<void> {
+  const params = new URLSearchParams({ week_no: String(week_no) })
+  if (parentStoreKeys && parentStoreKeys.length > 0) {
+    for (const key of parentStoreKeys) {
+      const v = (key || '').trim()
+      if (v) params.append('parent_store_keys', v)
+    }
+  }
+  const res = await fetch(`${API_BASE}/asin-performances/group-a/export?${params.toString()}`)
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(parseErrorResponse(text, res.status) || 'Failed to export Group A data')
+  }
+  const blob = await res.blob()
+  const url = window.URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `group_a_week_${week_no}.csv`
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  window.URL.revokeObjectURL(url)
 }
 
 export async function getMonitorParents(): Promise<MonitorParentItem[]> {

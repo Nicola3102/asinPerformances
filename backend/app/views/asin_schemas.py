@@ -115,6 +115,52 @@ class GroupFResponse(BaseModel):
     rows: List[GroupFRow] = []
 
 
+class GroupASummaryRow(BaseModel):
+    parent_asin: Optional[str] = None
+    store_id: Optional[int] = None
+    created_at: Optional[datetime] = None
+    week_no: Optional[int] = None
+    total_impression_count: int = 0
+    total_cart_count: int = 0
+    total_session_count: int = 0
+    operation_status: Optional[bool] = False
+    operated_at: Optional[datetime] = None
+
+
+class GroupASummaryResponse(BaseModel):
+    week_no: Optional[int] = None
+    page: int = 1
+    page_size: int = 30
+    total: int = 0
+    total_pages: int = 0
+    rows: List[GroupASummaryRow] = []
+
+
+class GroupADetailChildRow(BaseModel):
+    child_asin: Optional[str] = None
+    child_impression_count: Optional[int] = None
+    child_cart: Optional[int] = None
+    child_session_count: Optional[int] = None
+    search_queries: List[SearchQueryRow] = []
+
+
+class GroupADetailResponse(BaseModel):
+    parent_asin: Optional[str] = None
+    store_id: Optional[int] = None
+    created_at: Optional[datetime] = None
+    week_no: Optional[int] = None
+    total_impression_count: int = 0
+    total_cart_count: int = 0
+    total_session_count: int = 0
+    children: List[GroupADetailChildRow] = []
+
+
+class GroupAOperateBody(BaseModel):
+    parent_asin: str
+    store_id: int
+    week_no: int | str
+
+
 class MonitorParentItem(BaseModel):
     """operation_status=1 的父 ASIN 列表项"""
     parent_asin: Optional[str] = None

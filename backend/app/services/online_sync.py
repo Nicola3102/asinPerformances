@@ -417,11 +417,15 @@ def _step2_fetch_for_parents(
             AsinPerformance.parent_asin == parent_asin,
         ).distinct().all()
         ordered_set = {(r[0], r[1], r[2]) for r in existing}
-        # 其他子：(child_asin, store_id, week_no_str, week_no_int) 且不在 ordered_set
+        # 其他子：(child_asin, store_id, week_no_str, week_no_int) 且不在 ordered_set；
+        # 仅当 (parent_asin, week_no, store_id) 在 parent_lookup 中时才纳入，避免写入「该父在本 store 本周无订单」的行，
+        # 否则 _recompute_parent_order_totals 会将该组 parent_order_total 置为 0。
         other_triples = []
         for (store_id, asin) in listing:
             for (wk_str, wk_int) in target_weeks:
                 if (asin, store_id, wk_int) in ordered_set:
+                    continue
+                if (parent_asin, wk_int, store_id) not in parent_lookup:
                     continue
                 other_triples.append((asin, store_id, wk_str, wk_int))
         if not other_triples:
@@ -1023,6 +1027,9 @@ def _recompute_parent_order_totals(local_db: Session) -> int:
     updated_groups = 0
     for pa, wn, sid, tot in groups:
         tot_val = int(tot) if tot is not None else 0
+        # 不将 parent_order_total 更新为 0，避免覆盖为「该组仅有 order_num=0 的 Step2 行」导致的 0
+        if tot_val == 0:
+            continue
         n = local_db.query(AsinPerformance).filter(
             AsinPerformance.parent_asin == pa,
             AsinPerformance.week_no == wn,

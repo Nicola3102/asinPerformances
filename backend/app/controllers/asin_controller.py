@@ -13,13 +13,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import func, text
+from sqlalchemy import func, text, tuple_
 
 from app.online_engine import get_online_engine
 
 from app.config import settings
 from app.database import get_db
-from app.models import AsinPerformance
+from app.models import AsinPerformance, GroupA
 from app.views import (
     AsinPerformanceCreate,
     AsinPerformanceResponse,
@@ -33,6 +33,11 @@ from app.views import (
     SearchQueryRow,
     GroupFRow,
     GroupFResponse,
+    GroupASummaryRow,
+    GroupASummaryResponse,
+    GroupADetailChildRow,
+    GroupADetailResponse,
+    GroupAOperateBody,
     MonitorParentItem,
     MonitorTrackRow,
     MonitorTrackResponse,
@@ -42,6 +47,11 @@ from app.services.group_f_spark import (
     compute_scan_weeks_list_for_api,
     _group_f_current_week_no,
     _group_f_to_mysql_week_no,
+)
+from app.services.groupA_impression import (
+    sync_group_a_impression,
+    _get_sync_date_range,
+    _date_to_week_no,
 )
 
 router = APIRouter(prefix="/api/asin-performances", tags=["asin-performances"])
@@ -55,7 +65,7 @@ _GROUP_F_STALE_SEC = 25 * 60   # 超过此时长视为过期，允许新请求
 _GROUP_F_STUCK_SEC = 20 * 60   # 超过此时长在 status 中标记为 is_stuck
 
 
-def _fetch_listing_meta_for_export(rows: list[AsinPerformance]) -> dict:
+def _fetch_listing_meta_for_export(rows) -> dict:
     """
     通过 (child_asin, store_id) 从 online 库补齐 pid/title/search_term。
     返回 key=(child_asin, store_id) -> {"pid": ..., "title": ..., "search_term": ...}
@@ -474,6 +484,288 @@ class RefreshQueryStatusBody(BaseModel):
     week_no: int | str
 
 
+@router.post("/group-a")
+def trigger_group_a_sync(
+    week_no: Optional[str] = Query(None, description="Week number, optional; defaults to current script logic"),
+):
+    """触发 Group A 同步，将结果写入本地 group_A 表。"""
+    try:
+        if week_no is not None and str(week_no).strip():
+            wk_str = str(week_no).strip().replace(",", "")
+            if not wk_str.isdigit():
+                raise HTTPException(status_code=400, detail="week_no 格式不合法")
+        else:
+            date_start_str, date_end_str = _get_sync_date_range()
+            date_end_d = datetime.strptime(date_end_str, "%Y-%m-%d").date()
+            reference_date = date_end_d - timedelta(days=1)
+            wk_str, _ = _date_to_week_no(reference_date)
+            logger.info(
+                "[GroupA] API auto week_no by date_end-1: date_start=%s date_end=%s reference_date=%s -> week_no=%s",
+                date_start_str,
+                date_end_str,
+                reference_date.strftime("%Y-%m-%d"),
+                wk_str,
+            )
+
+        logger.info("[GroupA] API trigger start: week_no=%s", wk_str)
+        out = sync_group_a_impression(wk_str)
+        logger.info("[GroupA] API trigger done: week_no=%s result=%s", wk_str, out)
+        return {
+            "status": "ok",
+            "week_no": int(wk_str),
+            "message": f"Group A sync completed for week_no={wk_str}",
+            "result": out,
+        }
+    except HTTPException:
+        raise
+    except ValueError as e:
+        logger.warning("[GroupA] API trigger validation failed: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("[GroupA] API trigger failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/group-a/weeks", response_model=List[int])
+def list_group_a_weeks(db: Session = Depends(get_db)):
+    rows = (
+        db.query(GroupA.week_no)
+        .filter(GroupA.week_no.isnot(None))
+        .distinct()
+        .order_by(GroupA.week_no.desc())
+        .all()
+    )
+    out: List[int] = []
+    for r in rows:
+        try:
+            out.append(int(r[0]))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+@router.get("/group-a/summary", response_model=GroupASummaryResponse)
+def list_group_a_summary(
+    week_no: Optional[int] = Query(None, description="Week number, default latest week"),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(30, ge=1, le=100, description="Page size"),
+    db: Session = Depends(get_db),
+):
+    selected_week = week_no if week_no is not None else db.query(func.max(GroupA.week_no)).scalar()
+    if selected_week is None:
+        return GroupASummaryResponse(week_no=None, page=page, page_size=page_size, total=0, total_pages=0, rows=[])
+
+    child_agg = (
+        db.query(
+            GroupA.parent_asin.label("parent_asin"),
+            GroupA.store_id.label("store_id"),
+            GroupA.week_no.label("week_no"),
+            func.max(GroupA.parent_asin_created_at).label("created_at"),
+            GroupA.child_asin.label("child_asin"),
+            func.max(func.coalesce(GroupA.child_impression_count, 0)).label("child_impression_count"),
+            func.max(func.coalesce(GroupA.child_cart, 0)).label("child_cart"),
+            func.max(func.coalesce(GroupA.child_session_count, 0)).label("child_session_count"),
+            func.max(func.coalesce(GroupA.operation_status, 0)).label("operation_status"),
+            func.max(GroupA.operated_at).label("operated_at"),
+        )
+        .filter(
+            GroupA.week_no == selected_week,
+            GroupA.parent_asin.isnot(None),
+            GroupA.parent_asin != "",
+            GroupA.store_id.isnot(None),
+            GroupA.child_asin.isnot(None),
+            GroupA.child_asin != "",
+        )
+        .group_by(GroupA.parent_asin, GroupA.store_id, GroupA.week_no, GroupA.child_asin)
+        .subquery()
+    )
+
+    summary_query = (
+        db.query(
+            child_agg.c.parent_asin.label("parent_asin"),
+            child_agg.c.store_id.label("store_id"),
+            func.max(child_agg.c.created_at).label("created_at"),
+            child_agg.c.week_no.label("week_no"),
+            func.sum(child_agg.c.child_impression_count).label("total_impression_count"),
+            func.sum(child_agg.c.child_cart).label("total_cart_count"),
+            func.sum(child_agg.c.child_session_count).label("total_session_count"),
+            func.max(child_agg.c.operation_status).label("operation_status"),
+            func.max(child_agg.c.operated_at).label("operated_at"),
+        )
+        .group_by(child_agg.c.parent_asin, child_agg.c.store_id, child_agg.c.week_no)
+    )
+
+    summary_subq = summary_query.subquery()
+    total = int(db.query(func.count()).select_from(summary_subq).scalar() or 0)
+    total_pages = (total + page_size - 1) // page_size if total > 0 else 0
+
+    rows = (
+        db.query(summary_subq)
+        .order_by(
+            summary_subq.c.total_impression_count.desc(),
+            summary_subq.c.total_cart_count.desc(),
+            summary_subq.c.total_session_count.desc(),
+            summary_subq.c.parent_asin.asc(),
+            summary_subq.c.store_id.asc(),
+        )
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    out_rows = [
+        GroupASummaryRow(
+            parent_asin=r.parent_asin,
+            store_id=int(r.store_id) if r.store_id is not None else None,
+            created_at=r.created_at,
+            week_no=int(r.week_no) if r.week_no is not None else None,
+            total_impression_count=int(r.total_impression_count or 0),
+            total_cart_count=int(r.total_cart_count or 0),
+            total_session_count=int(r.total_session_count or 0),
+            operation_status=bool(int(r.operation_status)) if r.operation_status is not None else False,
+            operated_at=r.operated_at,
+        )
+        for r in rows
+    ]
+    return GroupASummaryResponse(
+        week_no=int(selected_week),
+        page=page,
+        page_size=page_size,
+        total=total,
+        total_pages=total_pages,
+        rows=out_rows,
+    )
+
+
+@router.get("/group-a/detail", response_model=GroupADetailResponse)
+def get_group_a_detail(
+    parent_asin: str = Query(..., description="Parent ASIN"),
+    week_no: int = Query(..., description="Week number"),
+    store_id: int = Query(..., description="Store ID"),
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(GroupA)
+        .filter(
+            GroupA.parent_asin == parent_asin,
+            GroupA.week_no == week_no,
+            GroupA.store_id == store_id,
+        )
+        .order_by(GroupA.child_asin, GroupA.search_query)
+        .all()
+    )
+    if not rows:
+        return GroupADetailResponse(
+            parent_asin=parent_asin,
+            week_no=week_no,
+            store_id=store_id,
+            children=[],
+        )
+
+    total_impression_count = 0
+    total_cart_count = 0
+    total_session_count = 0
+    by_child: dict[tuple[str, int], dict] = {}
+    for r in rows:
+        child_asin = (r.child_asin or "").strip()
+        if child_asin == "":
+            continue
+        key = (child_asin, int(r.store_id) if r.store_id is not None else store_id)
+        if key not in by_child:
+            child_impression_count = int(r.child_impression_count or 0)
+            child_cart = int(r.child_cart or 0)
+            child_session_count = int(r.child_session_count or 0)
+            by_child[key] = {
+                "child_asin": child_asin,
+                "child_impression_count": child_impression_count,
+                "child_cart": child_cart,
+                "child_session_count": child_session_count,
+                "search_queries": [],
+            }
+            total_impression_count += child_impression_count
+            total_cart_count += child_cart
+            total_session_count += child_session_count
+
+        by_child[key]["search_queries"].append(
+            SearchQueryRow(
+                search_query=r.search_query,
+                search_query_volume=r.search_query_volume,
+                search_query_impression_count=r.search_query_impression_count,
+                search_query_total_impression=r.search_query_total_impression_count,
+                search_query_click_count=r.search_query_click_count,
+                search_query_total_click=r.search_query_total_click_count,
+                search_query_purchase_count=None,
+            )
+        )
+
+    def _sort_key(row: SearchQueryRow):
+        return (
+            -(row.search_query_impression_count or 0),
+            -(row.search_query_volume or 0),
+            row.search_query or "",
+        )
+
+    children = []
+    for group in by_child.values():
+        sorted_queries = sorted(group["search_queries"], key=_sort_key)
+        children.append(
+            GroupADetailChildRow(
+                child_asin=group["child_asin"],
+                child_impression_count=group["child_impression_count"],
+                child_cart=group["child_cart"],
+                child_session_count=group["child_session_count"],
+                search_queries=sorted_queries,
+            )
+        )
+    children.sort(key=lambda c: (-(c.child_impression_count or 0), -(c.child_session_count or 0), c.child_asin or ""))
+
+    return GroupADetailResponse(
+        parent_asin=parent_asin,
+        store_id=store_id,
+        created_at=rows[0].parent_asin_created_at,
+        week_no=week_no,
+        total_impression_count=total_impression_count,
+        total_cart_count=total_cart_count,
+        total_session_count=total_session_count,
+        children=children,
+    )
+
+
+@router.post("/group-a/operate")
+def operate_group_a(
+    body: GroupAOperateBody,
+    db: Session = Depends(get_db),
+):
+    parent_asin = (body.parent_asin or "").strip()
+    if parent_asin == "":
+        raise HTTPException(status_code=400, detail="parent_asin 不能为空")
+    week_raw = str(body.week_no).strip().replace(",", "")
+    if not week_raw.isdigit():
+        raise HTTPException(status_code=400, detail="week_no 格式不合法")
+    week_no = int(week_raw)
+    now = datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None)
+    n = (
+        db.query(GroupA)
+        .filter(
+            func.trim(GroupA.parent_asin) == parent_asin,
+            GroupA.store_id == body.store_id,
+            GroupA.week_no == week_no,
+        )
+        .update(
+            {"operation_status": True, "operated_at": now},
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    return {
+        "updated": n,
+        "parent_asin": parent_asin,
+        "store_id": int(body.store_id),
+        "week_no": week_no,
+        "operated_at": now.isoformat(),
+    }
+
+
 @router.post("/query-status/refresh")
 def refresh_query_status(
     body: RefreshQueryStatusBody,
@@ -860,6 +1152,98 @@ def export_week_data(
         ])
     output.seek(0)
     filename = f"asin_performances_week_{week_no}.csv"
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/group-a/export")
+def export_group_a_data(
+    week_no: int = Query(..., description="Week number"),
+    parent_store_keys: Optional[List[str]] = Query(None, description="Optional parent_asin||store_id filters"),
+    db: Session = Depends(get_db),
+):
+    """下载指定 week_no 的 group_A 数据（CSV），支持按父 ASIN + store_id 过滤。"""
+    q = db.query(GroupA).filter(GroupA.week_no == week_no)
+    if parent_store_keys:
+        normalized_pairs = []
+        for raw in parent_store_keys:
+            if not raw:
+                continue
+            parts = raw.split("||", 1)
+            if len(parts) != 2:
+                continue
+            parent_asin = parts[0].strip()
+            store_raw = parts[1].strip()
+            if not parent_asin or not store_raw.isdigit():
+                continue
+            normalized_pairs.append((parent_asin, int(store_raw)))
+        if normalized_pairs:
+            q = q.filter(tuple_(GroupA.parent_asin, GroupA.store_id).in_(normalized_pairs))
+
+    rows = q.order_by(
+        GroupA.parent_asin,
+        GroupA.store_id,
+        GroupA.child_asin,
+        GroupA.id,
+    ).all()
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"week_no={week_no} 无可导出数据")
+
+    headers = [
+        "id",
+        "store_id",
+        "parent_asin",
+        "child_asin",
+        "pid",
+        "search_term",
+        "title",
+        "parent_asin_created_at",
+        "week_no",
+        "child_impression_count",
+        "child_cart",
+        "child_session_count",
+        "search_query",
+        "search_query_volume",
+        "search_query_impression_count",
+        "search_query_total_impression_count",
+        "search_query_click_count",
+        "search_query_total_click_count",
+        "operation_status",
+        "operated_at",
+    ]
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(headers)
+    meta_map = _fetch_listing_meta_for_export(rows)
+    for r in rows:
+        meta = meta_map.get((r.child_asin, int(r.store_id) if r.store_id is not None else None), {})
+        writer.writerow([
+            r.id,
+            r.store_id,
+            r.parent_asin,
+            r.child_asin,
+            meta.get("pid"),
+            meta.get("search_term"),
+            meta.get("title"),
+            r.parent_asin_created_at.isoformat() if r.parent_asin_created_at else None,
+            r.week_no,
+            r.child_impression_count,
+            r.child_cart,
+            r.child_session_count,
+            r.search_query,
+            r.search_query_volume,
+            r.search_query_impression_count,
+            r.search_query_total_impression_count,
+            r.search_query_click_count,
+            r.search_query_total_click_count,
+            r.operation_status,
+            r.operated_at.isoformat() if r.operated_at else None,
+        ])
+    output.seek(0)
+    filename = f"group_a_week_{week_no}.csv"
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv; charset=utf-8",

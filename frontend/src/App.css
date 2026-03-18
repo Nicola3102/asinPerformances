@@ -131,6 +131,14 @@
   flex-wrap: wrap;
 }
 
+.group-a-controls {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+}
+
 .group-f-controls label {
   display: flex;
   align-items: center;
@@ -236,6 +244,7 @@
   display: flex;
   align-items: center;
   gap: 1rem;
+  flex-wrap: wrap;
 }
 
 .monitor-desc {
@@ -305,6 +314,22 @@
 .group-f-pagination .pagination-btns button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.pagination-jump {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: #333;
+  font-size: 0.9rem;
+}
+
+.pagination-jump input {
+  width: 4.5rem;
+  padding: 0.35rem 0.45rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-size: 0.9rem;
 }
 
 .form {
