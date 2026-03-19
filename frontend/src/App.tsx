@@ -774,9 +774,18 @@ function buildChildTables(track: MonitorTrackResponse): Map<string, { queries: s
   }
   const out = new Map<string, { queries: string[]; cell: Map<string, { v: number | null; i: number | null; c: number | null }> }>()
   for (const [child, byQuery] of byChild) {
-    const queries = Array.from(byQuery.keys()).sort()
+    const queries = Array.from(byQuery.entries())
+      .filter(([q, byWeek]) => {
+        if (q.trim() !== '') return true
+        return Array.from(byWeek.values()).some((vals) => vals.v != null || vals.i != null || vals.c != null)
+      })
+      .map(([q]) => q)
+      .sort()
+    if (queries.length === 0) continue
     const cell = new Map<string, { v: number | null; i: number | null; c: number | null }>()
-    for (const [q, byWeek] of byQuery) {
+    for (const q of queries) {
+      const byWeek = byQuery.get(q)
+      if (!byWeek) continue
       for (const [week, vals] of byWeek) {
         cell.set(`${q}\t${week}`, vals)
       }
