@@ -1342,16 +1342,19 @@ def list_detail_by_parent_week(
 
 @router.get("/monitor/parents")
 def list_monitor_parents(db: Session = Depends(get_db)):
-    """返回所有 operation_status=1 的父 ASIN 列表（去重）。"""
+    """返回所有 operation_status=1 的父 ASIN 列表（去重），附最早 operated_at。"""
     rows = (
-        db.query(AsinPerformance.parent_asin)
+        db.query(
+            AsinPerformance.parent_asin,
+            func.min(AsinPerformance.operated_at).label("operated_at"),
+        )
         .filter(AsinPerformance.operation_status == True)
         .filter(AsinPerformance.parent_asin.isnot(None), AsinPerformance.parent_asin != "")
-        .distinct()
+        .group_by(AsinPerformance.parent_asin)
         .order_by(AsinPerformance.parent_asin)
         .all()
     )
-    return [MonitorParentItem(parent_asin=r[0]) for r in rows]
+    return [MonitorParentItem(parent_asin=r[0], operated_at=r[1]) for r in rows]
 
 
 @router.get("/monitor/track", response_model=MonitorTrackResponse)

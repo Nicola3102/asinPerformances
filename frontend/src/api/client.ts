@@ -169,6 +169,7 @@ export interface GroupADetailResponse {
 
 export interface MonitorParentItem {
   parent_asin: string | null;
+  operated_at: string | null;
 }
 
 export interface MonitorTrackRow {

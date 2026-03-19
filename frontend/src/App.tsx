@@ -752,11 +752,16 @@ function AsinHomePage() {
 
 const GROUP_F_PAGE_SIZE = 30
 const GROUP_A_PAGE_SIZE = 30
+const MONITOR_VOLUME_SPIKE_THRESHOLD = 200
 
 type AsinFilter = 'all' | 'has' | 'empty'
 
 /** 按 child_asin 分组，每组内按 search_query 建表：行=search_query，列=week_no，单元格=volume/impression/click */
-function buildChildTables(track: MonitorTrackResponse): Map<string, { queries: string[]; cell: Map<string, { v: number | null; i: number | null; c: number | null }> }> {
+function buildChildTables(track: MonitorTrackResponse): Map<string, {
+  queries: string[];
+  cell: Map<string, { v: number | null; i: number | null; c: number | null }>;
+  weekSummary: Map<number, { queryCount: number; volumeTotal: number; impressionTotal: number; clickTotal: number }>;
+}> {
   const byChild = new Map<string, Map<string, Map<number, { v: number | null; i: number | null; c: number | null }>>>()
   for (const r of track.rows) {
     const c = r.child_asin ?? ''
@@ -772,7 +777,11 @@ function buildChildTables(track: MonitorTrackResponse): Map<string, { queries: s
       c: r.search_query_click_count ?? null,
     })
   }
-  const out = new Map<string, { queries: string[]; cell: Map<string, { v: number | null; i: number | null; c: number | null }> }>()
+  const out = new Map<string, {
+    queries: string[];
+    cell: Map<string, { v: number | null; i: number | null; c: number | null }>;
+    weekSummary: Map<number, { queryCount: number; volumeTotal: number; impressionTotal: number; clickTotal: number }>;
+  }>()
   for (const [child, byQuery] of byChild) {
     const queries = Array.from(byQuery.entries())
       .filter(([q, byWeek]) => {
@@ -783,14 +792,26 @@ function buildChildTables(track: MonitorTrackResponse): Map<string, { queries: s
       .sort()
     if (queries.length === 0) continue
     const cell = new Map<string, { v: number | null; i: number | null; c: number | null }>()
+    const weekSummary = new Map<number, { queryCount: number; volumeTotal: number; impressionTotal: number; clickTotal: number }>()
     for (const q of queries) {
       const byWeek = byQuery.get(q)
       if (!byWeek) continue
       for (const [week, vals] of byWeek) {
         cell.set(`${q}\t${week}`, vals)
+        const summary = weekSummary.get(week) ?? {
+          queryCount: 0,
+          volumeTotal: 0,
+          impressionTotal: 0,
+          clickTotal: 0,
+        }
+        summary.queryCount += 1
+        summary.volumeTotal += vals.v ?? 0
+        summary.impressionTotal += vals.i ?? 0
+        summary.clickTotal += vals.c ?? 0
+        weekSummary.set(week, summary)
       }
     }
-    out.set(child, { queries, cell })
+    out.set(child, { queries, cell, weekSummary })
   }
   return out
 }
@@ -798,6 +819,7 @@ function buildChildTables(track: MonitorTrackResponse): Map<string, { queries: s
 function MonitorPage() {
   const [parents, setParents] = useState<MonitorParentItem[]>([])
   const [selectedParent, setSelectedParent] = useState('')
+  const [parentSearch, setParentSearch] = useState('')
   const [track, setTrack] = useState<MonitorTrackResponse | null>(null)
   const [loadingParents, setLoadingParents] = useState(true)
   const [loadingTrack, setLoadingTrack] = useState(false)
@@ -828,8 +850,22 @@ function MonitorPage() {
       .finally(() => setLoadingTrack(false))
   }, [selectedParent])
 
+  const filteredParents = useMemo(() => {
+    const keyword = parentSearch.trim().toUpperCase()
+    if (!keyword) return parents
+    return parents.filter((p) => (p.parent_asin ?? '').toUpperCase().includes(keyword))
+  }, [parents, parentSearch])
+
+  useEffect(() => {
+    if (!filteredParents.length) return
+    const matched = filteredParents.some((p) => (p.parent_asin ?? '') === selectedParent)
+    if (!matched) setSelectedParent(filteredParents[0].parent_asin ?? '')
+  }, [filteredParents, selectedParent])
+
   const childTables = track ? buildChildTables(track) : new Map()
   const weeks = track?.weeks ?? []
+  const selectedParentMeta = parents.find((p) => (p.parent_asin ?? '') === selectedParent) ?? null
+  const selectedParentVisible = filteredParents.some((p) => (p.parent_asin ?? '') === selectedParent)
 
   return (
     <div className="app">
@@ -841,6 +877,16 @@ function MonitorPage() {
       {!loadingParents && parents.length > 0 && (
         <div className="monitor-controls">
           <label>
+            搜索父 ASIN：
+            <input
+              type="text"
+              value={parentSearch}
+              onChange={(e) => setParentSearch(e.target.value)}
+              placeholder="输入父 ASIN 关键字"
+              className="monitor-select"
+            />
+          </label>
+          <label>
             父 ASIN：
             <select
               value={selectedParent}
@@ -848,18 +894,26 @@ function MonitorPage() {
               disabled={loadingTrack}
               className="monitor-select"
             >
-              {parents.map((p) => (
+              {filteredParents.map((p) => (
                 <option key={p.parent_asin ?? ''} value={p.parent_asin ?? ''}>{p.parent_asin ?? '–'}</option>
               ))}
             </select>
           </label>
+          {selectedParentMeta && (
+            <span className="monitor-operated-at">
+              最早 operated_at：{formatCreatedAt(selectedParentMeta.operated_at)}
+            </span>
+          )}
         </div>
       )}
-      {loadingTrack && <p className="loading-hint">加载追踪数据...</p>}
-      {!loadingTrack && track && childTables.size === 0 && <p className="empty-hint">该父 ASIN 暂无子 ASIN 或 search_query 数据。</p>}
-      {!loadingTrack && track && childTables.size > 0 && (
+      {!loadingParents && parents.length > 0 && filteredParents.length === 0 && (
+        <p className="empty-hint">未匹配到父 ASIN，请调整搜索关键字。</p>
+      )}
+      {loadingTrack && selectedParentVisible && <p className="loading-hint">加载追踪数据...</p>}
+      {!loadingTrack && track && selectedParentVisible && childTables.size === 0 && <p className="empty-hint">该父 ASIN 暂无子 ASIN 或 search_query 数据。</p>}
+      {!loadingTrack && track && selectedParentVisible && childTables.size > 0 && (
         <div className="monitor-tables">
-          {Array.from(childTables.entries()).map(([childAsin, { queries, cell }]) => (
+          {Array.from(childTables.entries()).map(([childAsin, { queries, cell, weekSummary }]) => (
             <div key={childAsin} className="monitor-child-block">
               <h3>子 ASIN: {childAsin}</h3>
               <div className="monitor-table-wrap">
@@ -867,26 +921,43 @@ function MonitorPage() {
                   <thead>
                     <tr>
                       <th rowSpan={2} className="monitor-col-query">search_query</th>
-                      {weeks.map((w) => (
-                        <th key={w} colSpan={3} className="monitor-week-col">week {w}</th>
-                      ))}
+                      {weeks.map((w) => {
+                        const summary = weekSummary.get(w)
+                        return (
+                          <th key={w} colSpan={3} className="monitor-week-col">
+                            {`week ${w}(${summary?.queryCount ?? 0})`}
+                          </th>
+                        )
+                      })}
                     </tr>
                     <tr>
-                      {weeks.flatMap((w) => [
-                        <th key={`${w}-v`}>volume</th>,
-                        <th key={`${w}-i`}>impression</th>,
-                        <th key={`${w}-c`}>click</th>,
-                      ])}
+                      {weeks.flatMap((w) => {
+                        const summary = weekSummary.get(w)
+                        return [
+                          <th key={`${w}-v`}>{`volume(${summary?.volumeTotal ?? 0})`}</th>,
+                          <th key={`${w}-i`}>{`impression(${summary?.impressionTotal ?? 0})`}</th>,
+                          <th key={`${w}-c`}>{`click(${summary?.clickTotal ?? 0})`}</th>,
+                        ]
+                      })}
                     </tr>
                   </thead>
                   <tbody>
                     {queries.map((q: string) => (
                       <tr key={q}>
                         <td className="monitor-query-cell">{q || '–'}</td>
-                        {weeks.flatMap((w) => {
+                        {weeks.flatMap((w, idx) => {
                           const val = cell.get(`${q}\t${w}`) ?? { v: null, i: null, c: null }
+                          const prevWeek = idx > 0 ? weeks[idx - 1] : null
+                          const prevVal = prevWeek != null ? (cell.get(`${q}\t${prevWeek}`) ?? { v: null, i: null, c: null }) : null
+                          const highlightVolume =
+                            idx > 0 &&
+                            val.v != null &&
+                            val.v >= MONITOR_VOLUME_SPIKE_THRESHOLD &&
+                            (prevVal == null || prevVal.v == null || prevVal.v <= 0)
                           return [
-                            <td key={`${q}-${w}-v`}>{formatNum(val.v)}</td>,
+                            <td key={`${q}-${w}-v`} className={highlightVolume ? 'monitor-volume-spike' : undefined}>
+                              {formatNum(val.v)}
+                            </td>,
                             <td key={`${q}-${w}-i`}>{formatNum(val.i)}</td>,
                             <td key={`${q}-${w}-c`}>{formatNum(val.c)}</td>,
                           ]

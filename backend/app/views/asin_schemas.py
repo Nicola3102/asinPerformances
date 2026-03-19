@@ -167,6 +167,7 @@ class GroupAOperateBody(BaseModel):
 class MonitorParentItem(BaseModel):
     """operation_status=1 的父 ASIN 列表项"""
     parent_asin: Optional[str] = None
+    operated_at: Optional[datetime] = None
 
 
 class MonitorTrackRow(BaseModel):

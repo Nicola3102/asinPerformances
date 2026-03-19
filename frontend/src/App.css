@@ -254,16 +254,29 @@
 }
 
 .monitor-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
   margin-bottom: 1rem;
 }
 
-.monitor-controls label { margin-right: 0.5rem; }
+.monitor-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
 
 .monitor-select {
   padding: 0.35rem 0.6rem;
   min-width: 12rem;
   border: 1px solid #ccc;
   border-radius: 4px;
+}
+
+.monitor-operated-at {
+  color: #666;
+  font-size: 0.9rem;
 }
 
 .monitor-tables {
@@ -297,6 +310,11 @@
 .monitor-week-col { text-align: center; }
 
 .monitor-query-cell { max-width: 14rem; overflow: hidden; text-overflow: ellipsis; }
+
+.monitor-volume-spike {
+  color: #d93025 !important;
+  font-weight: 700;
+}
 
 .group-f-pagination .pagination-btns button {
   padding: 0.4rem 0.8rem;
