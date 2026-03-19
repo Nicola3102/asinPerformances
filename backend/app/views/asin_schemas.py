@@ -77,6 +77,7 @@ class SearchQueryRow(BaseModel):
     search_query: Optional[str] = None
     search_query_volume: Optional[int] = None
     search_query_impression_count: Optional[int] = None
+    search_query_cart_count: Optional[int] = None
     search_query_total_impression: Optional[int] = None
     search_query_click_count: Optional[int] = None
     search_query_total_click: Optional[int] = None
@@ -112,6 +113,7 @@ class GroupFRow(BaseModel):
 class GroupFResponse(BaseModel):
     """Group F 接口响应"""
     weeks: List[int] = []
+    business_weeks: List[int] = []
     rows: List[GroupFRow] = []
 
 

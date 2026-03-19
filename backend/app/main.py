@@ -1,6 +1,7 @@
 import logging
 import threading
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from typing import Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -15,6 +16,11 @@ from app.controllers.sync_controller import router as sync_router
 from app.database import init_db
 from app.logging_config import setup_logging
 from app.services.online_sync import sync_from_online_db
+from app.services.groupA_impression import (
+    sync_group_a_impression,
+    _get_sync_date_range,
+    _date_to_week_no,
+)
 from app.sync_run_record import (
     now_asia,
     is_even_hour,
@@ -68,6 +74,34 @@ def _run_monitor_daily_track():
     )
 
 
+def _run_scheduled_group_a_sync():
+    """
+    定时任务（东八区每 N 小时整点）：执行 Group A 同步。
+    week_no 计算逻辑与 groupA_impression.py 命令行默认行为一致。
+    """
+    now = now_asia()
+    logger.info(
+        "[GroupA] Scheduled sync triggered at %s (Asia/Shanghai)",
+        now.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    try:
+        date_start_str, date_end_str = _get_sync_date_range()
+        date_end_d = now.date() + timedelta(days=1)
+        reference_date = date_end_d - timedelta(days=1)
+        wk_str, _ = _date_to_week_no(reference_date)
+        logger.info(
+            "[GroupA] Scheduled sync starting: date_start=%s date_end=%s reference_date=%s -> week_no=%s",
+            date_start_str,
+            date_end_str,
+            reference_date.strftime("%Y-%m-%d"),
+            wk_str,
+        )
+        out = sync_group_a_impression(wk_str)
+        logger.info("[GroupA] Scheduled sync done: week_no=%s result=%s", wk_str, out)
+    except Exception as e:
+        logger.exception("[GroupA] Scheduled sync failed: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _scheduler
@@ -94,9 +128,22 @@ async def lifespan(app: FastAPI):
                 id="monitor_daily_track",
                 misfire_grace_time=300,
             )
+            group_a_interval = max(1, int(settings.GROUP_A_SYNC_INTERVAL_HOURS or 4))
+            group_a_hours = ",".join(str(h) for h in range(0, 24, group_a_interval))
+            # Group A：东八区每 N 小时整点执行一次
+            _scheduler.add_job(
+                _run_scheduled_group_a_sync,
+                "cron",
+                hour=group_a_hours,
+                minute=0,
+                id="group_a_sync",
+                misfire_grace_time=300,
+            )
             _scheduler.start()
             job = _scheduler.get_job("online_sync")
             next_run = job.next_run_time if job else None
+            group_a_job = _scheduler.get_job("group_a_sync")
+            group_a_next_run = group_a_job.next_run_time if group_a_job else None
             # 若当前为东八区偶数小时且本小时内未执行过，启动时补跑一次
             now = now_asia()
             if is_even_hour(now) and should_run_scheduled_sync():
@@ -109,9 +156,25 @@ async def lifespan(app: FastAPI):
                     t.start()
                 except Exception as e:
                     logger.exception("Startup sync failed: %s", e)
+            if now.hour % settings.GROUP_A_SYNC_INTERVAL_HOURS == 0:
+                logger.info(
+                    "[GroupA] Scheduled sync: current hour %s matches %sh window (Asia/Shanghai) — running once in background.",
+                    now.hour,
+                    settings.GROUP_A_SYNC_INTERVAL_HOURS,
+                )
+                try:
+                    t = threading.Thread(target=_run_scheduled_group_a_sync, daemon=True)
+                    t.start()
+                except Exception as e:
+                    logger.exception("[GroupA] Startup sync failed: %s", e)
             logger.info(
                 "Scheduled sync enabled: every 2h at :00 (even hours Asia/Shanghai), next_run_time=%s",
                 next_run,
+            )
+            logger.info(
+                "[GroupA] Scheduled sync enabled: every %sh at :00 (Asia/Shanghai), next_run_time=%s",
+                settings.GROUP_A_SYNC_INTERVAL_HOURS,
+                group_a_next_run,
             )
         except Exception as e:
             logger.warning("Scheduled sync not started: %s", e)

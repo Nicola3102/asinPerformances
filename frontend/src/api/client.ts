@@ -58,6 +58,7 @@ export interface SearchQueryRow {
   search_query: string | null;
   search_query_volume: number | null;
   search_query_impression_count: number | null;
+  search_query_cart_count: number | null;
   search_query_total_impression: number | null;
   search_query_click_count: number | null;
   search_query_total_click: number | null;
@@ -105,6 +106,7 @@ export interface GroupFRow {
 
 export interface GroupFResponse {
   weeks: number[];
+  business_weeks: number[];
   rows: GroupFRow[];
 }
 

@@ -530,7 +530,10 @@ def trigger_group_a_sync(
 def list_group_a_weeks(db: Session = Depends(get_db)):
     rows = (
         db.query(GroupA.week_no)
-        .filter(GroupA.week_no.isnot(None))
+        .filter(
+            GroupA.week_no.isnot(None),
+            GroupA.migrated_to_asin_performances == False,
+        )
         .distinct()
         .order_by(GroupA.week_no.desc())
         .all()
@@ -551,7 +554,8 @@ def list_group_a_summary(
     page_size: int = Query(30, ge=1, le=100, description="Page size"),
     db: Session = Depends(get_db),
 ):
-    selected_week = week_no if week_no is not None else db.query(func.max(GroupA.week_no)).scalar()
+    base_week_query = db.query(func.max(GroupA.week_no)).filter(GroupA.migrated_to_asin_performances == False)
+    selected_week = week_no if week_no is not None else base_week_query.scalar()
     if selected_week is None:
         return GroupASummaryResponse(week_no=None, page=page, page_size=page_size, total=0, total_pages=0, rows=[])
 
@@ -570,6 +574,7 @@ def list_group_a_summary(
         )
         .filter(
             GroupA.week_no == selected_week,
+            GroupA.migrated_to_asin_performances == False,
             GroupA.parent_asin.isnot(None),
             GroupA.parent_asin != "",
             GroupA.store_id.isnot(None),
@@ -650,6 +655,7 @@ def get_group_a_detail(
             GroupA.parent_asin == parent_asin,
             GroupA.week_no == week_no,
             GroupA.store_id == store_id,
+            GroupA.migrated_to_asin_performances == False,
         )
         .order_by(GroupA.child_asin, GroupA.search_query)
         .all()
@@ -691,10 +697,10 @@ def get_group_a_detail(
                 search_query=r.search_query,
                 search_query_volume=r.search_query_volume,
                 search_query_impression_count=r.search_query_impression_count,
+                search_query_cart_count=r.search_query_cart_count,
                 search_query_total_impression=r.search_query_total_impression_count,
                 search_query_click_count=r.search_query_click_count,
                 search_query_total_click=r.search_query_total_click_count,
-                search_query_purchase_count=None,
             )
         )
 
@@ -1008,11 +1014,12 @@ def release_group_f_lock():
 @router.get("/group-f", response_model=GroupFResponse)
 def get_group_f_candidates(
     scan_weeks: int = Query(4, ge=1, le=12, description="扫描周数（指定周为空时生效）"),
-    week_nos: Optional[List[int]] = Query(None, description="指定周，如 202607，可多值；有值时忽略扫描周数"),
+    week_nos: Optional[List[int]] = Query(None, description="指定 Group F 创建周，如 202612，可多值；有值时忽略扫描周数"),
 ):
     """
     Group F：查询指定周或按扫描周数计算的周内创建的父 ASIN 状态。
-    指定周：week_nos=202607 或 week_nos=202607&week_nos=202606；留空则按 scan_weeks 计算。
+    注意：Group F 使用独立周号定义（包含 1 月 1 日的那周为 week 1），不同于其他页面/MySQL week_no。
+    指定周：week_nos=202612 或 week_nos=202612&week_nos=202611；留空则按 scan_weeks 计算。
     """
     logger.info("[Group F] 请求已到达: scan_weeks=%s, week_nos=%s", scan_weeks, week_nos)
     if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
@@ -1047,16 +1054,17 @@ def get_group_f_candidates(
                 ).scalar()
             cands = [int(w) for w in (search_max, traffic_max) if w is not None]
             if not cands:
-                return GroupFResponse(weeks=[], rows=[])
+                return GroupFResponse(weeks=[], business_weeks=[], rows=[])
             db_max = max(cands)
             current_week = max(db_max, _group_f_current_week_no())
             scan_weeks_list = compute_scan_weeks_list_for_api(current_week, scan_weeks)
-        mysql_weeks = [_group_f_to_mysql_week_no(w) for w in scan_weeks_list]
-        logger.info("[Group F] request_id=%s 创建周（Group F）=%s，mysql_weeks=%s，调用 get_group_f...", request_id, scan_weeks_list, mysql_weeks)
-        rows = get_group_f(mysql_weeks)
+        business_weeks = [_group_f_to_mysql_week_no(w) for w in scan_weeks_list]
+        logger.info("[Group F] request_id=%s 创建周（Group F）=%s，对应业务 week_no=%s，调用 get_group_f...", request_id, scan_weeks_list, business_weeks)
+        rows = get_group_f(business_weeks)
         logger.info("[Group F] request_id=%s 查询成功，返回 %d 条", request_id, len(rows))
         return GroupFResponse(
             weeks=scan_weeks_list,
+            business_weeks=business_weeks,
             rows=[
                 GroupFRow(
                     parent_asin=r[0],
@@ -1167,6 +1175,7 @@ def export_group_a_data(
 ):
     """下载指定 week_no 的 group_A 数据（CSV），支持按父 ASIN + store_id 过滤。"""
     q = db.query(GroupA).filter(GroupA.week_no == week_no)
+    q = q.filter(GroupA.migrated_to_asin_performances == False)
     if parent_store_keys:
         normalized_pairs = []
         for raw in parent_store_keys:
@@ -1208,6 +1217,7 @@ def export_group_a_data(
         "search_query",
         "search_query_volume",
         "search_query_impression_count",
+        "search_query_cart_count",
         "search_query_total_impression_count",
         "search_query_click_count",
         "search_query_total_click_count",
@@ -1236,6 +1246,7 @@ def export_group_a_data(
             r.search_query,
             r.search_query_volume,
             r.search_query_impression_count,
+            r.search_query_cart_count,
             r.search_query_total_impression_count,
             r.search_query_click_count,
             r.search_query_total_click_count,

@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 # 确保 backend 在 path 并加载 .env
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -40,59 +40,58 @@ def _load_env():
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
                     env[k.strip()] = v.strip()
+    try:
+        from app.config import settings
+
+        env.setdefault("online_db_host", getattr(settings, "ONLINE_DB_HOST", "") or "")
+        env.setdefault("online_db_user", getattr(settings, "ONLINE_DB_USER", "") or "")
+        env.setdefault("online_db_pwd", getattr(settings, "ONLINE_DB_PWD", "") or "")
+        env.setdefault("online_db_port", str(getattr(settings, "ONLINE_DB_PORT", 3306) or 3306))
+        env.setdefault("online_db_name", getattr(settings, "ONLINE_DB_NAME", "rug") or "rug")
+    except Exception:
+        pass
     return env
 
 def _week_no_list(last_n=4):
-    """最近 n 周的 week_no（周日为一周开始，与 MySQL WEEK(...,0) 一致）。"""
-    from datetime import date, timedelta
-    today = date.today()
-    days_since_sunday = (today.weekday() + 1) % 7
-    week_start = today - timedelta(days=days_since_sunday)
-    jan1 = date(week_start.year, 1, 1)
-    first_sunday = jan1 + timedelta(days=(6 - jan1.weekday()) % 7)
-    out = []
-    for i in range(1, last_n + 1):
-        sunday = week_start - timedelta(days=7 * i)
-        week_num = (sunday - first_sunday).days // 7 + 1
-        week_no = int(f"{sunday.year}{week_num:02d}")
-        out.append(week_no)
-    return out
+    """最近 n 周的业务 week_no（与 Group F 专用 week_no 规则一致）。"""
+    return _group_f_week_no_list(last_n)
 
 def _week_no_to_sunday(week_no):
-    """week_no (YYYYWW) 对应周的周日。"""
-    from datetime import date, timedelta
-    y, w = week_no // 100, week_no % 100
-    jan1 = date(y, 1, 1)
-    first_sunday = jan1 + timedelta(days=(6 - jan1.weekday()) % 7)
-    return first_sunday + timedelta(days=(w - 1) * 7)
+    """业务 week_no (YYYYWW) 对应周的周日。"""
+    return _group_f_week_no_to_sunday(int(week_no))
 
 def _sunday_to_week_no(d):
-    """日期所在周（周日为一周开始）的 week_no。"""
-    from datetime import date, timedelta
-    jan1 = date(d.year, 1, 1)
-    first_sunday = jan1 + timedelta(days=(6 - jan1.weekday()) % 7)
-    w = (d - first_sunday).days // 7 + 1
-    return d.year * 100 + w
+    """日期所在周的业务 week_no（与 Group F 专用 week_no 规则一致）。"""
+    return _group_f_sunday_to_week_no(d)
 
 def _current_week_no():
-    """当前日期所在周的 week_no（与 MySQL WEEK(...,0) 一致）。"""
-    from datetime import date, timedelta
-    today = date.today()
-    days_since_sunday = (today.weekday() + 1) % 7
-    week_start = today - timedelta(days=days_since_sunday)
-    return _sunday_to_week_no(week_start)
+    """当前日期所在周的业务 week_no（与 Group F 专用 week_no 规则一致）。"""
+    return _group_f_current_week_no()
 
 def _week_no_minus_weeks(week_no, n):
-    """week_no 往前推 n 周后的 week_no。"""
-    from datetime import timedelta
-    sun = _week_no_to_sunday(week_no)
-    past = sun - timedelta(days=7 * n)
-    return _sunday_to_week_no(past)
+    """业务 week_no 往前推 n 周后的 week_no。"""
+    return _group_f_week_no_minus_weeks(int(week_no), n)
 
 def _filter_creation_weeks_ended(creation_week_list):
     """只保留「创建周 + 4 周已全部结束」的创建周，即 creation_week <= 当前周 - 4。"""
     current = _current_week_no()
     latest_creation = _week_no_minus_weeks(current, 4)
+    filtered = [w for w in creation_week_list if w <= latest_creation]
+    return filtered, current, latest_creation
+
+def _group_f_week_no_list(last_n=4):
+    """最近 n 个 Group F 创建周（CLI 专用，不影响其他文件）。"""
+    out = []
+    current_week = _group_f_current_week_no()
+    base_week = _group_f_week_no_minus_weeks(current_week, 4)
+    for i in range(last_n):
+        out.append(_group_f_week_no_minus_weeks(base_week, i))
+    return out
+
+def _group_f_filter_creation_weeks_ended(creation_week_list):
+    """CLI 专用：只保留创建后 4 周已结束的 Group F 创建周。"""
+    current = _group_f_current_week_no()
+    latest_creation = _group_f_week_no_minus_weeks(current, 4)
     filtered = [w for w in creation_week_list if w <= latest_creation]
     return filtered, current, latest_creation
 
@@ -106,6 +105,23 @@ def _activity_weeks(creation_week_list):
             next_sun = sun + timedelta(days=7 * i)
             out.add(_sunday_to_week_no(next_sun))
     return sorted(out)
+
+def _creation_week_ranges(creation_week_list):
+    """创建周转为可走索引的日期范围 [(week_no, start_dt, end_dt), ...]。"""
+    from datetime import datetime, timedelta
+    out = []
+    for cw in creation_week_list:
+        sunday = _week_no_to_sunday(cw)
+        start_dt = datetime.combine(sunday, datetime.min.time())
+        end_dt = start_dt + timedelta(days=7)
+        out.append((int(cw), start_dt, end_dt))
+    return out
+
+def _candidate_activity_weeks(creation_week_no):
+    """单个创建周对应后续连续 4 个活动周（业务 week_no）。"""
+    from datetime import timedelta
+    sun = _week_no_to_sunday(int(creation_week_no))
+    return [_sunday_to_week_no(sun + timedelta(days=7 * i)) for i in range(1, 5)]
 
 def _sql_step1_created_parents(creation_week_list):
     """Step 1: 查询指定创建周内创建的父 ASIN（parent_asin, parent_asin_create_at, store_id, creation_week_no）。"""
@@ -244,6 +260,28 @@ def _execute_query(conn, sql, step_name):
     log.info("[Group F] %s 完成，返回 %d 行，耗时 %.1f 秒", step_name, len(rows), elapsed)
     return cols, rows
 
+def _execute_nonquery(conn, sql, params, step_name):
+    """执行 DDL/DML，打日志。"""
+    with conn.cursor() as cur:
+        t0 = time.perf_counter()
+        log.info("[Group F] %s 执行中...", step_name)
+        cur.execute(sql, params)
+        affected = cur.rowcount
+    elapsed = time.perf_counter() - t0
+    log.info("[Group F] %s 完成，影响 %s 行，耗时 %.1f 秒", step_name, affected, elapsed)
+    return affected
+
+def _executemany_nonquery(conn, sql, params, step_name):
+    """批量执行 DDL/DML，打日志。"""
+    with conn.cursor() as cur:
+        t0 = time.perf_counter()
+        log.info("[Group F] %s 执行中（批量 %d 条）...", step_name, len(params))
+        cur.executemany(sql, params)
+        affected = cur.rowcount
+    elapsed = time.perf_counter() - t0
+    log.info("[Group F] %s 完成，影响 %s 行，耗时 %.1f 秒", step_name, affected, elapsed)
+    return affected
+
 def run_with_pymysql(env, creation_week_list):
     """分步执行 SQL，每步完成后立即打日志，便于观察进度。"""
     try:
@@ -269,32 +307,158 @@ def run_with_pymysql(env, creation_week_list):
     activity_weeks = _activity_weeks(creation_week_list)
     log.info("[Group F] 活动周（近四周）week_no: %s，创建周: %s", activity_weeks, creation_week_list)
     try:
-        # Step 1: 指定创建周内创建的父 ASIN
+        # Step 0: 创建临时表并装载创建周范围，避免 YEAR/WEEK 导致索引失效
+        _execute_nonquery(conn, "DROP TEMPORARY TABLE IF EXISTS tmp_group_f_creation_weeks", (), "Step 0/6 清理创建周临时表")
+        _execute_nonquery(conn, "DROP TEMPORARY TABLE IF EXISTS tmp_group_f_candidates", (), "Step 0/6 清理候选父临时表")
+        _execute_nonquery(conn, "DROP TEMPORARY TABLE IF EXISTS tmp_group_f_candidate_weeks", (), "Step 0/6 清理候选周临时表")
+        _execute_nonquery(
+            conn,
+            """
+            CREATE TEMPORARY TABLE tmp_group_f_creation_weeks (
+              creation_week_no INT NOT NULL,
+              start_dt DATETIME NOT NULL,
+              end_dt DATETIME NOT NULL,
+              PRIMARY KEY (creation_week_no)
+            )
+            """,
+            (),
+            "Step 0/6 创建创建周临时表",
+        )
+        creation_ranges = _creation_week_ranges(creation_week_list)
+        _executemany_nonquery(
+            conn,
+            "INSERT INTO tmp_group_f_creation_weeks (creation_week_no, start_dt, end_dt) VALUES (%s, %s, %s)",
+            creation_ranges,
+            "Step 0/6 写入创建周范围",
+        )
+
+        # Step 1: 仅按创建时间范围拉取候选父 ASIN，并建立候选临时表
         log.info("[Group F] Step 1/4 开始（距查询开始 %.0f 秒）", time.perf_counter() - run_start)
-        _, base_rows = _execute_query(conn, _sql_step1_created_parents(creation_week_list), "Step 1/4 创建周父 ASIN")
-        if not base_rows:
+        _execute_nonquery(
+            conn,
+            """
+            CREATE TEMPORARY TABLE tmp_group_f_candidates AS
+            SELECT
+              av.id AS parent_id,
+              av.asin AS parent_asin,
+              av.created_at AS parent_asin_create_at,
+              al.store_id AS store_id,
+              cw.creation_week_no AS creation_week_no,
+              cw.end_dt AS window_start,
+              DATE_ADD(cw.end_dt, INTERVAL 28 DAY) AS window_end
+            FROM tmp_group_f_creation_weeks cw
+            INNER JOIN amazon_variation av
+              ON av.created_at >= cw.start_dt AND av.created_at < cw.end_dt
+            INNER JOIN amazon_listing al
+              ON al.variation_id = av.id AND al.store_id IN (1, 7, 12, 25)
+            GROUP BY av.id, av.asin, av.created_at, al.store_id, cw.creation_week_no, cw.end_dt
+            """,
+            (),
+            "Step 1/4 构建候选父临时表",
+        )
+        _, candidate_rows = _execute_query(
+            conn,
+            """
+            SELECT parent_id, parent_asin, parent_asin_create_at, store_id, creation_week_no
+            FROM tmp_group_f_candidates
+            ORDER BY creation_week_no, parent_asin, store_id
+            """,
+            "Step 1/4 读取候选父 ASIN",
+        )
+        if not candidate_rows:
             log.info("[Group F] 无候选，结果为空")
             return ["parent_asin", "created_at", "store_id", "impression_count_asin", "order_asin", "sessions_asin"], []
+        base_rows = [(r[1], r[2], r[3], r[4], r[0]) for r in candidate_rows]
 
-        # Step 2: 近四周内有订单的父 ASIN，每 (parent_asin, store_id) 一条子 ASIN
+        candidate_week_rows = []
+        for parent_id, parent_asin, _created_at, store_id, creation_week_no in candidate_rows:
+            for activity_week_no in _candidate_activity_weeks(creation_week_no):
+                candidate_week_rows.append((parent_id, parent_asin, store_id, int(activity_week_no)))
+        _execute_nonquery(
+            conn,
+            """
+            CREATE TEMPORARY TABLE tmp_group_f_candidate_weeks (
+              parent_id BIGINT NOT NULL,
+              parent_asin VARCHAR(64) NOT NULL,
+              store_id INT NOT NULL,
+              activity_week_no INT NOT NULL,
+              PRIMARY KEY (parent_id, store_id, activity_week_no)
+            )
+            """,
+            (),
+            "Step 1/4 创建候选活动周临时表",
+        )
+        _executemany_nonquery(
+            conn,
+            "INSERT INTO tmp_group_f_candidate_weeks (parent_id, parent_asin, store_id, activity_week_no) VALUES (%s, %s, %s, %s)",
+            candidate_week_rows,
+            "Step 1/4 写入候选活动周",
+        )
+
+        # Step 2: 仅针对候选父 ASIN，检查近四周内是否有订单
         log.info("[Group F] Step 2/4 开始（距查询开始 %.0f 秒）", time.perf_counter() - run_start)
-        _, rows2 = _execute_query(conn, _sql_step2_parents_with_orders(activity_weeks), "Step 2/4 有订单的父 ASIN")
+        _, rows2 = _execute_query(
+            conn,
+            """
+            SELECT c.parent_asin, c.store_id, MIN(oi.asin) AS child_asin
+            FROM tmp_group_f_candidates c
+            INNER JOIN amazon_listing al
+              ON al.variation_id = c.parent_id AND al.store_id = c.store_id
+            INNER JOIN order_item oi
+              ON oi.asin = al.asin
+             AND oi.store_id = al.store_id
+             AND oi.purchase_utc_date >= c.window_start
+             AND oi.purchase_utc_date < c.window_end
+            GROUP BY c.parent_asin, c.store_id
+            """,
+            "Step 2/4 候选父中有订单的父 ASIN",
+        )
         order_asin_map = {}
         for r in rows2:
             if r[0] is not None and r[2] is not None:
                 order_asin_map[(r[0], r[1])] = r[2]
 
-        # Step 3: 近四周内有 impression 的父 ASIN，每 (parent_asin, store_id) 一条子 ASIN
+        # Step 3: 仅针对候选父 ASIN，检查近四周内是否有 impression
         log.info("[Group F] Step 3/4 开始（距查询开始 %.0f 秒）", time.perf_counter() - run_start)
-        _, rows3 = _execute_query(conn, _sql_step3_parents_with_impression(activity_weeks), "Step 3/4 有 impression 的父 ASIN")
+        _, rows3 = _execute_query(
+            conn,
+            """
+            SELECT cw.parent_asin, cw.store_id, MIN(s.asin) AS child_asin
+            FROM tmp_group_f_candidate_weeks cw
+            INNER JOIN amazon_listing al
+              ON al.variation_id = cw.parent_id AND al.store_id = cw.store_id
+            INNER JOIN amazon_search s
+              ON s.asin = al.asin
+             AND s.store_id = al.store_id
+             AND s.week_no = cw.activity_week_no
+            WHERE COALESCE(s.impression_count, 0) > 0
+            GROUP BY cw.parent_asin, cw.store_id
+            """,
+            "Step 3/4 候选父中有 impression 的父 ASIN",
+        )
         impression_count_asin_map = {}
         for r in rows3:
             if r[0] is not None and r[2] is not None:
                 impression_count_asin_map[(r[0], r[1])] = r[2]
 
-        # Step 4: 近四周内有 sessions 的父 ASIN，每 (parent_asin, store_id) 一条子 ASIN
+        # Step 4: 仅针对候选父 ASIN，检查近四周内是否有 sessions
         log.info("[Group F] Step 4/4 开始（距查询开始 %.0f 秒）", time.perf_counter() - run_start)
-        _, rows4 = _execute_query(conn, _sql_step4_parents_with_sessions(activity_weeks), "Step 4/4 有 sessions 的父 ASIN")
+        _, rows4 = _execute_query(
+            conn,
+            """
+            SELECT cw.parent_asin, cw.store_id, MIN(t0.asin) AS child_asin
+            FROM tmp_group_f_candidate_weeks cw
+            INNER JOIN amazon_listing al
+              ON al.variation_id = cw.parent_id AND al.store_id = cw.store_id
+            INNER JOIN amazon_sales_traffic t0
+              ON t0.asin = al.asin
+             AND t0.store_id = al.store_id
+             AND t0.week_no = cw.activity_week_no
+            WHERE COALESCE(t0.sessions, 0) > 0
+            GROUP BY cw.parent_asin, cw.store_id
+            """,
+            "Step 4/4 候选父中有 sessions 的父 ASIN",
+        )
         sessions_asin_map = {}
         for r in rows4:
             if r[0] is not None and r[2] is not None:
@@ -362,9 +526,8 @@ def _group_f_week_no_minus_weeks(week_no: int, n: int) -> int:
 
 
 def _group_f_to_mysql_week_no(week_no: int) -> int:
-    """Group F week_no 转为 MySQL WEEK(...,0) 的 week_no，用于数据库查询。"""
-    sun = _group_f_week_no_to_sunday(week_no)
-    return _sunday_to_week_no(sun)
+    """Group F 创建周转为业务 week_no；当前业务定义与 Group F 周号规则一致。"""
+    return int(week_no)
 
 
 def compute_scan_weeks_list_for_api(current_week: int, scan_weeks: int) -> list:
@@ -406,16 +569,16 @@ def get_group_f(scan_weeks_list: list) -> list:
 
 
 def _parse_weeks():
-    """解析命令行：无参=最近4个创建周；一个数字N(1..99)=最近N个创建周；一个6位数=单周；多个参数=显式创建周 week_no 列表。"""
+    """解析命令行（CLI 使用 Group F 专用 week_no）：无参=最近4个创建周；一个数字N(1..99)=最近N个创建周；一个6位数=单周；多个参数=显式创建周 week_no 列表。"""
     args = sys.argv[1:]
     if not args:
-        return _week_no_list(4)
+        return _group_f_week_no_list(4)
     if len(args) == 1:
         raw = args[0]
         try:
             n = int(raw)
             if 1 <= n <= 99:
-                return _week_no_list(n)
+                return _group_f_week_no_list(n)
             if 100000 <= n <= 999999:
                 return [n]
         except ValueError:
@@ -426,30 +589,29 @@ def _parse_weeks():
 def main():
     log.info("加载 .env ...")
     env = _load_env()
-    creation_week_list = _parse_weeks()
-    creation_week_list, current_week, latest_creation = _filter_creation_weeks_ended(creation_week_list)
-    if not creation_week_list:
-        log.warning("当前周 %s，仅统计创建周 <= %s（创建后 4 周已结束）；传入的创建周均晚于该范围，无数据可统计", current_week, latest_creation)
+    creation_week_list_group_f = _parse_weeks()
+    creation_week_list_group_f, current_week_group_f, latest_creation_group_f = _group_f_filter_creation_weeks_ended(creation_week_list_group_f)
+    if not creation_week_list_group_f:
+        log.warning(
+            "当前 Group F 周 %s，仅统计创建周 <= %s（创建后 4 周已结束）；传入的创建周均晚于该范围，无数据可统计",
+            current_week_group_f,
+            latest_creation_group_f,
+        )
         print("无符合条件的创建周（创建周须 <= 当前周-4，即创建后 4 周均已结束）", flush=True)
         return
-    print("当前周 week_no: %s，最晚统计创建周: %s（仅统计创建周 <= %s，即创建后 4 周已全部结束）" % (current_week, latest_creation, latest_creation), flush=True)
-    print("创建周 week_no:", creation_week_list, f"（共 {len(creation_week_list)} 个创建周）", flush=True)
+    creation_week_list_business = [_group_f_to_mysql_week_no(w) for w in creation_week_list_group_f]
+    print(
+        "当前 Group F 周 week_no: %s，最晚统计创建周: %s（仅统计创建周 <= %s，即创建后 4 周已全部结束）"
+        % (current_week_group_f, latest_creation_group_f, latest_creation_group_f),
+        flush=True,
+    )
+    print("Group F 创建周 week_no:", creation_week_list_group_f, f"（共 {len(creation_week_list_group_f)} 个创建周）", flush=True)
+    print("对应业务 week_no:", creation_week_list_business, flush=True)
     print("结果: 列出指定周所有父 ASIN，并展示 created_at、store_id；impression_count_asin/order_asin/sessions_asin 为该父 ASIN 下在近四周内有对应数据的任意一个子 ASIN（无则空）\n", flush=True)
 
-    # 优先 PySpark（需 MySQL JDBC 驱动 JAR）；失败则回退 pymysql
-    df = run_with_pyspark(env, creation_week_list)
-    if df is not None:
-        log.info("计算行数并输出（show 可能触发额外拉取）...")
-        t0 = time.perf_counter()
-        n = df.count()
-        log.info("行数: %d，耗时 %.1f 秒", n, time.perf_counter() - t0)
-        print("(使用 PySpark JDBC)\n")
-        df.show(100, truncate=False)
-        print(f"\n共 {n} 个父 ASIN 符合条件")
-        return
-
-    log.info("回退到 pymysql 执行查询")
-    out = run_with_pymysql(env, creation_week_list)
+    # 优先使用优化后的 pymysql 路径；PySpark 作为兜底
+    log.info("优先使用 pymysql 执行优化后的分步查询")
+    out = run_with_pymysql(env, creation_week_list_business)
     if out is not None:
         cols, rows = out
         print("(使用 pymysql，若需 PySpark 请配置 spark.driver.extraClassPath 加入 mysql-connector-java JAR)\n")
@@ -482,6 +644,17 @@ def main():
         #     print("parent_asin\tcreated_at\tstore_id")
         #     for r in no_activity:
         #         print("\t".join(str(x) if x is not None else "" for x in (r[0], r[1], r[2])))
+        return
+
+    df = run_with_pyspark(env, creation_week_list_business)
+    if df is not None:
+        log.info("计算行数并输出（show 可能触发额外拉取）...")
+        t0 = time.perf_counter()
+        n = df.count()
+        log.info("行数: %d，耗时 %.1f 秒", n, time.perf_counter() - t0)
+        print("(使用 PySpark JDBC)\n")
+        df.show(100, truncate=False)
+        print(f"\n共 {n} 个父 ASIN 符合条件")
         return
 
     print("ERROR: 未配置 .env 中的 online_db_host / online_db_user 等，或未安装 pyspark/pymysql", file=sys.stderr)

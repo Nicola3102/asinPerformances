@@ -28,10 +28,12 @@ class GroupA(Base):
     search_query = Column(String(512), nullable=True)
     search_query_volume = Column(BigInteger, nullable=True)
     search_query_impression_count = Column(BigInteger, nullable=True)
+    search_query_cart_count = Column(BigInteger, nullable=True)
     search_query_total_impression_count = Column(BigInteger, nullable=True)
     search_query_click_count = Column(BigInteger, nullable=True)
     # 兼容：若旧表已存在 search_query_total_click，则会保留；新逻辑写入 *_count 字段
     search_query_total_click_count = Column(BigInteger, nullable=True)
+    migrated_to_asin_performances = Column(Boolean, default=False, nullable=False, server_default="0")
     operation_status = Column(Boolean, default=False, nullable=False, server_default="0")
     operated_at = Column(DateTime, nullable=True)
 

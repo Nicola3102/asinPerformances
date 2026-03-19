@@ -69,15 +69,36 @@ def _ensure_operation_columns():
 
 
 def _ensure_group_a_operation_columns():
-    """若 group_A 表缺少 operation_status / operated_at 列则添加（兼容已有表）。"""
+    """若 group_A 表缺少兼容列则添加（兼容已有表）。"""
     from sqlalchemy import text
     with engine.connect() as conn:
         if engine.dialect.name == "mysql":
+            old_purchase_col = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'group_A' AND COLUMN_NAME = 'search_query_purchase_count'"
+                )
+            ).scalar()
+            new_cart_col = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'group_A' AND COLUMN_NAME = 'search_query_cart_count'"
+                )
+            ).scalar()
+            if old_purchase_col and not new_cart_col:
+                conn.execute(
+                    text(
+                        "ALTER TABLE group_A CHANGE COLUMN search_query_purchase_count search_query_cart_count BIGINT NULL"
+                    )
+                )
+                conn.commit()
             for col, ddl in [
                 ("operation_status", "ALTER TABLE group_A ADD COLUMN operation_status TINYINT(1) NOT NULL DEFAULT 0"),
                 ("operated_at", "ALTER TABLE group_A ADD COLUMN operated_at DATETIME NULL"),
                 ("child_session_count", "ALTER TABLE group_A ADD COLUMN child_session_count BIGINT NULL"),
+                ("search_query_cart_count", "ALTER TABLE group_A ADD COLUMN search_query_cart_count BIGINT NULL"),
                 ("search_query_total_click_count", "ALTER TABLE group_A ADD COLUMN search_query_total_click_count BIGINT NULL"),
+                ("migrated_to_asin_performances", "ALTER TABLE group_A ADD COLUMN migrated_to_asin_performances TINYINT(1) NOT NULL DEFAULT 0"),
             ]:
                 r = conn.execute(
                     text(

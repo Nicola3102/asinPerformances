@@ -9,7 +9,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import text
+from sqlalchemy import text, tuple_
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 
 from app.config import settings
@@ -85,6 +85,7 @@ def sync_group_a_impression(week_no: str | int) -> dict:
     parents_with_no_children = 0
     parents_with_no_search_data = 0
     online_sql_calls = 0
+    migrated_to_asin_performances = 0
 
     logger.info("[GroupA] sync started: week_no=%s", wk_str)
     try:
@@ -225,6 +226,30 @@ def sync_group_a_impression(week_no: str | int) -> dict:
         existing_parent_keys = {(r[0], int(r[1])) for r in existing_parent_keys if r[0] and r[1] is not None}
         logger.info("[GroupA] Step3 existing_parent_keys loaded: %s in %.2fs", len(existing_parent_keys), time.time() - t_step3_load)
 
+        # 3.1) 已在 asin_performances 出单的父 ASIN，从 group_A 业务视角视为“已迁移”
+        t_step3_mark = time.time()
+        if existing_parent_keys:
+            migrated_to_asin_performances = (
+                local_db.query(GroupA)
+                .filter(
+                    GroupA.week_no == wk_int,
+                    tuple_(GroupA.parent_asin, GroupA.store_id).in_(list(existing_parent_keys)),
+                    GroupA.migrated_to_asin_performances == False,
+                )
+                .update(
+                    {"migrated_to_asin_performances": True},
+                    synchronize_session=False,
+                )
+            )
+            local_db.commit()
+        logger.info(
+            "[GroupA] Step3 mark migrated parents: week_no=%s existing_in_asin_perf=%s marked=%s elapsed=%.2fs",
+            wk_str,
+            len(existing_parent_keys),
+            migrated_to_asin_performances,
+            time.time() - t_step3_mark,
+        )
+
         t_step3_filter = time.time()
         final_parents = [(pa, sid, pid, pc) for (pa, sid, pid, pc) in all_parents if (pa, sid) not in existing_parent_keys and pid is not None]
         skipped_parents_existing = len(all_parents) - len(final_parents)
@@ -364,7 +389,7 @@ def sync_group_a_impression(week_no: str | int) -> dict:
                 t_search = time.time()
                 search_sql = (
                     "SELECT sd.asin, sd.store_id, sd.search_query, sd.search_query_volume, "
-                    "sd.impression_count, sd.total_impression_count, sd.click_count, sd.total_click_count "
+                    "sd.impression_count, sd.cart_count, sd.total_impression_count, sd.click_count, sd.total_click_count "
                     "FROM amazon_search_data sd "
                     "INNER JOIN ("
                     "    SELECT DISTINCT al.asin, al.store_id "
@@ -425,9 +450,11 @@ def sync_group_a_impression(week_no: str | int) -> dict:
                             "search_query": sq,
                             "search_query_volume": r[3],
                             "search_query_impression_count": r[4],
-                            "search_query_total_impression_count": r[5],
-                            "search_query_click_count": r[6],
-                            "search_query_total_click_count": r[7],
+                            "search_query_cart_count": r[5],
+                            "search_query_total_impression_count": r[6],
+                            "search_query_click_count": r[7],
+                            "search_query_total_click_count": r[8],
+                            "migrated_to_asin_performances": False,
                         }
                     )
 
@@ -452,9 +479,11 @@ def sync_group_a_impression(week_no: str | int) -> dict:
                         "child_session_count": stmt.inserted.child_session_count,
                         "search_query_volume": stmt.inserted.search_query_volume,
                         "search_query_impression_count": stmt.inserted.search_query_impression_count,
+                        "search_query_cart_count": stmt.inserted.search_query_cart_count,
                         "search_query_total_impression_count": stmt.inserted.search_query_total_impression_count,
                         "search_query_click_count": stmt.inserted.search_query_click_count,
                         "search_query_total_click_count": stmt.inserted.search_query_total_click_count,
+                        "migrated_to_asin_performances": stmt.inserted.migrated_to_asin_performances,
                     }
                     res = local_db.execute(stmt.on_duplicate_key_update(**update_cols))
                     affected = int(getattr(res, "rowcount", 0) or 0)
@@ -558,6 +587,7 @@ def sync_group_a_impression(week_no: str | int) -> dict:
             "parents_no_children": parents_with_no_children,
             "parents_no_search_data": parents_with_no_search_data,
             "online_sql_calls": online_sql_calls,
+            "migrated_to_asin_performances": migrated_to_asin_performances,
         }
     finally:
         try:

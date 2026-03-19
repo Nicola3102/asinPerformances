@@ -5,3 +5,4 @@ pymysql==1.1.0
 cryptography==42.0.2
 pydantic-settings==2.1.0
 apscheduler==3.10.4
+pyspark==4.1.1

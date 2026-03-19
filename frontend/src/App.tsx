@@ -96,12 +96,14 @@ function SearchQueryTable({
   compact = false,
   showHeader = true,
   className = '',
+  tailMetric = 'purchase',
 }: {
   rows: SearchQueryRow[]
   compact?: boolean
   /** 为 false 时每个子 ASIN 内不显示表头，仅主表「Search query (volume, impression, ...)」列有表头 */
   showHeader?: boolean
   className?: string
+  tailMetric?: 'purchase' | 'cart'
 }) {
   if (!rows.length) return <span className="text-muted">–</span>
   return (
@@ -115,7 +117,7 @@ function SearchQueryTable({
             <th>total_impression</th>
             <th>click</th>
             <th>total_click</th>
-            <th>purchase_count</th>
+            <th>{tailMetric === 'cart' ? 'cart_count' : 'purchase_count'}</th>
           </tr>
         </thead>
       )}
@@ -128,7 +130,7 @@ function SearchQueryTable({
             <td>{formatNum(r.search_query_total_impression)}</td>
             <td>{formatNum(r.search_query_click_count)}</td>
             <td>{formatNum(r.search_query_total_click)}</td>
-            <td>{formatNum(r.search_query_purchase_count)}</td>
+            <td>{formatNum(tailMetric === 'cart' ? r.search_query_cart_count : r.search_query_purchase_count)}</td>
           </tr>
         ))}
       </tbody>
@@ -941,10 +943,10 @@ function GroupFPage() {
       <h1>Group F</h1>
       <div className="group-f-controls">
         <label>
-          指定周：
+          指定 Group F 创建周：
           <input
             type="text"
-            placeholder="如 202607 或 202607,202606，回车查询"
+            placeholder="202611,202610 回车查询"
             value={specificWeeks}
             onChange={(e) => setSpecificWeeks(e.target.value)}
             onKeyDown={handleSpecificWeeksKeyDown}
@@ -966,7 +968,10 @@ function GroupFPage() {
           </select>
         </label>
         <span className="group-f-weeks">
-          活动周数：{loading ? '计算中...' : data?.weeks?.length ? data.weeks.join(', ') : '–'}
+          Group F 创建周：{loading ? '计算中...' : data?.weeks?.length ? data.weeks.join(', ') : '–'}
+        </span>
+        <span className="group-f-weeks">
+          对应业务周：{loading ? '计算中...' : data?.business_weeks?.length ? data.business_weeks.join(', ') : '–'}
         </span>
       </div>
       {!loading && !error && data && rawRows.length > 0 && (
@@ -1149,7 +1154,7 @@ function GroupADetailModal({
                 <th>Child ASIN</th>
                 <th>Child Impression</th>
                 <th>Child Session</th>
-                <th>Search query (volume, impression, total_impression, click, total_click, purchase_count)</th>
+                <th>Search query (volume, impression, total_impression, click, total_click, cart_count)</th>
               </tr>
             </thead>
             <tbody>
@@ -1167,7 +1172,7 @@ function GroupADetailModal({
                     <td>{row.child_impression_count != null ? String(row.child_impression_count) : '–'}</td>
                     <td>{row.child_session_count != null ? String(row.child_session_count) : '–'}</td>
                     <td className="cell-search-query-wrap">
-                      <SearchQueryTable rows={displayRows} compact showHeader={false} />
+                      <SearchQueryTable rows={displayRows} compact showHeader={false} tailMetric="cart" />
                       {overLimit && (
                         <button
                           type="button"
@@ -1197,7 +1202,7 @@ function GroupADetailModal({
           title={`Search query · Child ASIN: ${data.children[zoomedChildIndex].child_asin ?? '–'}`}
           onClose={() => setZoomedChildIndex(null)}
         >
-          <SearchQueryTable rows={data.children[zoomedChildIndex].search_queries ?? []} />
+          <SearchQueryTable rows={data.children[zoomedChildIndex].search_queries ?? []} tailMetric="cart" />
         </ZoomModal>
       )}
     </div>
