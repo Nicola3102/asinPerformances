@@ -1067,12 +1067,13 @@ def get_group_f_candidates(
             business_weeks=business_weeks,
             rows=[
                 GroupFRow(
-                    parent_asin=r[0],
-                    created_at=r[1],
-                    store_id=int(r[2]) if r[2] is not None else None,
-                    impression_count_asin=str(r[3]) if r[3] else None,
-                    order_asin=str(r[4]) if r[4] else None,
-                    sessions_asin=str(r[5]) if r[5] else None,
+                    variation_id=int(r[0]) if r[0] is not None else None,
+                    parent_asin=r[1],
+                    created_at=r[2],
+                    store_id=int(r[3]) if r[3] is not None else None,
+                    impression_count_asin=str(r[4]) if r[4] else None,
+                    order_asin=str(r[5]) if r[5] else None,
+                    sessions_asin=str(r[6]) if r[6] else None,
                 )
                 for r in rows
             ],

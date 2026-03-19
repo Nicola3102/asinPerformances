@@ -102,6 +102,7 @@ class DetailResponse(BaseModel):
 
 class GroupFRow(BaseModel):
     """Group F 接口单行：指定周所有父 ASIN 的完整数据。"""
+    variation_id: Optional[int] = None
     parent_asin: Optional[str] = None
     created_at: Optional[datetime] = None
     store_id: Optional[int] = None

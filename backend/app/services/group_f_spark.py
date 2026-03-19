@@ -124,10 +124,10 @@ def _candidate_activity_weeks(creation_week_no):
     return [_sunday_to_week_no(sun + timedelta(days=7 * i)) for i in range(1, 5)]
 
 def _sql_step1_created_parents(creation_week_list):
-    """Step 1: 查询指定创建周内创建的父 ASIN（parent_asin, parent_asin_create_at, store_id, creation_week_no）。"""
+    """Step 1: 查询指定创建周内创建的父 ASIN（variation_id, parent_asin, parent_asin_create_at, store_id, creation_week_no）。"""
     ph = ",".join([f"'{w}'" for w in creation_week_list])
     return f"""
-SELECT av.asin AS parent_asin, av.created_at AS parent_asin_create_at, al.store_id,
+SELECT av.id AS variation_id, av.asin AS parent_asin, av.created_at AS parent_asin_create_at, al.store_id,
        (YEAR(av.created_at) * 100 + WEEK(av.created_at, 0)) AS creation_week_no
 FROM amazon_variation av
 INNER JOIN (SELECT DISTINCT variation_id, store_id FROM amazon_listing WHERE store_id IN (1, 7,12,25)) al ON al.variation_id = av.id
@@ -186,9 +186,9 @@ def _sql(creation_week_list):
     ph_creation = ",".join([f"'{w}'" for w in creation_week_list])
     ph_activity = ",".join([f"'{w}'" for w in activity_weeks])
     return f"""
-SELECT a.parent_asin AS asin, a.parent_asin_create_at AS created_at, a.store_id
+SELECT a.variation_id, a.parent_asin AS asin, a.parent_asin_create_at AS created_at, a.store_id
 FROM (
-  SELECT av.asin AS parent_asin, av.created_at AS parent_asin_create_at, al.store_id,
+  SELECT av.id AS variation_id, av.asin AS parent_asin, av.created_at AS parent_asin_create_at, al.store_id,
          (YEAR(av.created_at) * 100 + WEEK(av.created_at, 0)) AS creation_week_no
   FROM amazon_variation av
   INNER JOIN (SELECT DISTINCT variation_id, store_id FROM amazon_listing WHERE store_id IN (1, 7,12,25)) al ON al.variation_id = av.id
@@ -367,8 +367,8 @@ def run_with_pymysql(env, creation_week_list):
         )
         if not candidate_rows:
             log.info("[Group F] 无候选，结果为空")
-            return ["parent_asin", "created_at", "store_id", "impression_count_asin", "order_asin", "sessions_asin"], []
-        base_rows = [(r[1], r[2], r[3], r[4], r[0]) for r in candidate_rows]
+            return ["variation_id", "parent_asin", "created_at", "store_id", "impression_count_asin", "order_asin", "sessions_asin"], []
+        base_rows = [(r[0], r[1], r[2], r[3], r[4]) for r in candidate_rows]
 
         candidate_week_rows = []
         for parent_id, parent_asin, _created_at, store_id, creation_week_no in candidate_rows:
@@ -465,15 +465,15 @@ def run_with_pymysql(env, creation_week_list):
                 sessions_asin_map[(r[0], r[1])] = r[2]
 
         # 结果：列出指定周的所有父 ASIN，并填充 impression_count_asin / order_asin / sessions_asin（有则填一个子 ASIN，无则空）
-        cols = ["parent_asin", "created_at", "store_id", "impression_count_asin", "order_asin", "sessions_asin"]
+        cols = ["variation_id", "parent_asin", "created_at", "store_id", "impression_count_asin", "order_asin", "sessions_asin"]
         result = []
         for r in base_rows:
-            pa, created_at, store_id = r[0], r[1], r[2]
+            variation_id, pa, created_at, store_id = r[0], r[1], r[2], r[3]
             key = (pa, store_id) if (pa is not None and store_id is not None) else None
             imp_asin = (impression_count_asin_map.get(key) or "") if key else ""
             ord_asin = (order_asin_map.get(key) or "") if key else ""
             sess_asin = (sessions_asin_map.get(key) or "") if key else ""
-            result.append((pa, created_at, store_id, imp_asin, ord_asin, sess_asin))
+            result.append((variation_id, pa, created_at, store_id, imp_asin, ord_asin, sess_asin))
         log.info("[Group F] 全部完成，共 %d 条，总耗时 %.1f 秒", len(result), time.perf_counter() - run_start)
         return cols, result
     finally:

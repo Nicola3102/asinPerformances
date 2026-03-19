@@ -10,6 +10,8 @@ import {
   refreshQueryStatus,
   syncFromOnline,
   getGroupFData,
+  getGroupFLockStatus,
+  releaseGroupFLock,
   listGroupAWeeks,
   getGroupASummary,
   getGroupADetail,
@@ -23,6 +25,7 @@ import {
   type SearchQueryRow,
   type GroupFResponse,
   type GroupFRow,
+  type GroupFLockStatus,
   type GroupASummaryResponse,
   type GroupASummaryRow,
   type GroupADetailResponse,
@@ -62,12 +65,13 @@ function escapeCsvCell(val: string | number): string {
 }
 
 function groupFRowsToCsv(rows: GroupFRow[]): string {
-  const header = ['Parent ASIN', 'Created At', 'store_id', 'impression_count_asin', 'order_asin', 'sessions_asin']
+  const header = ['variation_id', 'Parent ASIN', 'Created At', 'store_id', 'impression_count_asin', 'order_asin', 'sessions_asin']
   const lines = [header.map(escapeCsvCell).join(',')]
   for (const r of rows) {
     const created = formatCreatedAt(r.created_at)
     lines.push(
       [
+        r.variation_id ?? '',
         r.parent_asin ?? '',
         created,
         r.store_id ?? '',
@@ -89,6 +93,45 @@ function downloadGroupFCsv(rows: GroupFRow[], filename?: string): void {
   a.download = filename ?? `group-f-${new Date().toISOString().slice(0, 10)}.csv`
   a.click()
   URL.revokeObjectURL(url)
+}
+
+const GROUP_F_CACHE_STORAGE_KEY = 'group-f-cache-v1'
+
+type GroupFCacheEntry = {
+  savedAt: string
+  data: GroupFResponse
+}
+
+function loadGroupFCache(): Record<string, GroupFCacheEntry> {
+  if (typeof window === 'undefined') return {}
+  try {
+    const raw = window.localStorage.getItem(GROUP_F_CACHE_STORAGE_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, GroupFCacheEntry> : {}
+  } catch {
+    return {}
+  }
+}
+
+function saveGroupFCache(cache: Record<string, GroupFCacheEntry>): void {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(GROUP_F_CACHE_STORAGE_KEY, JSON.stringify(cache))
+  } catch {
+    /* ignore storage failures */
+  }
+}
+
+function formatCacheTime(v: string | null | undefined): string {
+  if (!v) return ''
+  try {
+    const d = new Date(v)
+    if (Number.isNaN(d.getTime())) return v
+    return d.toLocaleString('zh-CN', { dateStyle: 'short', timeStyle: 'medium', hour12: false })
+  } catch {
+    return v
+  }
 }
 
 function SearchQueryTable({
@@ -860,7 +903,13 @@ function GroupFPage() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [data, setData] = useState<GroupFResponse | null>(null)
+  const [dataRequestKey, setDataRequestKey] = useState<string | null>(null)
+  const [cacheByKey, setCacheByKey] = useState<Record<string, GroupFCacheEntry>>(() => loadGroupFCache())
   const hasDataRef = useRef(false)
+  const [lockStatus, setLockStatus] = useState<GroupFLockStatus | null>(null)
+  const [waitingForLock, setWaitingForLock] = useState(false)
+  const [reloadNonce, setReloadNonce] = useState(0)
+  const lockPollTimerRef = useRef<number | null>(null)
 
   const [storeIdFilter, setStoreIdFilter] = useState('')
   const [impressionFilter, setImpressionFilter] = useState<AsinFilter>('all')
@@ -876,6 +925,11 @@ function GroupFPage() {
     return nums.length > 0 ? nums : null
   }, [submittedSpecificWeeks])
 
+  const requestKey = weekNos == null ? `scan:${scanWeeks}` : `weeks:${JSON.stringify(weekNos)}`
+  const cachedEntry = cacheByKey[requestKey] ?? null
+  const displayData = dataRequestKey === requestKey ? data : (cachedEntry?.data ?? null)
+  const isShowingCachedData = dataRequestKey !== requestKey && cachedEntry != null
+
   useEffect(() => {
     setPage(1)
   }, [scanWeeks, submittedSpecificWeeks])
@@ -889,20 +943,83 @@ function GroupFPage() {
     const ctrl = new AbortController()
     setLoading(true)
     setError(null)
+    setWaitingForLock(false)
+    setLockStatus(null)
     getGroupFData(scanWeeks, weekNos ?? undefined, ctrl.signal)
       .then((res) => {
         hasDataRef.current = true
         setData(res)
+        setDataRequestKey(requestKey)
+        setCacheByKey((prev) => {
+          const next = {
+            ...prev,
+            [requestKey]: {
+              savedAt: new Date().toISOString(),
+              data: res,
+            },
+          }
+          saveGroupFCache(next)
+          return next
+        })
         setError(null)
+        setWaitingForLock(false)
+        setLockStatus(null)
       })
       .catch((e) => {
-        if (e?.name !== 'AbortError' && !hasDataRef.current) {
+        if (e?.name === 'AbortError') return
+        if ((e as { status?: number } | null)?.status === 429) {
+          setWaitingForLock(true)
+          setError(null)
+          return
+        }
+        if (!hasDataRef.current) {
           setError(e instanceof Error ? e.message : 'Failed to load')
         }
       })
       .finally(() => setLoading(false))
     return () => ctrl.abort()
-  }, [scanWeeks, weekNos === null ? null : JSON.stringify(weekNos)])
+  }, [scanWeeks, weekNos === null ? null : JSON.stringify(weekNos), reloadNonce, requestKey])
+
+  useEffect(() => {
+    if (!waitingForLock) {
+      if (lockPollTimerRef.current != null) {
+        window.clearTimeout(lockPollTimerRef.current)
+        lockPollTimerRef.current = null
+      }
+      return
+    }
+
+    const ctrl = new AbortController()
+    let cancelled = false
+
+    const poll = async () => {
+      try {
+        const status = await getGroupFLockStatus(ctrl.signal)
+        if (cancelled) return
+        setLockStatus(status)
+        if (status.lock_held) {
+          lockPollTimerRef.current = window.setTimeout(poll, status.is_stuck ? 5000 : 3000)
+          return
+        }
+        setWaitingForLock(false)
+        setReloadNonce((n) => n + 1)
+      } catch (e) {
+        if ((e as { name?: string } | null)?.name === 'AbortError' || cancelled) return
+        setError(e instanceof Error ? e.message : '获取 Group F 查询状态失败')
+        lockPollTimerRef.current = window.setTimeout(poll, 5000)
+      }
+    }
+
+    poll()
+    return () => {
+      cancelled = true
+      ctrl.abort()
+      if (lockPollTimerRef.current != null) {
+        window.clearTimeout(lockPollTimerRef.current)
+        lockPollTimerRef.current = null
+      }
+    }
+  }, [waitingForLock, requestKey])
 
   const handleSpecificWeeksKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter') {
@@ -911,7 +1028,22 @@ function GroupFPage() {
     }
   }
 
-  const rawRows = data?.rows ?? []
+  const handleReleaseLockAndRetry = async () => {
+    try {
+      setLoading(true)
+      setError(null)
+      await releaseGroupFLock()
+      setWaitingForLock(false)
+      setLockStatus(null)
+      setReloadNonce((n) => n + 1)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '释放 Group F 锁失败')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const rawRows = displayData?.rows ?? []
   const filteredRows = useMemo(() => {
     let filtered = rawRows
     if (storeIdFilter.trim()) {
@@ -937,6 +1069,14 @@ function GroupFPage() {
   const currentPage = Math.min(Math.max(1, page), totalPages)
   const startIdx = (currentPage - 1) * GROUP_F_PAGE_SIZE
   const pageRows = rows.slice(startIdx, startIdx + GROUP_F_PAGE_SIZE)
+  const lockMessage = waitingForLock
+    ? lockStatus?.lock_held
+      ? `Group F 查询正在执行中，已运行 ${Math.round(lockStatus.duration_seconds ?? 0)} 秒，完成后将自动刷新结果。${lockStatus.is_stuck ? ' 若长时间不结束，可手动释放锁。' : ''}`
+      : '检测到 Group F 查询已完成，正在自动刷新结果...'
+    : null
+  const cacheMessage = isShowingCachedData
+    ? `当前展示的是该查询条件上次成功结果（缓存时间：${formatCacheTime(cachedEntry?.savedAt)}），最新查询完成后会自动刷新。`
+    : null
 
   return (
     <div className="app">
@@ -968,13 +1108,25 @@ function GroupFPage() {
           </select>
         </label>
         <span className="group-f-weeks">
-          Group F 创建周：{loading ? '计算中...' : data?.weeks?.length ? data.weeks.join(', ') : '–'}
+          Group F 创建周：{loading && !displayData ? '计算中...' : displayData?.weeks?.length ? displayData.weeks.join(', ') : '–'}
         </span>
         <span className="group-f-weeks">
-          对应业务周：{loading ? '计算中...' : data?.business_weeks?.length ? data.business_weeks.join(', ') : '–'}
+          对应业务周：{loading && !displayData ? '计算中...' : displayData?.business_weeks?.length ? displayData.business_weeks.join(', ') : '–'}
         </span>
       </div>
-      {!loading && !error && data && rawRows.length > 0 && (
+      {cacheMessage && <p className="empty-hint">{cacheMessage}</p>}
+      {lockMessage && (
+        <p className="error">
+          {lockMessage}
+          <button type="button" className="retry-btn" onClick={() => setReloadNonce((n) => n + 1)}>
+            立即重试
+          </button>
+          <button type="button" className="retry-btn" onClick={handleReleaseLockAndRetry}>
+            释放锁并重试
+          </button>
+        </p>
+      )}
+      {displayData && rawRows.length > 0 && (
         <div className="group-f-filters">
           <label>
             store_id：
@@ -1039,6 +1191,7 @@ function GroupFPage() {
         <table className="data-table">
           <thead>
             <tr>
+              <th>variation_id</th>
               <th>Parent ASIN</th>
               <th>Created At</th>
               <th>store_id</th>
@@ -1048,25 +1201,10 @@ function GroupFPage() {
             </tr>
           </thead>
           <tbody>
-            {loading ? (
-              <tr>
-                <td colSpan={6} className="empty-hint">
-                  加载中... Group F 查询可能需要 5–6 分钟，请耐心等待。
-                </td>
-              </tr>
-            ) : error ? (
-              <tr>
-                <td colSpan={6} className="error">{error}</td>
-              </tr>
-            ) : rows.length === 0 ? (
-              <tr>
-                <td colSpan={6} className="empty-hint">
-                  {!data ? '正在加载...' : rawRows.length === 0 ? '暂无符合条件的数据。' : '暂无符合筛选条件的数据，请调整筛选条件。'}
-                </td>
-              </tr>
-            ) : (
+            {rows.length > 0 ? (
               pageRows.map((r: GroupFRow, i: number) => (
                 <tr key={`${r.parent_asin ?? ''}-${r.store_id ?? ''}-${startIdx + i}`}>
+                  <td>{r.variation_id ?? '–'}</td>
                   <td>{r.parent_asin ?? '–'}</td>
                   <td>{formatCreatedAt(r.created_at)}</td>
                   <td>{r.store_id ?? '–'}</td>
@@ -1075,10 +1213,32 @@ function GroupFPage() {
                   <td>{r.sessions_asin ?? '–'}</td>
                 </tr>
               ))
-            )}
+            ) : loading ? (
+              <tr>
+                <td colSpan={7} className="empty-hint">
+                  加载中... Group F 查询可能需要 5–6 分钟，请耐心等待。
+                </td>
+              </tr>
+            ) : waitingForLock && rawRows.length === 0 ? (
+              <tr>
+                <td colSpan={7} className="empty-hint">
+                  {lockMessage ?? 'Group F 查询进行中，完成后将自动刷新结果。'}
+                </td>
+              </tr>
+            ) : error ? (
+              <tr>
+                <td colSpan={7} className="error">{error}</td>
+              </tr>
+            ) : rows.length === 0 ? (
+              <tr>
+                <td colSpan={7} className="empty-hint">
+                  {!displayData ? '正在加载...' : rawRows.length === 0 ? '暂无符合条件的数据。' : '暂无符合筛选条件的数据，请调整筛选条件。'}
+                </td>
+              </tr>
+            ) : null}
           </tbody>
         </table>
-        {!loading && !error && data && rows.length > 0 && (
+        {displayData && rows.length > 0 && (
             <div className="group-f-pagination">
               <p className="empty-hint">
                 共 {rows.length} 个父 ASIN

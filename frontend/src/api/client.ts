@@ -96,6 +96,7 @@ export interface SummaryStatsResponse {
 }
 
 export interface GroupFRow {
+  variation_id: number | null;
   parent_asin: string | null;
   created_at: string | null;
   store_id: number | null;
@@ -108,6 +109,22 @@ export interface GroupFResponse {
   weeks: number[];
   business_weeks: number[];
   rows: GroupFRow[];
+}
+
+export interface GroupFLockStatus {
+  lock_held: boolean;
+  request_id: string | null;
+  started_at: string | null;
+  duration_seconds: number | null;
+  is_stuck: boolean;
+  message: string;
+}
+
+export interface GroupFReleaseLockResponse {
+  released: boolean;
+  had_lock: boolean;
+  previous_request_id: string | null;
+  message: string;
 }
 
 export interface GroupASummaryRow {
@@ -182,6 +199,12 @@ function parseErrorResponse(text: string, status: number): string {
   if (status === 502 || status === 504) return '后端超时或未就绪'
   if (status >= 500) return `后端错误 (${status})，请查看后端日志`
   return `请求失败 (${status})`
+}
+
+function buildApiError(text: string, status: number, fallback: string): Error & { status?: number } {
+  const err = new Error(parseErrorResponse(text, status) || fallback) as Error & { status?: number }
+  err.status = status
+  return err
 }
 
 export async function getTableStats(): Promise<TableStats> {
@@ -365,7 +388,25 @@ export async function getGroupFData(
   const res = await fetch(`${API_BASE}/asin-performances/group-f?${params.toString()}`, { signal })
   if (!res.ok) {
     const text = await res.text()
-    throw new Error(parseErrorResponse(text, res.status) || 'Failed to fetch Group F data')
+    throw buildApiError(text, res.status, 'Failed to fetch Group F data')
+  }
+  return res.json()
+}
+
+export async function getGroupFLockStatus(signal?: AbortSignal): Promise<GroupFLockStatus> {
+  const res = await fetch(`${API_BASE}/asin-performances/group-f/status`, { signal })
+  if (!res.ok) {
+    const text = await res.text()
+    throw buildApiError(text, res.status, 'Failed to fetch Group F lock status')
+  }
+  return res.json()
+}
+
+export async function releaseGroupFLock(): Promise<GroupFReleaseLockResponse> {
+  const res = await fetch(`${API_BASE}/asin-performances/group-f/release-lock`, { method: 'POST' })
+  if (!res.ok) {
+    const text = await res.text()
+    throw buildApiError(text, res.status, 'Failed to release Group F lock')
   }
   return res.json()
 }
