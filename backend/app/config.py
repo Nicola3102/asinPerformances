@@ -22,9 +22,10 @@ class Settings(BaseSettings):
     ONLINE_DB_USER: str = Field(default="", validation_alias="online_db_user")
     ONLINE_DB_PWD: str = Field(default="", validation_alias="online_db_pwd")
 
-    # 定时同步：东八区每 N 小时执行一次 online_sync
+    # 定时同步：东八区每 N 小时执行一次；后端进程需常驻
     ENABLE_SCHEDULED_SYNC: bool = Field(default=True, validation_alias="enable_scheduled_sync")
     SYNC_INTERVAL_HOURS: int = Field(default=2, validation_alias="sync_interval_hours")
+    MONITOR_SYNC_INTERVAL_HOURS: int = Field(default=6, validation_alias="monitor_sync_interval_hours")
     GROUP_A_SYNC_INTERVAL_HOURS: int = Field(default=4, validation_alias="group_a_sync_interval_hours")
     SYNC_TIMEZONE: str = Field(default="Asia/Shanghai", validation_alias="sync_timezone")
 

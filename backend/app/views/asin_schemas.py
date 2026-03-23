@@ -180,8 +180,18 @@ class MonitorTrackRow(BaseModel):
     search_query_click_count: Optional[int] = None
 
 
+class MonitorWeekStatus(BaseModel):
+    """监控追踪周状态：该周是否已完成抓取校验"""
+    week_no: Optional[int] = None
+    completed: bool = False
+    checked_at: Optional[datetime] = None
+    incomplete_count: int = 0
+    incomplete_child_asins: List[str] = []
+
+
 class MonitorTrackResponse(BaseModel):
     """监控追踪响应：某父 ASIN 下所有子 ASIN 各周的 search_query 数据"""
     parent_asin: Optional[str] = None
     weeks: List[int] = []
+    week_statuses: List[MonitorWeekStatus] = []
     rows: List[MonitorTrackRow] = []

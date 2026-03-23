@@ -181,9 +181,18 @@ export interface MonitorTrackRow {
   search_query_click_count: number | null;
 }
 
+export interface MonitorWeekStatus {
+  week_no: number | null;
+  completed: boolean;
+  checked_at: string | null;
+  incomplete_count: number;
+  incomplete_child_asins: string[];
+}
+
 export interface MonitorTrackResponse {
   parent_asin: string | null;
   weeks: number[];
+  week_statuses: MonitorWeekStatus[];
   rows: MonitorTrackRow[];
 }
 

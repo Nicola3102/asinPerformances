@@ -840,11 +840,17 @@ def _upsert_batch(local_db: Session, rows: list, table_name: str, progress_inter
       - 库里该组已有 search_query 数据：按条比对条数与内容，相同则跳过，不同则补缺或按线上数据更新。
     使用 order_id 判断是否已写入：同组内合并 order_id；更新时对指标类字段做补全。
     """
+    log_prefix = f"[AsinUpsert:{table_name}]"
     key_to_row = {_upsert_key(_row_to_dict(r)): r for r in rows}
     original_count = len(rows)
     rows = list(key_to_row.values())
     if len(rows) < original_count:
-        logger.info("Upsert batch deduped: %s -> %s rows by (store_id, parent_asin, child_asin, week_no, search_query)", original_count, len(rows))
+        logger.info(
+            "%s deduped: %s -> %s rows by (store_id, parent_asin, child_asin, week_no, search_query)",
+            log_prefix,
+            original_count,
+            len(rows),
+        )
 
     # 本批中「有非空 search_query」的 (store_id, parent_asin, child_asin, week_no) 组
     groups_with_incoming_search = set()
@@ -886,8 +892,8 @@ def _upsert_batch(local_db: Session, rows: list, table_name: str, progress_inter
     if deleted_placeholders:
         local_db.flush()
         logger.info(
-            "Upsert %s: deleted %s placeholder row(s) (empty search_query) for groups that now have search_query data from online",
-            table_name,
+            "%s deleted %s placeholder row(s) (empty search_query) for groups that now have search_query data from online",
+            log_prefix,
             deleted_placeholders,
         )
 
@@ -949,7 +955,14 @@ def _upsert_batch(local_db: Session, rows: list, table_name: str, progress_inter
             if sq is not None and isinstance(sq, str) and sq.strip():
                 if _row_content_equal(d, existing):
                     if progress_interval and ((i + 1) % progress_interval == 0 or (i + 1) == total):
-                        logger.info("Upsert %s: %s / %s (inserted=%s, updated=%s)", table_name, i + 1, total, rows_inserted, rows_updated)
+                        logger.info(
+                            "%s progress: %s / %s (inserted=%s, updated=%s)",
+                            log_prefix,
+                            i + 1,
+                            total,
+                            rows_inserted,
+                            rows_updated,
+                        )
                     continue
             if incoming_order > 0:
                 existing.order_num = d["order_num"]
@@ -972,7 +985,14 @@ def _upsert_batch(local_db: Session, rows: list, table_name: str, progress_inter
             local_db.add(AsinPerformance(**d))
             rows_inserted += 1
         if progress_interval and ((i + 1) % progress_interval == 0 or (i + 1) == total):
-            logger.info("Upsert %s: %s / %s (inserted=%s, updated=%s)", table_name, i + 1, total, rows_inserted, rows_updated)
+            logger.info(
+                "%s progress: %s / %s (inserted=%s, updated=%s)",
+                log_prefix,
+                i + 1,
+                total,
+                rows_inserted,
+                rows_updated,
+            )
     # 同组所有记录同步 order_id/order_num（含未在本批出现的 search_query 行）
     for (sid, pa, ca, wn), (oid_str, onum) in group_key_to_order.items():
         local_db.query(AsinPerformance).filter(

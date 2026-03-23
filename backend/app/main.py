@@ -21,10 +21,13 @@ from app.services.groupA_impression import (
     _get_sync_date_range,
     _date_to_week_no,
 )
+from app.services.auto_monitor import sync_auto_monitor
 from app.sync_run_record import (
     now_asia,
-    is_even_hour,
+    is_n_hour_slot,
+    should_run_monitor_sync,
     should_run_scheduled_sync,
+    record_monitor_run,
     record_sync_run,
 )
 
@@ -37,7 +40,7 @@ _scheduler: Optional[BackgroundScheduler] = None
 
 def _run_scheduled_sync():
     """
-    定时任务（东八区每偶数整点）：若本小时内已执行过（含手动）则跳过，否则执行 online_sync 并记录时间。
+    定时任务（东八区每 N 小时整点）：若本小时内已执行过（含手动）则跳过，否则执行 online_sync 并记录时间。
     """
     now = now_asia()
     logger.info(
@@ -47,10 +50,10 @@ def _run_scheduled_sync():
     try:
         if not should_run_scheduled_sync():
             logger.info(
-                "Scheduled sync skipped: already run in this even hour (Asia/Shanghai), next at next even hour."
+                "Scheduled sync skipped: already run in this hour slot (Asia/Shanghai)."
             )
             return
-        logger.info("Scheduled sync (even hour Asia/Shanghai): starting...")
+        logger.info("Scheduled sync (every %sh Asia/Shanghai): starting...", settings.SYNC_INTERVAL_HOURS)
         out = sync_from_online_db()
         record_sync_run()
         logger.info(
@@ -66,12 +69,25 @@ def _run_scheduled_sync():
 
 def _run_monitor_daily_track():
     """
-    每天东八区 8:00 执行：为 operation_status=1 的父 ASIN 做监控追踪标记。
-    数据更新仍由偶数整点 sync 完成，此处仅做日志与后续扩展（如仅同步已操作父 ASIN）。
+    定时任务（东八区每 6 小时整点：0/6/12/18）：
+    若本小时内已执行过则跳过，否则为 operation_status=1 的父 ASIN 自动补齐自 operated_at 起的周数据，
+    并同步 checked_status，用于 Monitor 页面展示周完成状态。
     """
+    now = now_asia()
     logger.info(
-        "[Monitor] Daily track at 8:00 UTC+8 (Asia/Shanghai): tick."
+        "[Monitor] Scheduled track triggered at %s (Asia/Shanghai), checking should_run...",
+        now.strftime("%Y-%m-%d %H:%M:%S"),
     )
+    try:
+        if not should_run_monitor_sync(interval_hours=6):
+            logger.info("[Monitor] Scheduled track skipped: already run in this hour (Asia/Shanghai).")
+            return
+        logger.info("[Monitor] Scheduled track (every 6h Asia/Shanghai): starting auto monitor sync.")
+        out = sync_auto_monitor()
+        record_monitor_run()
+        logger.info("[Monitor] Daily track done: %s", out)
+    except Exception as e:
+        logger.exception("[Monitor] Daily track failed: %s", e)
 
 
 def _run_scheduled_group_a_sync():
@@ -110,20 +126,24 @@ async def lifespan(app: FastAPI):
     if settings.ENABLE_SCHEDULED_SYNC:
         try:
             _scheduler = BackgroundScheduler(timezone=settings.SYNC_TIMEZONE)
-            # 东八区每偶数整点（0,2,4,...,22）执行
+            sync_interval = max(1, int(settings.SYNC_INTERVAL_HOURS or 2))
+            sync_hours = ",".join(str(h) for h in range(0, 24, sync_interval))
+            # Online Sync：东八区每 N 小时整点执行一次
             _scheduler.add_job(
                 _run_scheduled_sync,
                 "cron",
-                hour="0,2,4,6,8,10,12,14,16,18,20,22",
+                hour=sync_hours,
                 minute=0,
                 id="online_sync",
                 misfire_grace_time=300,
             )
-            # 每天东八区 8:00 执行 monitor 追踪（与 8 点 sync 同刻，先打点再 sync 或仅打点）
+            monitor_interval = max(1, int(settings.MONITOR_SYNC_INTERVAL_HOURS or 6))
+            monitor_hours = ",".join(str(h) for h in range(0, 24, monitor_interval))
+            # Monitor：东八区每 N 小时整点执行一次
             _scheduler.add_job(
                 _run_monitor_daily_track,
                 "cron",
-                hour=8,
+                hour=monitor_hours,
                 minute=0,
                 id="monitor_daily_track",
                 misfire_grace_time=300,
@@ -142,20 +162,34 @@ async def lifespan(app: FastAPI):
             _scheduler.start()
             job = _scheduler.get_job("online_sync")
             next_run = job.next_run_time if job else None
+            monitor_job = _scheduler.get_job("monitor_daily_track")
+            monitor_next_run = monitor_job.next_run_time if monitor_job else None
             group_a_job = _scheduler.get_job("group_a_sync")
             group_a_next_run = group_a_job.next_run_time if group_a_job else None
-            # 若当前为东八区偶数小时且本小时内未执行过，启动时补跑一次
+            # 若当前为东八区命中 online sync 的小时窗口且本小时内未执行过，启动时补跑一次
             now = now_asia()
-            if is_even_hour(now) and should_run_scheduled_sync():
+            if is_n_hour_slot(now, sync_interval) and should_run_scheduled_sync():
                 logger.info(
-                    "Scheduled sync: current hour %s is even (Asia/Shanghai), no run yet this hour — running once in background.",
+                    "Scheduled sync: current hour %s matches %sh window (Asia/Shanghai), no run yet this hour — running once in background.",
                     now.hour,
+                    sync_interval,
                 )
                 try:
                     t = threading.Thread(target=_run_scheduled_sync, daemon=True)
                     t.start()
                 except Exception as e:
                     logger.exception("Startup sync failed: %s", e)
+            if is_n_hour_slot(now, monitor_interval) and should_run_monitor_sync(interval_hours=monitor_interval):
+                logger.info(
+                    "[Monitor] Scheduled track: current hour %s matches %sh window (Asia/Shanghai) — running once in background.",
+                    now.hour,
+                    monitor_interval,
+                )
+                try:
+                    t = threading.Thread(target=_run_monitor_daily_track, daemon=True)
+                    t.start()
+                except Exception as e:
+                    logger.exception("[Monitor] Startup track failed: %s", e)
             if now.hour % settings.GROUP_A_SYNC_INTERVAL_HOURS == 0:
                 logger.info(
                     "[GroupA] Scheduled sync: current hour %s matches %sh window (Asia/Shanghai) — running once in background.",
@@ -168,8 +202,14 @@ async def lifespan(app: FastAPI):
                 except Exception as e:
                     logger.exception("[GroupA] Startup sync failed: %s", e)
             logger.info(
-                "Scheduled sync enabled: every 2h at :00 (even hours Asia/Shanghai), next_run_time=%s",
+                "Scheduled sync enabled: every %sh at :00 (Asia/Shanghai), next_run_time=%s",
+                sync_interval,
                 next_run,
+            )
+            logger.info(
+                "[Monitor] Scheduled track enabled: every %sh at :00 (Asia/Shanghai), next_run_time=%s",
+                monitor_interval,
+                monitor_next_run,
             )
             logger.info(
                 "[GroupA] Scheduled sync enabled: every %sh at :00 (Asia/Shanghai), next_run_time=%s",

@@ -9,7 +9,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import text, tuple_
+from sqlalchemy import func, text, tuple_
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 
 from app.config import settings
@@ -77,10 +77,11 @@ def sync_group_a_impression(week_no: str | int) -> dict:
 
     t0 = time.time()
     fetched_children = 0
-    skipped_parents_existing = 0
+    skipped_parents_with_orders = 0
     inserted = 0
     updated = 0
     missing_parent_map = 0
+    ambiguous_parent_map = 0
     missing_parent_id = 0
     parents_with_no_children = 0
     parents_with_no_search_data = 0
@@ -89,11 +90,12 @@ def sync_group_a_impression(week_no: str | int) -> dict:
 
     logger.info("[GroupA] sync started: week_no=%s", wk_str)
     try:
-        # 1) amazon_search: 一次性拉取本周高曝光子 asin 的 impression/cart + parent 映射，避免 Step2 分批 692 次慢查
+        # 1) amazon_search: 一次性拉取本周高曝光子 asin 的 impression/cart + parent 映射。
+        #    仅接受能唯一映射到单个 variation_id 的子 ASIN，避免用 MIN(variation_id) 误绑父体。
         t_step1 = time.time()
         min_impression_count = 5
         logger.info(
-            "[GroupA] Step1 start: querying amazon_search + parent mapping for week_no=%s with impression_count > %s (single joined query)",
+            "[GroupA] Step1 start: querying amazon_search + uniquely-resolved parent mapping for week_no=%s with impression_count > %s (single joined query)",
             wk_str,
             min_impression_count,
         )
@@ -104,10 +106,13 @@ def sync_group_a_impression(week_no: str | int) -> dict:
                     "SELECT s.asin AS child_asin, s.store_id, "
                     "COALESCE(s.impression_count, 0) AS impression_count, "
                     "COALESCE(s.cart_count, 0) AS cart_count, "
-                    "av.asin AS parent_asin, av.id AS parent_id, av.created_at AS parent_created_at "
+                    "av.asin AS parent_asin, av.id AS parent_id, av.created_at AS parent_created_at, "
+                    "COALESCE(lm.variation_count, 0) AS parent_variation_count "
                     "FROM amazon_search s "
                     "LEFT JOIN ("
-                    "    SELECT al.asin, al.store_id, MIN(al.variation_id) AS variation_id "
+                    "    SELECT al.asin, al.store_id, "
+                    "           MIN(al.variation_id) AS variation_id, "
+                    "           COUNT(DISTINCT al.variation_id) AS variation_count "
                     "    FROM amazon_listing al "
                     "    INNER JOIN ("
                     "        SELECT DISTINCT asin, store_id "
@@ -118,7 +123,7 @@ def sync_group_a_impression(week_no: str | int) -> dict:
                     "    WHERE al.store_id IN (1,7,12,25) "
                     "    GROUP BY al.asin, al.store_id"
                     ") lm ON lm.asin = s.asin AND lm.store_id = s.store_id "
-                    "LEFT JOIN amazon_variation av ON av.id = lm.variation_id "
+                    "LEFT JOIN amazon_variation av ON av.id = lm.variation_id AND lm.variation_count = 1 "
                     "WHERE s.store_id IN (1,7,12,25) AND s.week_no = :wk "
                     "  AND COALESCE(s.impression_count, 0) > :min_impression_count "
                     "ORDER BY COALESCE(s.impression_count, 0) DESC"
@@ -136,7 +141,15 @@ def sync_group_a_impression(week_no: str | int) -> dict:
             time.time() - t_step1,
         )
         if not rows:
-            return {"week_no": wk_int, "fetched_children": 0, "skipped_parents_existing": 0, "inserted": 0, "updated": 0}
+            return {
+                "week_no": wk_int,
+                "fetched_children": 0,
+                "skipped_parents_with_orders": 0,
+                "inserted": 0,
+                "updated": 0,
+                "missing_parent_map": 0,
+                "ambiguous_parent_map": 0,
+            }
 
         # 预先构建 (child_asin, store_id) -> (impression, cart)
         child_metrics = {(r[0], int(r[1]) if r[1] is not None else None): (int(r[2] or 0), int(r[3] or 0)) for r in rows}
@@ -149,7 +162,15 @@ def sync_group_a_impression(week_no: str | int) -> dict:
         # 2) 解析父 asin：直接消费 Step1 联表结果，在内存中去重并统计缺失映射
         child_pairs = [(r[0], int(r[1])) for r in rows if r[0] and r[1] is not None]
         if not child_pairs:
-            return {"week_no": wk_int, "fetched_children": fetched_children, "skipped_parents_existing": 0, "inserted": 0, "updated": 0}
+            return {
+                "week_no": wk_int,
+                "fetched_children": fetched_children,
+                "skipped_parents_with_orders": 0,
+                "inserted": 0,
+                "updated": 0,
+                "missing_parent_map": 0,
+                "ambiguous_parent_map": 0,
+            }
 
         seen_parent_key = set()
         mapped_child_keys = set()
@@ -169,13 +190,18 @@ def sync_group_a_impression(week_no: str | int) -> dict:
             parent_asin = r[4]
             parent_id = int(r[5]) if r[5] is not None else None
             parent_created_at = r[6]
+            variation_count = int(r[7] or 0)
 
             if child_asin and sid is not None:
                 ckey = (child_asin, sid)
-                if parent_asin or parent_id is not None:
+                if variation_count > 1:
+                    ambiguous_parent_map += 1
+                elif parent_asin or parent_id is not None:
                     mapped_child_keys.add(ckey)
 
-            if parent_id is None:
+            if variation_count > 1:
+                pass
+            elif parent_id is None:
                 if child_asin and sid is not None:
                     missing_parent_id += 1
             elif parent_asin and sid is not None:
@@ -186,31 +212,44 @@ def sync_group_a_impression(week_no: str | int) -> dict:
 
             if row_idx == 1 or row_idx % STEP2_LOG_EVERY == 0 or row_idx == num_step2_rows:
                 logger.info(
-                    "[GroupA] Step2 progress: rows=%s/%s mapped_children=%s unique_parents=%s missing_parent_id=%s elapsed=%.2fs",
+                    "[GroupA] Step2 progress: rows=%s/%s mapped_children=%s unique_parents=%s ambiguous_parent_map=%s missing_parent_id=%s elapsed=%.2fs",
                     row_idx,
                     num_step2_rows,
                     len(mapped_child_keys),
                     len(all_parents),
+                    ambiguous_parent_map,
                     missing_parent_id,
                     time.time() - t_step2,
                 )
 
-        missing_parent_map = max(0, len(child_pairs) - len(mapped_child_keys))
+        missing_parent_map = max(0, len(child_pairs) - len(mapped_child_keys) - ambiguous_parent_map)
         logger.info(
-            "[GroupA] Step2 parent mapping done: pairs=%s mapped_children=%s unique_parents=%s missing_map=%s missing_parent_id=%s elapsed=%.2fs",
+            "[GroupA] Step2 parent mapping done: pairs=%s mapped_children=%s unique_parents=%s ambiguous_map=%s missing_map=%s missing_parent_id=%s elapsed=%.2fs",
             len(child_pairs),
             len(mapped_child_keys),
             len(all_parents),
+            ambiguous_parent_map,
             missing_parent_map,
             missing_parent_id,
             time.time() - t_step2,
         )
 
         if not all_parents:
-            return {"week_no": wk_int, "fetched_children": fetched_children, "skipped_parents_existing": 0, "inserted": 0, "updated": 0}
+            return {
+                "week_no": wk_int,
+                "fetched_children": fetched_children,
+                "skipped_parents_with_orders": 0,
+                "inserted": 0,
+                "updated": 0,
+                "missing_parent_map": missing_parent_map,
+                "ambiguous_parent_map": ambiguous_parent_map,
+            }
 
-        # 3) 先加载本周 asin_performances 中已有订单的 (parent_asin, store_id)，再用集合过滤出待处理父 ASIN
-        logger.info("[GroupA] Step3 start: loading existing (parent_asin, store_id) from asin_performances week_no=%s...", wk_str)
+        # 3) 先加载本周 asin_performances 中“已存在且 parent_order_total > 0”的 (parent_asin, store_id)，再用集合过滤出待处理父 ASIN
+        logger.info(
+            "[GroupA] Step3 start: loading (parent_asin, store_id) from asin_performances with parent_order_total > 0 for week_no=%s...",
+            wk_str,
+        )
         t_step3_load = time.time()
         existing_parent_keys = set(
             local_db.query(AsinPerformance.parent_asin, AsinPerformance.store_id)
@@ -220,13 +259,18 @@ def sync_group_a_impression(week_no: str | int) -> dict:
                 AsinPerformance.parent_asin.isnot(None),
                 AsinPerformance.parent_asin != "",
             )
-            .distinct()
+            .group_by(AsinPerformance.parent_asin, AsinPerformance.store_id)
+            .having(func.max(AsinPerformance.parent_order_total) > 0)
             .all()
         )
         existing_parent_keys = {(r[0], int(r[1])) for r in existing_parent_keys if r[0] and r[1] is not None}
-        logger.info("[GroupA] Step3 existing_parent_keys loaded: %s in %.2fs", len(existing_parent_keys), time.time() - t_step3_load)
+        logger.info(
+            "[GroupA] Step3 existing_parent_keys loaded (parent_order_total > 0): %s in %.2fs",
+            len(existing_parent_keys),
+            time.time() - t_step3_load,
+        )
 
-        # 3.1) 已在 asin_performances 出单的父 ASIN，从 group_A 业务视角视为“已迁移”
+        # 3.1) 已在 asin_performances 中存在且 parent_order_total > 0 的父 ASIN，从 group_A 业务视角视为“已迁移”
         t_step3_mark = time.time()
         if existing_parent_keys:
             migrated_to_asin_performances = (
@@ -243,7 +287,7 @@ def sync_group_a_impression(week_no: str | int) -> dict:
             )
             local_db.commit()
         logger.info(
-            "[GroupA] Step3 mark migrated parents: week_no=%s existing_in_asin_perf=%s marked=%s elapsed=%.2fs",
+            "[GroupA] Step3 mark migrated parents: week_no=%s existing_in_asin_perf_with_orders=%s marked=%s elapsed=%.2fs",
             wk_str,
             len(existing_parent_keys),
             migrated_to_asin_performances,
@@ -252,30 +296,31 @@ def sync_group_a_impression(week_no: str | int) -> dict:
 
         t_step3_filter = time.time()
         final_parents = [(pa, sid, pid, pc) for (pa, sid, pid, pc) in all_parents if (pa, sid) not in existing_parent_keys and pid is not None]
-        skipped_parents_existing = len(all_parents) - len(final_parents)
+        skipped_parents_with_orders = len(all_parents) - len(final_parents)
         logger.info(
-            "[GroupA] Step3 filter existing parents: week_no=%s parents_total=%s skipped_existing=%s to_process=%s existing_in_asin_perf=%s elapsed=%.2fs",
+            "[GroupA] Step3 filter existing parents: week_no=%s parents_total=%s skipped_parents_with_orders=%s to_process=%s existing_in_asin_perf_with_orders=%s elapsed=%.2fs",
             wk_str,
             len(all_parents),
-            skipped_parents_existing,
+            skipped_parents_with_orders,
             len(final_parents),
             len(existing_parent_keys),
             time.time() - t_step3_filter,
         )
         if not final_parents:
             logger.warning(
-                "[GroupA] No data will be written to group_A: all parents for week_no=%s already exist in asin_performances (count=%s). "
-                "group_A only stores parents NOT in asin_performances for this week.",
+                "[GroupA] No data will be written to group_A: all parents for week_no=%s already exist in asin_performances with parent_order_total > 0 (count=%s). "
+                "group_A only stores parents NOT in asin_performances with parent_order_total > 0 for this week.",
                 wk_str,
                 len(existing_parent_keys),
             )
             return {
                 "week_no": wk_int,
                 "fetched_children": fetched_children,
-                "skipped_parents_existing": skipped_parents_existing,
+                "skipped_parents_with_orders": skipped_parents_with_orders,
                 "inserted": 0,
                 "updated": 0,
                 "missing_parent_map": missing_parent_map,
+                "ambiguous_parent_map": ambiguous_parent_map,
                 "parents_no_children": parents_with_no_children,
                 "parents_no_search_data": parents_with_no_search_data,
             }
@@ -345,15 +390,11 @@ def sync_group_a_impression(week_no: str | int) -> dict:
                     child_to_parent[key] = (pa, pc)
                     child_pairs_all.append(key)
 
-                child_pairs_filtered = child_pairs_all
-
-                if not child_pairs_filtered:
-                    skipped_parents_existing += len(batch_parents)
+                if not child_pairs_all:
                     logger.info(
-                        "[GroupA] batch %s/%s skip: all parents already exist in asin_performances for week_no=%s elapsed=%.2fs",
+                        "[GroupA] batch %s/%s skip: no valid child ASINs found for current parent batch elapsed=%.2fs",
                         bidx,
                         (len(final_parents) + parent_batch_size - 1) // parent_batch_size,
-                        wk_str,
                         time.time() - t_batch,
                     )
                     continue
@@ -379,7 +420,7 @@ def sync_group_a_impression(week_no: str | int) -> dict:
                     "[GroupA] batch %s/%s sessions fetched: keys=%s hits=%s queries=%s elapsed=%.2fs",
                     bidx,
                     num_batches,
-                    len(child_pairs_filtered),
+                    len(child_pairs_all),
                     len(sessions_map),
                     1,
                     time.time() - t_sessions,
@@ -404,7 +445,7 @@ def sync_group_a_impression(week_no: str | int) -> dict:
                     "[GroupA] batch %s/%s search_data fetched: child_keys=%s rows=%s queries=%s elapsed=%.2fs",
                     bidx,
                     num_batches,
-                    len(child_pairs_filtered),
+                    len(child_pairs_all),
                     len(search_rows),
                     1,
                     time.time() - t_search,
@@ -413,10 +454,10 @@ def sync_group_a_impression(week_no: str | int) -> dict:
                 if not search_rows:
                     parents_with_no_search_data += len(batch_parents)
                     logger.info(
-                        "[GroupA] batch %s/%s skip: search_data empty for filtered children=%s elapsed=%.2fs",
+                        "[GroupA] batch %s/%s skip: search_data empty for children=%s elapsed=%.2fs",
                         bidx,
                         (len(final_parents) + parent_batch_size - 1) // parent_batch_size,
-                        len(child_pairs_filtered),
+                        len(child_pairs_all),
                         time.time() - t_batch,
                     )
                     continue
@@ -496,7 +537,7 @@ def sync_group_a_impression(week_no: str | int) -> dict:
                         (len(final_parents) + parent_batch_size - 1) // parent_batch_size,
                         len(batch_parents),
                         len(listing_rows),
-                        len(child_pairs_filtered),
+                        len(child_pairs_all),
                         len(search_rows),
                         len(values),
                         affected,
@@ -564,11 +605,12 @@ def sync_group_a_impression(week_no: str | int) -> dict:
 
         total_elapsed = time.time() - t0
         logger.info(
-            "[GroupA] DONE: week_no=%s fetched_children=%s missing_parent_map=%s skipped_parents_existing=%s parents_no_children=%s parents_no_search_data=%s inserted=%s updated=%s online_sql_calls=%s elapsed=%.2fs",
+            "[GroupA] DONE: week_no=%s fetched_children=%s ambiguous_parent_map=%s missing_parent_map=%s skipped_parents_with_orders=%s parents_no_children=%s parents_no_search_data=%s inserted=%s updated=%s online_sql_calls=%s elapsed=%.2fs",
             wk_str,
             fetched_children,
+            ambiguous_parent_map,
             missing_parent_map,
-            skipped_parents_existing,
+            skipped_parents_with_orders,
             parents_with_no_children,
             parents_with_no_search_data,
             inserted,
@@ -580,10 +622,11 @@ def sync_group_a_impression(week_no: str | int) -> dict:
         return {
             "week_no": wk_int,
             "fetched_children": fetched_children,
-            "skipped_parents_existing": skipped_parents_existing,
+            "skipped_parents_with_orders": skipped_parents_with_orders,
             "inserted": inserted,
             "updated": updated,
             "missing_parent_map": missing_parent_map,
+            "ambiguous_parent_map": ambiguous_parent_map,
             "parents_no_children": parents_with_no_children,
             "parents_no_search_data": parents_with_no_search_data,
             "online_sql_calls": online_sql_calls,

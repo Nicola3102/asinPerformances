@@ -40,6 +40,7 @@ from app.views import (
     GroupAOperateBody,
     MonitorParentItem,
     MonitorTrackRow,
+    MonitorWeekStatus,
     MonitorTrackResponse,
 )
 from app.services.group_f_spark import (
@@ -53,6 +54,7 @@ from app.services.groupA_impression import (
     _get_sync_date_range,
     _date_to_week_no,
 )
+from app.services.auto_monitor import check_parent_store_week_completed, get_parent_week_status_details
 
 router = APIRouter(prefix="/api/asin-performances", tags=["asin-performances"])
 logger = logging.getLogger(__name__)
@@ -63,6 +65,16 @@ _group_f_slot = {"started_at": None, "request_id": None}
 _group_f_slot_lock = threading.Lock()
 _GROUP_F_STALE_SEC = 25 * 60   # 超过此时长视为过期，允许新请求
 _GROUP_F_STUCK_SEC = 20 * 60   # 超过此时长在 status 中标记为 is_stuck
+
+
+def _normalize_group_a_sync_result(result: dict) -> dict:
+    """Normalize Group A sync result keys for API consumers."""
+    normalized = dict(result or {})
+    if "skipped_parents_with_orders" not in normalized and "skipped_parents_existing" in normalized:
+        normalized["skipped_parents_with_orders"] = normalized.pop("skipped_parents_existing")
+    else:
+        normalized.pop("skipped_parents_existing", None)
+    return normalized
 
 
 def _fetch_listing_meta_for_export(rows) -> dict:
@@ -509,6 +521,7 @@ def trigger_group_a_sync(
 
         logger.info("[GroupA] API trigger start: week_no=%s", wk_str)
         out = sync_group_a_impression(wk_str)
+        out = _normalize_group_a_sync_result(out)
         logger.info("[GroupA] API trigger done: week_no=%s result=%s", wk_str, out)
         return {
             "status": "ok",
@@ -780,8 +793,10 @@ def refresh_query_status(
     """
     轮询查询状态：
     - 针对指定 week_no 下各 (parent_asin, store_id)；
-    - 仅检查该父 ASIN 下 impression>0 的子 ASIN；
-    - 若子 ASIN 在 online.amazon_search 中状态全部为 3，则标记 completed；
+    - 检查该父 ASIN 在对应 store 下的全部子 ASIN；
+    - 若该周 amazon_search 对该父 ASIN 的全部子 ASIN 一条记录都没有，视为该周尚未开始处理，不允许通过；
+    - 若子 ASIN 在 online.amazon_search 中状态为 3，或该周无记录，则视为该子 ASIN 已完成；
+    - 仅当存在子 ASIN 查到记录但状态不为 3 时，才标记该父 ASIN 为 pending；
     - completed 的父 ASIN 后续跳过；
     - 未 completed 的父 ASIN 每 8 分钟最多检查一次。
     """
@@ -831,6 +846,8 @@ def refresh_query_status(
     try:
         with online_engine.connect() as conn:
             for pa, sid, q_status, checked_at in groups:
+                if sid is None:
+                    continue
                 if str(q_status or "").lower() == "completed":
                     skipped_completed += 1
                     continue
@@ -838,22 +855,9 @@ def refresh_query_status(
                     skipped_by_interval += 1
                     continue
 
-                child_rows = (
-                    db.query(AsinPerformance.child_asin)
-                    .filter(
-                        AsinPerformance.week_no == week_no,
-                        AsinPerformance.parent_asin == pa,
-                        AsinPerformance.store_id == sid,
-                        AsinPerformance.child_impression_count > 0,
-                        AsinPerformance.child_asin.isnot(None),
-                        AsinPerformance.child_asin != "",
-                    )
-                    .distinct()
-                    .all()
-                )
-                child_asins = [r[0] for r in child_rows if r[0]]
-                if not child_asins:
-                    # 无 impression 子 ASIN，保持 pending，只记录检查时间
+                done, child_count = check_parent_store_week_completed(conn, str(pa or ""), int(sid), week_no)
+                if child_count == 0:
+                    # 无子 ASIN，保持 pending，只记录检查时间
                     db.query(AsinPerformance).filter(
                         AsinPerformance.week_no == week_no,
                         AsinPerformance.parent_asin == pa,
@@ -864,26 +868,6 @@ def refresh_query_status(
                     )
                     checked_groups += 1
                     continue
-
-                status_map = {}
-                batch_size = 200
-                for i in range(0, len(child_asins), batch_size):
-                    batch = child_asins[i:i + batch_size]
-                    asin_ph = ", ".join([f":a{j}" for j in range(len(batch))])
-                    params = {"sid": sid, "week_no": str(week_no)}
-                    for j, asin in enumerate(batch):
-                        params[f"a{j}"] = asin
-                    rows = conn.execute(
-                        text(
-                            f"SELECT asin, status FROM amazon_search "
-                            f"WHERE store_id = :sid AND week_no = :week_no AND asin IN ({asin_ph})"
-                        ),
-                        params,
-                    ).fetchall()
-                    for r in rows:
-                        status_map[str(r[0])] = r[1]
-
-                done = all((asin in status_map and int(status_map[asin]) == 3) for asin in child_asins)
                 new_status = "completed" if done else "pending"
                 db.query(AsinPerformance).filter(
                     AsinPerformance.week_no == week_no,
@@ -1383,6 +1367,42 @@ def get_monitor_track(
         .all()
     )
     weeks = sorted({r[1] for r in rows if r[1] is not None})
+    if weeks:
+        latest_week = max(weeks)
+        latest_week_rows = [r for r in rows if r[1] == latest_week]
+        latest_week_has_data = any(
+            (r[2] is not None and str(r[2]).strip() != "")
+            or r[3] is not None
+            or r[4] is not None
+            or r[5] is not None
+            for r in latest_week_rows
+        )
+        latest_week_status_rows = (
+            db.query(
+                AsinPerformance.store_id,
+                func.max(AsinPerformance.checked_status).label("checked_status"),
+            )
+            .filter(
+                AsinPerformance.parent_asin == parent_asin,
+                AsinPerformance.week_no == latest_week,
+            )
+            .group_by(AsinPerformance.store_id)
+            .all()
+        )
+        all_pending = bool(latest_week_status_rows) and all(
+            str(item[1] or "").lower() == "pending"
+            for item in latest_week_status_rows
+        )
+        if all_pending or not latest_week_has_data:
+            weeks = [w for w in weeks if w != latest_week]
+            rows = [r for r in rows if r[1] != latest_week]
+            logger.info(
+                "[Monitor] hide latest week for parent_asin=%s latest_week=%s all_pending=%s has_data=%s",
+                parent_asin,
+                latest_week,
+                all_pending,
+                latest_week_has_data,
+            )
     out_rows = [
         MonitorTrackRow(
             child_asin=r[0],
@@ -1394,7 +1414,53 @@ def get_monitor_track(
         )
         for r in rows
     ]
-    return MonitorTrackResponse(parent_asin=parent_asin, weeks=weeks, rows=out_rows)
+    status_rows = (
+        db.query(
+            AsinPerformance.week_no,
+            AsinPerformance.store_id,
+            AsinPerformance.checked_status,
+            AsinPerformance.checked_at,
+        )
+        .filter(
+            AsinPerformance.parent_asin == parent_asin,
+            AsinPerformance.week_no.isnot(None),
+        )
+        .all()
+    )
+    latest_status_by_group = {}
+    for week_no, store_id, checked_status, checked_at in status_rows:
+        if week_no is None or store_id is None:
+            continue
+        key = (int(week_no), int(store_id))
+        prev = latest_status_by_group.get(key)
+        if prev is None or ((checked_at or datetime.min) >= (prev[1] or datetime.min)):
+            latest_status_by_group[key] = (str(checked_status or "").lower(), checked_at)
+    week_details = {}
+    if weeks and settings.ONLINE_DB_HOST and settings.ONLINE_DB_USER:
+        try:
+            engine = get_online_engine()
+            with engine.connect() as conn:
+                week_details = get_parent_week_status_details(conn, parent_asin, weeks)
+        except Exception as e:
+            logger.warning("[Monitor] failed to load week status details for parent_asin=%s: %s", parent_asin, e)
+    week_statuses = []
+    for week_no in weeks:
+        per_store = [val for (wk, _sid), val in latest_status_by_group.items() if wk == week_no]
+        detail = week_details.get(week_no, {})
+        completed = detail.get("completed")
+        if completed is None:
+            completed = bool(per_store) and all(status == "completed" for status, _checked_at in per_store)
+        checked_at = max((item[1] for item in per_store if item[1] is not None), default=None)
+        week_statuses.append(
+            MonitorWeekStatus(
+                week_no=week_no,
+                completed=bool(completed),
+                checked_at=checked_at,
+                incomplete_count=int(detail.get("incomplete_count") or 0),
+                incomplete_child_asins=detail.get("incomplete_child_asins") or [],
+            )
+        )
+    return MonitorTrackResponse(parent_asin=parent_asin, weeks=weeks, week_statuses=week_statuses, rows=out_rows)
 
 
 @router.get("/{item_id}", response_model=AsinPerformanceResponse)

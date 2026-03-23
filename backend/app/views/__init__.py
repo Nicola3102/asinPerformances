@@ -18,6 +18,7 @@ from app.views.asin_schemas import (
     GroupAOperateBody,
     MonitorParentItem,
     MonitorTrackRow,
+    MonitorWeekStatus,
     MonitorTrackResponse,
 )
 
@@ -41,5 +42,6 @@ __all__ = [
     "GroupAOperateBody",
     "MonitorParentItem",
     "MonitorTrackRow",
+    "MonitorWeekStatus",
     "MonitorTrackResponse",
 ]

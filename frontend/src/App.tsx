@@ -821,6 +821,7 @@ function MonitorPage() {
   const [selectedParent, setSelectedParent] = useState('')
   const [parentSearch, setParentSearch] = useState('')
   const [track, setTrack] = useState<MonitorTrackResponse | null>(null)
+  const [selectedIncompleteWeek, setSelectedIncompleteWeek] = useState<number | null>(null)
   const [loadingParents, setLoadingParents] = useState(true)
   const [loadingTrack, setLoadingTrack] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -840,6 +841,7 @@ function MonitorPage() {
   useEffect(() => {
     if (!selectedParent.trim()) {
       setTrack(null)
+      setSelectedIncompleteWeek(null)
       return
     }
     setLoadingTrack(true)
@@ -864,6 +866,8 @@ function MonitorPage() {
 
   const childTables = track ? buildChildTables(track) : new Map()
   const weeks = track?.weeks ?? []
+  const weekStatuses = track?.week_statuses ?? []
+  const incompleteWeekDetail = weekStatuses.find((item) => item.week_no === selectedIncompleteWeek) ?? null
   const selectedParentMeta = parents.find((p) => (p.parent_asin ?? '') === selectedParent) ?? null
   const selectedParentVisible = filteredParents.some((p) => (p.parent_asin ?? '') === selectedParent)
 
@@ -904,6 +908,26 @@ function MonitorPage() {
               最早 operated_at：{formatCreatedAt(selectedParentMeta.operated_at)}
             </span>
           )}
+          {selectedParentVisible && weekStatuses.length > 0 && (
+            <span className="monitor-operated-at">
+              周状态：
+              {' '}
+              {weekStatuses.map((item, idx) => (
+                <span key={item.week_no ?? `wk-${idx}`} className="monitor-week-status-item">
+                  <span>{`${item.week_no ?? '–'}${item.completed ? '✅' : ''}`}</span>
+                  <button
+                    type="button"
+                    className="monitor-missing-btn"
+                    disabled={(item.incomplete_count ?? 0) <= 0}
+                    onClick={() => setSelectedIncompleteWeek(item.week_no ?? null)}
+                    title={(item.incomplete_count ?? 0) > 0 ? '查看未完成子 ASIN' : '无未完成子 ASIN'}
+                  >
+                    {`未完成${item.incomplete_count ?? 0}`}
+                  </button>
+                </span>
+              ))}
+            </span>
+          )}
         </div>
       )}
       {!loadingParents && parents.length > 0 && filteredParents.length === 0 && (
@@ -925,7 +949,7 @@ function MonitorPage() {
                         const summary = weekSummary.get(w)
                         return (
                           <th key={w} colSpan={3} className="monitor-week-col">
-                            {`week ${w}(${summary?.queryCount ?? 0})`}
+                            {`${w}(${summary?.queryCount ?? 0})`}
                           </th>
                         )
                       })}
@@ -969,6 +993,27 @@ function MonitorPage() {
               </div>
             </div>
           ))}
+        </div>
+      )}
+      {selectedIncompleteWeek != null && incompleteWeekDetail && (
+        <div className="modal-overlay" onClick={() => setSelectedIncompleteWeek(null)}>
+          <div className="modal monitor-missing-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>{`${selectedParent || '父 ASIN'} - ${selectedIncompleteWeek} 未完成子 ASIN`}</h2>
+              <button type="button" className="modal-close" onClick={() => setSelectedIncompleteWeek(null)}>×</button>
+            </div>
+            <div className="modal-body">
+              {incompleteWeekDetail.incomplete_child_asins.length === 0 ? (
+                <p className="empty-hint">该周没有未完成子 ASIN。</p>
+              ) : (
+                <div className="monitor-missing-list">
+                  {incompleteWeekDetail.incomplete_child_asins.map((asin) => (
+                    <span key={asin} className="monitor-missing-chip">{asin}</span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       )}
     </div>
