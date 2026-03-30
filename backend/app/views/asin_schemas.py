@@ -22,6 +22,8 @@ class AsinPerformanceBase(BaseModel):
     search_query_total_impression: Optional[int] = None
     search_query_click_count: Optional[int] = None
     search_query_total_click: Optional[int] = None
+    ad_check: Optional[bool] = False
+    ad_created_at: Optional[datetime] = None
 
 
 class AsinPerformanceCreate(AsinPerformanceBase):
@@ -44,6 +46,10 @@ class SummaryRow(BaseModel):
     week_no: Optional[int] = None
     store_id: Optional[int] = None
     operation_status: Optional[bool] = False
+    last_operated_at: Optional[datetime] = None
+    ad_check: Optional[bool] = False
+    ad_created_at: Optional[datetime] = None
+    last_ad_created_at: Optional[datetime] = None
     operated_at: Optional[datetime] = None
     checked_status: Optional[str] = None
     checked_at: Optional[datetime] = None
@@ -58,6 +64,10 @@ class SummaryRowConsolidated(BaseModel):
     store_ids: List[int] = []
     child_asins_with_orders: List[str] = []
     operation_status: Optional[bool] = False
+    last_operated_at: Optional[datetime] = None
+    ad_check: Optional[bool] = False
+    ad_created_at: Optional[datetime] = None
+    last_ad_created_at: Optional[datetime] = None
     operated_at: Optional[datetime] = None
     checked_status: Optional[str] = None
     checked_at: Optional[datetime] = None
@@ -195,3 +205,36 @@ class MonitorTrackResponse(BaseModel):
     weeks: List[int] = []
     week_statuses: List[MonitorWeekStatus] = []
     rows: List[MonitorTrackRow] = []
+
+
+class TrendBatchOption(BaseModel):
+    id: int
+    label: str
+
+
+class TrendFilterOptions(BaseModel):
+    store_ids: List[int] = []
+    batch_ids: List[int] = []
+    batch_options: List[TrendBatchOption] = []
+    week_nos: List[int] = []
+    used_models: List[str] = []
+
+
+class TrendWeekPoint(BaseModel):
+    week_no: int
+    new_asin_count: int = 0
+    total_impression: int = 0
+    total_sessions: int = 0
+    total_clicks: int = 0
+    total_asin_count: int = 0
+    active_asin_count: int = 0
+    impression_asin_count: int = 0
+    related_click: int = 0
+    impression_asin_rate: float = 0.0
+
+
+class TrendResponse(BaseModel):
+    matched_row_count: int = 0
+    weeks: List[int] = []
+    filter_options: TrendFilterOptions = TrendFilterOptions()
+    series: List[TrendWeekPoint] = []

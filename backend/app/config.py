@@ -27,6 +27,22 @@ class Settings(BaseSettings):
     SYNC_INTERVAL_HOURS: int = Field(default=2, validation_alias="sync_interval_hours")
     MONITOR_SYNC_INTERVAL_HOURS: int = Field(default=6, validation_alias="monitor_sync_interval_hours")
     GROUP_A_SYNC_INTERVAL_HOURS: int = Field(default=4, validation_alias="group_a_sync_interval_hours")
+    LISTING_TRACKING_WRITE_CHUNK_SIZE: int = Field(
+        default=500,
+        validation_alias="listing_tracking_write_chunk_size",
+    )
+    LISTING_TRACKING_READER_WORKERS: int = Field(
+        default=4,
+        validation_alias="listing_tracking_reader_workers",
+    )
+    IMAGE_MODEL_RAW: str = Field(
+        default="qwen-image-edit-2511",
+        validation_alias="image_model",
+    )
+    LISTING_TRACKING_IMAGE_MODEL_PREFIXES_RAW: str = Field(
+        default="",
+        validation_alias="listing_tracking_image_model_prefixes",
+    )
     SYNC_TIMEZONE: str = Field(default="Asia/Shanghai", validation_alias="sync_timezone")
 
     @property
@@ -42,6 +58,11 @@ class Settings(BaseSettings):
             f"mysql+pymysql://{self.ONLINE_DB_USER}:{self.ONLINE_DB_PWD}"
             f"@{self.ONLINE_DB_HOST}:{self.ONLINE_DB_PORT}/{self.ONLINE_DB_NAME}"
         )
+
+    @property
+    def listing_tracking_image_model_prefixes(self) -> list[str]:
+        raw = self.IMAGE_MODEL_RAW or self.LISTING_TRACKING_IMAGE_MODEL_PREFIXES_RAW or ""
+        return [item.strip() for item in raw.split(",") if item.strip()]
 
     class Config:
         env_file = str(_ENV_FILE)

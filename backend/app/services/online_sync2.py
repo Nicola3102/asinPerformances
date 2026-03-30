@@ -1,11 +1,13 @@
 """
 从 online_db 分步执行 SQL：先写入有订单的子 ASIN 及其指标，再按父 ASIN 分批从本地读 parent_asin、从远程查子 ASIN 的 traffic/search 数据并写入。
 """
+import csv
 import logging
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 import time
 import random
+from pathlib import Path
 
 import pymysql
 from sqlalchemy import or_, text
@@ -14,7 +16,7 @@ from sqlalchemy.orm import Session
 logger = logging.getLogger(__name__)
 
 from app.config import settings
-from app.database import SessionLocal, init_db
+from app.database import init_db
 from app.online_engine import get_online_engine
 from app.models import AsinPerformance
 
@@ -83,7 +85,7 @@ def _get_sync_date_range():
 
 
 # 店铺（与 online 库各表索引匹配）
-STORE_IDS = "(1, 7,12,25)"
+STORE_IDS = "(3)"
 
 # 依赖 online 库各表已有索引（如 store_id, week_no, purchase_utc_date 等）以加速执行
 # 第一步拆为：1) 轻量核心查询只取有订单子 ASIN+父 ASIN 信息；2) 分批查 traffic/search/search_data 并合并，避免单次大 JOIN 超时
@@ -164,7 +166,7 @@ def _get_active_asins(online_conn, asins: list) -> set:
             # 仅保留：在 listing 中且所有记录的 status 均为 'active' 的 asin
             rows = online_conn.execute(
                 text(
-                    f"SELECT asin FROM amazon_listing WHERE store_id IN (1, 7,12,25) AND asin IN ({placeholders}) GROUP BY asin "
+                    f"SELECT asin FROM amazon_listing WHERE store_id IN (3) AND asin IN ({placeholders}) GROUP BY asin "
                     "HAVING SUM(CASE WHEN COALESCE(status, '') != 'active' THEN 1 ELSE 0 END) = 0"
                 ),
                 params,
@@ -335,7 +337,7 @@ def _step1_fallback_recover(online_engine, params: dict, included_pairs: set, re
                 "COUNT(DISTINCT order_id) AS order_num, "
                 "GROUP_CONCAT(DISTINCT order_id ORDER BY order_id SEPARATOR ',') AS order_ids "
                 "FROM order_item "
-                "WHERE store_id IN (1, 7, 12, 25) AND purchase_utc_date BETWEEN :date_start AND :date_end "
+                "WHERE store_id IN (3) AND purchase_utc_date BETWEEN :date_start AND :date_end "
                 "GROUP BY asin, store_id"
             ),
             params,
@@ -360,7 +362,7 @@ def _step1_fallback_recover(online_engine, params: dict, included_pairs: set, re
                         "SELECT al.asin, av.id AS variation_id, av.asin AS parent_asin, av.created_at AS parent_asin_create_at "
                         "FROM amazon_listing al "
                         "INNER JOIN amazon_variation av ON av.id = al.variation_id "
-                        f"WHERE al.asin IN ({placeholders}) AND al.store_id IN (1, 7, 12, 25) "
+                        f"WHERE al.asin IN ({placeholders}) AND al.store_id IN (3) "
                         "GROUP BY al.asin, av.id, av.asin, av.created_at"
                     ),
                     prm,
@@ -420,10 +422,10 @@ def _get_target_weeks(date_start: str, date_end: str):
 
 
 def _step2_fetch_for_parents(
-    local_db: Session,
     online_conn,
     parent_asins: list,
     parent_lookup: dict,
+    ordered_set: set[tuple[str, int, int]],
     target_weeks: list,
     store_ids: tuple = (1, 7,12,25),
     batch_size: int = 200,
@@ -452,7 +454,7 @@ def _step2_fetch_for_parents(
         # online: (store_id, asin) 该父下所有子
         listing = online_conn.execute(
             text(
-                "SELECT store_id, asin FROM amazon_listing WHERE variation_id = :pid AND store_id IN (1, 7,12,25)"
+                "SELECT store_id, asin FROM amazon_listing WHERE variation_id = :pid AND store_id IN (3)"
             ),
             {"pid": parent_id},
         ).fetchall()
@@ -461,12 +463,7 @@ def _step2_fetch_for_parents(
         # Step2 为无订单子 asin，仅当 imp/sess 均为 0 时才需 status 全为 active；先取 active 集合供下面判断
         listing_asins = list({r[1] for r in listing})
         active_asins = _get_active_asins(online_conn, listing_asins)
-        # 本地：该父下已有 (child_asin, store_id, week_no)（step1 订单）
-        existing = local_db.query(AsinPerformance.child_asin, AsinPerformance.store_id, AsinPerformance.week_no).filter(
-            AsinPerformance.parent_asin == parent_asin,
-        ).distinct().all()
-        ordered_set = {(r[0], r[1], r[2]) for r in existing}
-        # 其他子：(child_asin, store_id, week_no_str, week_no_int) 且不在 ordered_set；
+        # 其他子：(child_asin, store_id, week_no_str, week_no_int) 且不在 ordered_set（step1 订单集合）；
         # 仅当 (parent_asin, week_no, store_id) 在 parent_lookup 中时才纳入，避免写入「该父在本 store 本周无订单」的行，
         # 否则 _recompute_parent_order_totals 会将该组 parent_order_total 置为 0。
         other_triples = []
@@ -574,6 +571,110 @@ def _step2_fetch_for_parents(
                     rows_out.append(row)
                     parent_qualified_count[parent_asin] = parent_qualified_count.get(parent_asin, 0) + 1
     return rows_out, parent_qualified_count
+
+
+def _fetch_listing_pid_title_map(online_conn, asin_store_pairs: list[tuple[str, int]]) -> dict[tuple[str, int], tuple[int | None, str | None]]:
+    """
+    批量查询 amazon_listing，返回 (child_asin, store_id) -> (pid, ai_title)。
+    若存在多条，使用 MAX(pid), MAX(ai_title) 作为稳定导出值。
+    """
+    if not asin_store_pairs:
+        return {}
+    out: dict[tuple[str, int], tuple[int | None, str | None]] = {}
+    batch_size = 500
+    for i in range(0, len(asin_store_pairs), batch_size):
+        chunk = asin_store_pairs[i : i + batch_size]
+        placeholders = ", ".join([f"(:a{j}, :s{j})" for j in range(len(chunk))])
+        params = {}
+        for j, (asin, store_id) in enumerate(chunk):
+            params[f"a{j}"] = asin
+            params[f"s{j}"] = int(store_id)
+        rows = online_conn.execute(
+            text(
+                "SELECT asin, store_id, MAX(CAST(pid AS UNSIGNED)) AS pid, MAX(ai_title) AS ai_title "
+                "FROM amazon_listing "
+                f"WHERE (asin, store_id) IN ({placeholders}) "
+                "GROUP BY asin, store_id"
+            ),
+            params,
+        ).fetchall()
+        for r in rows:
+            asin = (r[0] or "").strip()
+            sid = int(r[1]) if r[1] is not None else None
+            if not asin or sid is None:
+                continue
+            pid = int(r[2]) if r[2] is not None else None
+            ai_title = (r[3] or "").strip() or None
+            out[(asin, sid)] = (pid, ai_title)
+    return out
+
+
+def _export_rows_to_csv(rows: list, online_engine, output_path: str) -> int:
+    """将查询结果写入 CSV，并补充 amazon_listing.pid / ai_title。"""
+    if not rows:
+        return 0
+    dict_rows = [_row_to_dict(r, with_store_id=True) for r in rows]
+    asin_store_pairs = sorted(
+        {
+            (str(item.get("child_asin") or "").strip(), int(item.get("store_id")))
+            for item in dict_rows
+            if item.get("child_asin") and item.get("store_id") is not None
+        }
+    )
+    with online_engine.connect() as conn:
+        pid_title_map = _fetch_listing_pid_title_map(conn, asin_store_pairs)
+
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "store_id",
+        "pid",
+        "ai_title",
+        "parent_asin",
+        "child_asin",
+        "week_no",
+        "parent_order_total",
+        "order_num",
+        "order_id",
+        "child_impression_count",
+        "child_session_count",
+        "search_query",
+        "search_query_volume",
+        "search_query_impression_count",
+        "search_query_purchase_count",
+        "search_query_total_impression",
+        "search_query_click_count",
+        "search_query_total_click",
+    ]
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for d in dict_rows:
+            key = (str(d.get("child_asin") or "").strip(), int(d.get("store_id"))) if d.get("child_asin") and d.get("store_id") is not None else None
+            pid, ai_title = pid_title_map.get(key, (None, None)) if key else (None, None)
+            writer.writerow(
+                {
+                    "store_id": d.get("store_id"),
+                    "pid": pid,
+                    "ai_title": ai_title,
+                    "parent_asin": d.get("parent_asin"),
+                    "child_asin": d.get("child_asin"),
+                    "week_no": d.get("week_no"),
+                    "parent_order_total": d.get("parent_order_total"),
+                    "order_num": d.get("order_num"),
+                    "order_id": d.get("order_id"),
+                    "child_impression_count": d.get("child_impression_count"),
+                    "child_session_count": d.get("child_session_count"),
+                    "search_query": d.get("search_query"),
+                    "search_query_volume": d.get("search_query_volume"),
+                    "search_query_impression_count": d.get("search_query_impression_count"),
+                    "search_query_purchase_count": d.get("search_query_purchase_count"),
+                    "search_query_total_impression": d.get("search_query_total_impression"),
+                    "search_query_click_count": d.get("search_query_click_count"),
+                    "search_query_total_click": d.get("search_query_total_click"),
+                }
+            )
+    return len(dict_rows)
 
 
 def _step3_backfill_search_query(
@@ -1158,8 +1259,6 @@ def sync_from_online_db() -> dict:
     if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
         raise ValueError("Online DB config missing: set online_db_host, online_db_user, online_db_pwd, online_db_name in .env")
 
-    init_db()
-
     # date_start_str, date_end_str = _get_sync_date_range()
     date_start_str, date_end_str = "2026-02-15", "2026-02-22"
     logger.info("Sync date range: date_start=%s, date_end=%s", date_start_str, date_end_str)
@@ -1171,13 +1270,10 @@ def sync_from_online_db() -> dict:
     target_week_no = _date_to_week_no(reference_date)
     logger.info("week_no reference date (date_end-1): %s -> week_no=%s", reference_date_str, target_week_no[0])
 
-    table_name = settings.MYSQL_DB_NAME
+    init_db()
     online_engine = get_online_engine()
-    local_db: Session = SessionLocal()
     params = {"date_start": date_start_str, "date_end": date_end_str, "reference_date": reference_date_str}
     total_fetched = 0
-    total_inserted = 0
-    total_updated = 0
     period_order_rows = None
     period_distinct_triples = None
     n_core = 0
@@ -1185,6 +1281,7 @@ def sync_from_online_db() -> dict:
     parent_asins = []
     step2_per_parent_qualified = {}
 
+    all_rows_for_csv = []
     try:
         
         with online_engine.connect() as conn:
@@ -1271,22 +1368,7 @@ def sync_from_online_db() -> dict:
         n1 = len(rows1)
         total_fetched += n1
         logger.info("Step 1 total rows with metrics: %s", n1)
-        if rows1:
-            progress_interval = max(1, n1 // 10)
-            ins1, upd1 = _run_with_deadlock_retry(
-                local_db,
-                "Step 1 upsert",
-                lambda: _upsert_batch(local_db, rows1, "step1", progress_interval),
-            )
-            total_inserted += ins1
-            total_updated += upd1
-            local_db.flush()
-            groups_updated = _run_with_deadlock_retry(
-                local_db,
-                "Step 1 recompute parent_order_total",
-                lambda: _recompute_parent_order_totals(local_db),
-            )
-            logger.info("Recomputed parent_order_total for %s (parent_asin, week_no, store_id) groups", groups_updated)
+        all_rows_for_csv.extend(rows1)
         if excluded_count > 0:
             fallback_core_rows = _step1_fallback_recover(
                 online_engine, params, included_pairs, reference_date_str
@@ -1297,54 +1379,38 @@ def sync_from_online_db() -> dict:
                         conn, fallback_core_rows, set(), batch_size=200
                     )
                 if fallback_rows1:
-                    progress_interval_fb = max(1, len(fallback_rows1) // 5)
-                    ins_fb, upd_fb = _run_with_deadlock_retry(
-                        local_db,
-                        "Step1 fallback upsert",
-                        lambda: _upsert_batch(
-                            local_db, fallback_rows1, "step1_fallback", progress_interval_fb
-                        ),
-                    )
-                    total_inserted += ins_fb
-                    total_updated += upd_fb
-                    local_db.flush()
-                    groups_updated_fb = _run_with_deadlock_retry(
-                        local_db,
-                        "Step1 fallback recompute parent_order_total",
-                        lambda: _recompute_parent_order_totals(local_db),
-                    )
-                    logger.info(
-                        "Step1 fallback: inserted=%s, updated=%s; recomputed %s groups",
-                        ins_fb, upd_fb, groups_updated_fb,
-                    )
-        local_db.commit()
+                    all_rows_for_csv.extend(fallback_rows1)
 
         # 第二步：复用同一 online_engine，从本地 asin_performances 读 parent_asin，按父 ASIN 分批在 online 查子 ASIN
         step2_error = None
         rows2 = []
         try:
             target_weeks = [target_week_no]
-            # 本地：有订单的 (parent_asin, week_no, store_id) -> parent_order_total
-            local_rows = (
-                local_db.query(
-                    AsinPerformance.parent_asin,
-                    AsinPerformance.week_no,
-                    AsinPerformance.store_id,
-                    AsinPerformance.parent_order_total,
+            # 由 Step1 结果构造 parent_lookup 与 ordered_set（无本地写表依赖）
+            local_rows = [
+                (
+                    r[2],  # parent_asin
+                    int(r[7]) if r[7] is not None else None,  # week_no
+                    int(r[1]) if r[1] is not None else None,  # store_id
+                    r[4],  # parent_order_total
                 )
-                .filter(
-                    AsinPerformance.parent_asin.isnot(None),
-                    AsinPerformance.parent_asin != "",
-                    AsinPerformance.parent_order_total > 0,
-                )
-                .distinct()
-                .all()
-            )
+                for r in rows1
+                if r[2] is not None and r[7] is not None and r[1] is not None and r[4] is not None
+            ]
             parent_lookup = {}
             parent_asins_set = set()
             for r in local_rows:
                 parent_lookup[(r[0], r[1], r[2])] = r[3]
                 parent_asins_set.add(r[0])
+            ordered_set = {
+                (
+                    str(r[0]).strip() if r[0] is not None else None,
+                    int(r[1]) if r[1] is not None else None,
+                    int(r[7]) if r[7] is not None else None,
+                )
+                for r in rows1
+                if r[0] is not None and r[1] is not None and r[7] is not None
+            }
             parent_asins = list(parent_asins_set)
             step2_per_parent_qualified = {}
             logger.info("Step 2: %s parent ASINs from local table, fetching other children from online by parent...", len(parent_asins))
@@ -1353,12 +1419,12 @@ def sync_from_online_db() -> dict:
                 batch = parent_asins[i : i + parent_batch_size]
                 with online_engine.connect() as conn:
                     chunk, per_parent = _step2_fetch_for_parents(
-                        local_db,
                         conn,
                         batch,
                         parent_lookup,
                         target_weeks,
-                        store_ids=(1, 7),
+                        ordered_set=ordered_set,
+                        store_ids=(3,),
                         batch_size=200,
                     )
                 rows2.extend(chunk)
@@ -1368,74 +1434,37 @@ def sync_from_online_db() -> dict:
             n2 = len(rows2)
             total_fetched += n2
             logger.info("Step 2 fetched %s rows total", n2)
-            if rows2:
-                progress_interval = max(1, n2 // 10)
-                ins2, upd2 = _run_with_deadlock_retry(
-                    local_db,
-                    "Step 2 upsert",
-                    lambda: _upsert_batch(local_db, rows2, "step2", progress_interval),
-                )
-                total_inserted += ins2
-                total_updated += upd2
-                local_db.flush()
-                groups_updated = _run_with_deadlock_retry(
-                    local_db,
-                    "Step 2 recompute parent_order_total",
-                    lambda: _recompute_parent_order_totals(local_db),
-                )
-                logger.info("After Step 2: recomputed parent_order_total for %s groups", groups_updated)
+            all_rows_for_csv.extend(rows2)
         except pymysql.err.OperationalError as e:
             step2_error = str(e)
             logger.warning("Step 2 failed: %s; 仅保留 Step 1 数据。", step2_error)
         except Exception as e:
             step2_error = str(e)
             logger.warning("Step 2 failed: %s; 仅保留 Step 1 数据。", step2_error)
-        local_db.commit()
-
-        # 第三步：对表中 search_query 为空的记录，从线上 amazon_search_data 回填
-        try:
-            ins3, upd3, backfill_count = _run_with_deadlock_retry(
-                local_db,
-                "Step 3 backfill upsert",
-                lambda: _step3_backfill_search_query(
-                    local_db,
-                    online_engine,
-                    batch_size=200,
-                    week_nos=[int(target_week_no)],
-                ),
-            )
-            if backfill_count > 0:
-                total_inserted += ins3
-                total_updated += upd3
-                local_db.commit()
-                logger.info("Step 3 backfill: %s rows from amazon_search_data, inserted=%s, updated=%s", backfill_count, ins3, upd3)
-        except Exception as e:
-            logger.warning("Step 3 backfill failed: %s", e)
-
-        local_count = local_db.query(AsinPerformance).count()
-        insert_ok = (total_inserted + total_updated) == total_fetched
+        out_dir = Path(__file__).resolve().parents[2] / "export"
+        csv_path = out_dir / f"online_sync2_export_{reference_date_str}_{int(time.time())}.csv"
+        exported_rows = _export_rows_to_csv(all_rows_for_csv, online_engine, str(csv_path))
+        logger.info("CSV export done: path=%s rows=%s", csv_path, exported_rows)
 
         # 执行摘要写入 log：周期、订单数、父 asin 数、insert/update、Step2 每父符合要求的子 asin 数
         logger.info(
-            "Sync summary: period=%s~%s | order_item_rows(1,7)=%s | core_sum(order_num)=%s | Step1_core_rows=%s | parent_asin_count=%s | inserted=%s | updated=%s | table_count=%s",
-            date_start_str, date_end_str, period_order_rows, core_sum_order_num, n_core, len(parent_asins), total_inserted, total_updated, local_count,
+            "Sync summary(CSV): period=%s~%s | order_item_rows(1,7)=%s | core_sum(order_num)=%s | Step1_core_rows=%s | parent_asin_count=%s | fetched=%s | exported=%s | csv=%s",
+            date_start_str, date_end_str, period_order_rows, core_sum_order_num, n_core, len(parent_asins), total_fetched, exported_rows, csv_path,
         )
         for pa in sorted(parent_asins):
             logger.info("Step2 parent %s: qualified child rows=%s", pa, step2_per_parent_qualified.get(pa, 0))
 
-        logger.info("Sync done: fetched=%s, inserted=%s, updated=%s, table_count=%s", total_fetched, total_inserted, total_updated, local_count)
+        logger.info("Sync done(CSV): fetched=%s, exported=%s, csv=%s", total_fetched, exported_rows, csv_path)
 
         return {
             "rows_fetched_from_online": total_fetched,
-            "rows_inserted": total_inserted,
-            "rows_updated": total_updated,
-            "local_table_count_after": local_count,
-            "table_name": table_name,
-            "insert_ok": insert_ok,
+            "rows_exported_to_csv": exported_rows,
+            "csv_path": str(csv_path),
+            "insert_ok": True,
             "step2_error": step2_error,
         }
     finally:
-        local_db.close()
+        pass
 
 
 if __name__ == "__main__":
@@ -1448,8 +1477,8 @@ if __name__ == "__main__":
         out = sync_from_online_db()
         record_sync_run()
         print(f"从 online 共查询: {out['rows_fetched_from_online']} 条", flush=True)
-        print(f"写入表 {out['table_name']}: 插入 {out['rows_inserted']} 条, 更新 {out.get('rows_updated', 0)} 条", flush=True)
-        print(f"同步后本地表行数: {out['local_table_count_after']} 条, insert_ok={out['insert_ok']}", flush=True)
+        print(f"导出 CSV 行数: {out['rows_exported_to_csv']} 条", flush=True)
+        print(f"CSV 文件: {out['csv_path']}", flush=True)
         sys.exit(0 if out["insert_ok"] else 1)
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)

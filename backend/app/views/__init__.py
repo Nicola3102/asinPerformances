@@ -20,6 +20,10 @@ from app.views.asin_schemas import (
     MonitorTrackRow,
     MonitorWeekStatus,
     MonitorTrackResponse,
+    TrendBatchOption,
+    TrendFilterOptions,
+    TrendWeekPoint,
+    TrendResponse,
 )
 
 __all__ = [
@@ -44,4 +48,8 @@ __all__ = [
     "MonitorTrackRow",
     "MonitorWeekStatus",
     "MonitorTrackResponse",
+    "TrendBatchOption",
+    "TrendFilterOptions",
+    "TrendWeekPoint",
+    "TrendResponse",
 ]

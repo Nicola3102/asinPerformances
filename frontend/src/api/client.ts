@@ -36,6 +36,10 @@ export interface SummaryRow {
   week_no: number | null;
   store_id: number | null;
   operation_status?: boolean | null;
+  last_operated_at?: string | null;
+  ad_check?: boolean | null;
+  ad_created_at?: string | null;
+  last_ad_created_at?: string | null;
   operated_at?: string | null;
   checked_status?: string | null;
   checked_at?: string | null;
@@ -49,6 +53,10 @@ export interface SummaryRowConsolidated {
   store_ids: number[];
   child_asins_with_orders: string[];
   operation_status?: boolean | null;
+  last_operated_at?: string | null;
+  ad_check?: boolean | null;
+  ad_created_at?: string | null;
+  last_ad_created_at?: string | null;
   operated_at?: string | null;
   checked_status?: string | null;
   checked_at?: string | null;
@@ -196,6 +204,39 @@ export interface MonitorTrackResponse {
   rows: MonitorTrackRow[];
 }
 
+export interface TrendBatchOption {
+  id: number;
+  label: string;
+}
+
+export interface TrendFilterOptions {
+  store_ids: number[];
+  batch_ids: number[];
+  batch_options: TrendBatchOption[];
+  week_nos: number[];
+  used_models: string[];
+}
+
+export interface TrendWeekPoint {
+  week_no: number;
+  new_asin_count: number;
+  total_impression: number;
+  total_sessions: number;
+  total_clicks: number;
+  total_asin_count: number;
+  active_asin_count: number;
+  impression_asin_count: number;
+  related_click: number;
+  impression_asin_rate: number;
+}
+
+export interface TrendResponse {
+  matched_row_count: number;
+  weeks: number[];
+  filter_options: TrendFilterOptions;
+  series: TrendWeekPoint[];
+}
+
 function parseErrorResponse(text: string, status: number): string {
   try {
     const err = text ? JSON.parse(text) : {}
@@ -321,6 +362,22 @@ export async function operateSummary(parent_asin: string, week_no: number): Prom
   if (!res.ok) {
     const text = await res.text()
     throw new Error(parseErrorResponse(text, res.status) || '操作失败')
+  }
+  return res.json()
+}
+
+export async function adCheckSummary(
+  parent_asin: string,
+  week_no: number
+): Promise<{ updated: number; ad_created_at?: string | null }> {
+  const res = await fetch(`${API_BASE}/asin-performances/ad-check`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ parent_asin, week_no }),
+  })
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(parseErrorResponse(text, res.status) || '广告操作失败')
   }
   return res.json()
 }
@@ -523,6 +580,40 @@ export async function getMonitorTrack(parent_asin: string): Promise<MonitorTrack
   if (!res.ok) {
     const text = await res.text()
     throw new Error(parseErrorResponse(text, res.status) || 'Failed to fetch monitor track')
+  }
+  return res.json()
+}
+
+export async function getTrendData(filters?: {
+  store_id?: number | null
+  used_model?: string | null
+  created_at_start?: string | null
+  created_at_end?: string | null
+  pid_min?: number | null
+  pid_max?: number | null
+  parent_asin?: string | null
+  week_nos?: number[] | null
+  batch_id?: number | null
+}): Promise<TrendResponse> {
+  const params = new URLSearchParams()
+  if (filters?.store_id != null) params.set('store_id', String(filters.store_id))
+  if (filters?.used_model) params.set('used_model', filters.used_model)
+  if (filters?.created_at_start) params.set('created_at_start', filters.created_at_start)
+  if (filters?.created_at_end) params.set('created_at_end', filters.created_at_end)
+  if (filters?.pid_min != null) params.set('pid_min', String(filters.pid_min))
+  if (filters?.pid_max != null) params.set('pid_max', String(filters.pid_max))
+  if (filters?.parent_asin) params.set('parent_asin', filters.parent_asin)
+  if (filters?.week_nos?.length) {
+    for (const w of filters.week_nos) {
+      params.append('week_no', String(w))
+    }
+  }
+  if (filters?.batch_id != null) params.set('batch_id', String(filters.batch_id))
+  const query = params.toString()
+  const res = await fetch(`${API_BASE}/trend${query ? `?${query}` : ''}`)
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(parseErrorResponse(text, res.status) || 'Failed to fetch trend data')
   }
   return res.json()
 }

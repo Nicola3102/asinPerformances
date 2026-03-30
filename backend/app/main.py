@@ -12,7 +12,9 @@ from fastapi.responses import JSONResponse
 from app.config import settings
 from app.online_engine import dispose_online_engine
 from app.controllers import asin_router
+from app.controllers.asin_controller import get_trend_data
 from app.controllers.sync_controller import router as sync_router
+from app.views.asin_schemas import TrendResponse
 from app.database import init_db
 from app.logging_config import setup_logging
 from app.services.online_sync import sync_from_online_db
@@ -260,6 +262,12 @@ app.add_middleware(
 )
 app.include_router(asin_router)
 app.include_router(sync_router)
+app.add_api_route(
+    "/api/trend",
+    get_trend_data,
+    methods=["GET"],
+    response_model=TrendResponse,
+)
 
 
 @app.get("/health")

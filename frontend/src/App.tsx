@@ -7,6 +7,7 @@ import {
   getTableStats,
   downloadWeekData,
   operateSummary,
+  adCheckSummary,
   refreshQueryStatus,
   syncFromOnline,
   getGroupFData,
@@ -19,6 +20,7 @@ import {
   downloadGroupAData,
   getMonitorParents,
   getMonitorTrack,
+  getTrendData,
   type SummaryRowConsolidated,
   type DetailResponse,
   type DetailChildRow,
@@ -32,6 +34,8 @@ import {
   type GroupADetailChildRow,
   type MonitorParentItem,
   type MonitorTrackResponse,
+  type TrendResponse,
+  type TrendWeekPoint,
 } from './api/client'
 import './App.css'
 
@@ -56,6 +60,68 @@ function formatCreatedAt(v: string | null | undefined): string {
 function formatNum(v: number | null | undefined): string {
   if (v == null) return '–'
   return String(v)
+}
+
+function formatDecimal(v: number | null | undefined, fractionDigits = 2): string {
+  if (v == null || Number.isNaN(v)) return '–'
+  return v.toLocaleString('zh-CN', {
+    minimumFractionDigits: fractionDigits,
+    maximumFractionDigits: fractionDigits,
+  })
+}
+
+function parseOptionalInt(v: string): number | null {
+  const raw = v.trim()
+  if (!raw) return null
+  const parsed = Number.parseInt(raw, 10)
+  return Number.isNaN(parsed) ? null : parsed
+}
+
+/** 与 backend `_listing_tracking_week_no` 一致：周日至周六为一周，week_no = 该周周六所在 ISO 年周（YYYYWW）。 */
+function listingTrackingWeekNo(d: Date): number {
+  const pyWd = d.getDay() === 0 ? 6 : d.getDay() - 1
+  const daysSinceSunday = (pyWd + 1) % 7
+  const ws = new Date(d.getFullYear(), d.getMonth(), d.getDate() - daysSinceSunday)
+  const we = new Date(ws.getFullYear(), ws.getMonth(), ws.getDate() + 6)
+  const { isoYear, isoWeek } = isoYearWeekForDate(we)
+  return isoYear * 100 + isoWeek
+}
+
+/** Python `datetime.isocalendar()` 等价（本地日历日）。 */
+function isoYearWeekForDate(d: Date): { isoYear: number; isoWeek: number } {
+  const thursday = new Date(d.getFullYear(), d.getMonth(), d.getDate())
+  const day = thursday.getDay() || 7
+  thursday.setDate(thursday.getDate() + 4 - day)
+  const isoYear = thursday.getFullYear()
+  const jan4 = new Date(isoYear, 0, 4)
+  const jd = jan4.getDay() || 7
+  jan4.setDate(jan4.getDate() + 4 - jd)
+  const isoWeek = 1 + Math.round((thursday.getTime() - jan4.getTime()) / 604800000)
+  return { isoYear, isoWeek }
+}
+
+const TREND_WEEK_NO_MIN = 202515
+
+/** 自 minWeekNo 起至 endDate 当周止的所有 week_no（与 listing_tracking 规则一致）。 */
+function buildListingTrackingWeekRange(minWeekNo: number, endDate: Date): number[] {
+  const endWn = listingTrackingWeekNo(endDate)
+  const minYear = Math.floor(minWeekNo / 100)
+  const d = new Date(minYear, 0, 1)
+  while (listingTrackingWeekNo(d) < minWeekNo) {
+    d.setDate(d.getDate() + 1)
+  }
+  const out: number[] = []
+  let prev = -1
+  while (true) {
+    const wn = listingTrackingWeekNo(d)
+    if (wn > endWn) break
+    if (wn !== prev) {
+      out.push(wn)
+      prev = wn
+    }
+    d.setDate(d.getDate() + 7)
+  }
+  return out
 }
 
 function escapeCsvCell(val: string | number): string {
@@ -377,6 +443,7 @@ function AsinHomePage() {
   const [syncing, setSyncing] = useState(false)
   const [downloading, setDownloading] = useState(false)
   const [operatingKey, setOperatingKey] = useState<string | null>(null)
+  const [adCheckingKey, setAdCheckingKey] = useState<string | null>(null)
   const [refreshingQueryStatus, setRefreshingQueryStatus] = useState(false)
   const queryRefreshInFlightRef = useRef(false)
   const [error, setError] = useState<string | null>(null)
@@ -518,6 +585,24 @@ function AsinHomePage() {
       setError(e instanceof Error ? e.message : '操作失败')
     } finally {
       setOperatingKey(null)
+    }
+  }
+
+  const handleAdCheck = async (parent_asin: string | null, week_no: number | null) => {
+    if (parent_asin == null || week_no == null) return
+    const key = `${parent_asin}-${week_no}`
+    setAdCheckingKey(key)
+    setError(null)
+    try {
+      const res = await adCheckSummary(parent_asin, week_no)
+      if (!res.updated || res.updated <= 0) {
+        setError(`未匹配到可更新广告记录（parent_asin=${parent_asin}, week_no=${week_no}）`)
+      }
+      await loadSummary(selectedWeek)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '广告操作失败')
+    } finally {
+      setAdCheckingKey(null)
     }
   }
 
@@ -688,6 +773,7 @@ function AsinHomePage() {
                 <th>Parent Order Total</th>
                 <th>store_id</th>
                 <th>operation_status</th>
+                <th>ad_check</th>
                 <th>checked_status</th>
                 <th></th>
               </tr>
@@ -695,9 +781,19 @@ function AsinHomePage() {
             <tbody>
               {summary.map((row, i) => {
                 const opDone = row.operation_status === true || (row.operated_at != null && row.operated_at !== '')
+                const adDone = row.ad_check === true || (row.ad_created_at != null && row.ad_created_at !== '')
+                const hadOperationHistory = !opDone && !!row.last_operated_at
+                const hadAdHistory = !adDone && !!row.last_ad_created_at
                 const opKey = `${row.parent_asin}-${row.week_no}`
                 const isOperating = operatingKey === opKey
+                const isAdChecking = adCheckingKey === opKey
                 const storeIdsStr = (row.store_ids ?? []).length > 0 ? (row.store_ids as number[]).join(', ') : '–'
+                const opTooltip = opDone
+                  ? (row.operated_at ? `已操作于 ${formatCreatedAt(row.operated_at)}` : '已操作')
+                  : (row.last_operated_at ? `最近一次操作时间：${formatCreatedAt(row.last_operated_at)}` : '点击将该父 ASIN 在本周下的记录标记为已操作')
+                const adTooltip = adDone
+                  ? (row.ad_created_at ? `已开广告于 ${formatCreatedAt(row.ad_created_at)}` : '已开广告')
+                  : (row.last_ad_created_at ? `最近一次开广告时间：${formatCreatedAt(row.last_ad_created_at)}` : '点击标记该父 ASIN 本周已开广告')
                 return (
                   <tr key={`${row.parent_asin}-${row.week_no}-${i}`}>
                     <td>
@@ -717,9 +813,20 @@ function AsinHomePage() {
                         className={opDone ? 'operate-btn operate-btn--done' : 'operate-btn'}
                         onClick={() => { void handleOperate(row.parent_asin, row.week_no) }}
                         disabled={isOperating}
-                        title={opDone ? (row.operated_at ? `已操作于 ${String(row.operated_at).slice(0, 19)}` : '已操作') : '点击将该父 ASIN 在本周下的记录标记为已操作'}
+                        title={opTooltip}
                       >
-                        {isOperating ? '处理中...' : (opDone ? '已操作' : '操作')}
+                        {isOperating ? '处理中...' : (opDone ? '已操作' : (hadOperationHistory ? '操作*' : '操作'))}
+                      </button>
+                    </td>
+                    <td>
+                      <button
+                        type="button"
+                        className={adDone ? 'ad-check-btn ad-check-btn--done' : 'ad-check-btn'}
+                        onClick={() => { void handleAdCheck(row.parent_asin, row.week_no) }}
+                        disabled={isAdChecking}
+                        title={adTooltip}
+                      >
+                        {isAdChecking ? '处理中...' : (adDone ? '已开广告' : (hadAdHistory ? '开广告*' : '开广告'))}
                       </button>
                     </td>
                     <td>
@@ -1768,6 +1875,874 @@ function GroupAPage() {
   )
 }
 
+type TrendFilterState = {
+  store_id: string
+  used_model: string
+  created_at_start: string
+  created_at_end: string
+  pid_min: string
+  pid_max: string
+  parent_asin: string
+  selected_week_nos: number[]
+  batch_id: string
+}
+
+const EMPTY_TREND_FILTERS: TrendFilterState = {
+  store_id: '',
+  used_model: '',
+  created_at_start: '',
+  created_at_end: '',
+  pid_min: '',
+  pid_max: '',
+  parent_asin: '',
+  selected_week_nos: [],
+  batch_id: '',
+}
+
+type TrendLineDef = {
+  key: keyof TrendWeekPoint
+  label: string
+  color: string
+  formatter?: (value: number) => string
+}
+
+function TrendBarOverviewCard({ data }: { data: TrendWeekPoint[] }) {
+  const [hoveredWeek, setHoveredWeek] = useState<null | {
+    x: number
+    y: number
+    week_no: number
+    new_asin_count: number
+    active_asin_count: number
+    total_impression: number
+  }>(null)
+
+  if (data.length === 0) {
+    return (
+      <div className="trend-chart-card trend-bar-card">
+        <div className="trend-chart-header">
+          <div>
+            <h3>Weekly Batch Overview</h3>
+          </div>
+        </div>
+        <p className="empty-hint">暂无数据</p>
+      </div>
+    )
+  }
+
+  const width = 1540
+  const height = 380
+  const padLeft = 72
+  const padRight = 72
+  const padTop = 26
+  const padBottom = 74
+  const chartWidth = width - padLeft - padRight
+  const chartHeight = height - padTop - padBottom
+  const groupWidth = chartWidth / Math.max(data.length, 1)
+  const barWidth = Math.max(6, Math.min(18, groupWidth / 5))
+  const newCountMax = Math.max(...data.map((item) => item.new_asin_count), 1)
+  const activeCountMax = Math.max(...data.map((item) => item.active_asin_count), 1)
+  const impressionMax = Math.max(...data.map((item) => item.total_impression), 1)
+  const activeCountTicks = Array.from({ length: 5 }, (_, idx) => (activeCountMax * idx) / 4)
+  const impressionTicks = Array.from({ length: 5 }, (_, idx) => (impressionMax * idx) / 4)
+  const getXCenter = (index: number) => padLeft + groupWidth * index + groupWidth / 2
+  const getNewCountY = (value: number) => padTop + chartHeight - (value / newCountMax) * chartHeight
+  const getActiveCountY = (value: number) => padTop + chartHeight - (value / activeCountMax) * chartHeight
+  const getImpressionY = (value: number) => padTop + chartHeight - (value / impressionMax) * chartHeight
+  const getBarHeight = (y: number, value: number) => {
+    const rawHeight = height - padBottom - y
+    if (value <= 0) return 0
+    return Math.max(4, rawHeight)
+  }
+
+  return (
+    <div className="trend-chart-card trend-bar-card">
+      <div className="trend-chart-header">
+        <div>
+          <h3>Weekly Batch Overview</h3>
+          <p className="trend-chart-hint">默认展示所有 batch，筛选后自动联动</p>
+        </div>
+      </div>
+      <div className="trend-chart-legend">
+        <span className="trend-legend-item">
+          <span className="trend-legend-swatch" style={{ backgroundColor: '#2563eb' }} />
+          New ASIN Count
+        </span>
+        <span className="trend-legend-item">
+          <span className="trend-legend-swatch" style={{ backgroundColor: '#16a34a' }} />
+          Active ASIN Count
+        </span>
+        <span className="trend-legend-item">
+          <span className="trend-legend-swatch" style={{ backgroundColor: '#f59e0b' }} />
+          Total Impression
+        </span>
+      </div>
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        className="trend-chart-svg"
+        role="img"
+        aria-label="Weekly Batch Overview"
+        onMouseLeave={() => setHoveredWeek(null)}
+      >
+        {activeCountTicks.map((tick, idx) => {
+          const y = getActiveCountY(tick)
+          return (
+            <g key={`count-tick-${idx}`}>
+              <line x1={padLeft} y1={y} x2={width - padRight} y2={y} className="trend-grid-line" />
+              <text x={padLeft - 8} y={y + 4} textAnchor="end" className="trend-axis-text">
+                {Math.round(tick).toLocaleString('zh-CN')}
+              </text>
+              <text x={width - padRight + 8} y={y + 4} textAnchor="start" className="trend-axis-text">
+                {Math.round(impressionTicks[idx] ?? 0).toLocaleString('zh-CN')}
+              </text>
+            </g>
+          )
+        })}
+        <line x1={padLeft} y1={padTop} x2={padLeft} y2={height - padBottom} className="trend-axis-line" />
+        <line x1={width - padRight} y1={padTop} x2={width - padRight} y2={height - padBottom} className="trend-axis-line" />
+        <line x1={padLeft} y1={height - padBottom} x2={width - padRight} y2={height - padBottom} className="trend-axis-line" />
+        {data.map((item, index) => {
+          const centerX = getXCenter(index)
+          const bars = [
+            { color: '#2563eb', value: item.new_asin_count, y: getNewCountY(item.new_asin_count), offset: -barWidth * 1.2 },
+            { color: '#16a34a', value: item.active_asin_count, y: getActiveCountY(item.active_asin_count), offset: 0 },
+            { color: '#f59e0b', value: item.total_impression, y: getImpressionY(item.total_impression), offset: barWidth * 1.2 },
+          ]
+          return (
+            <g
+              key={`bar-week-${item.week_no}`}
+              onMouseEnter={() => setHoveredWeek({
+                x: centerX,
+                y: Math.min(...bars.map((bar) => bar.y)),
+                week_no: item.week_no,
+                new_asin_count: item.new_asin_count,
+                active_asin_count: item.active_asin_count,
+                total_impression: item.total_impression,
+              })}
+            >
+              {bars.map((bar, barIdx) => (
+                <rect
+                  key={`bar-${item.week_no}-${barIdx}`}
+                  x={centerX + bar.offset - barWidth / 2}
+                  y={bar.value > 0 ? Math.min(bar.y, height - padBottom - 4) : bar.y}
+                  width={barWidth}
+                  height={getBarHeight(bar.y, bar.value)}
+                  rx="3"
+                  fill={bar.color}
+                  className="trend-bar-rect"
+                />
+              ))}
+              <g transform={`translate(${centerX - 10}, ${height - 16}) rotate(45)`}>
+                <text x="0" y="0" textAnchor="start" className="trend-axis-text trend-axis-text--bold">
+                  {item.week_no}
+                </text>
+              </g>
+            </g>
+          )
+        })}
+        {hoveredWeek && (
+          <g transform={`translate(${Math.min(width - 220, hoveredWeek.x + 14)}, ${Math.max(18, hoveredWeek.y - 94)})`}>
+            <rect width="200" height="82" rx="8" ry="8" className="trend-tooltip-box" />
+            <text x="10" y="18" className="trend-tooltip-title">{`${hoveredWeek.week_no}`}</text>
+            <text x="10" y="36" className="trend-tooltip-text">{`new asin: ${hoveredWeek.new_asin_count.toLocaleString('zh-CN')}`}</text>
+            <text x="10" y="52" className="trend-tooltip-text">{`active asin: ${hoveredWeek.active_asin_count.toLocaleString('zh-CN')}`}</text>
+            <text x="10" y="68" className="trend-tooltip-text">{`impression: ${hoveredWeek.total_impression.toLocaleString('zh-CN')}`}</text>
+          </g>
+        )}
+      </svg>
+    </div>
+  )
+}
+
+function TrendChartFigure({
+  title,
+  data,
+  lines,
+  expanded = false,
+}: {
+  title: string
+  data: TrendWeekPoint[]
+  lines: TrendLineDef[]
+  expanded?: boolean
+}) {
+  const showRelatedClickFormula =
+    lines.some((l) => l.key === 'related_click') && lines.some((l) => l.key === 'total_clicks')
+
+  const numericData = data
+    .map((item) => ({
+      week_no: item.week_no,
+      total_asin_count: item.total_asin_count,
+      active_asin_count: item.active_asin_count,
+      values: lines.map((line) => {
+        const raw = item[line.key]
+        return typeof raw === 'number' ? Number(raw) : 0
+      }),
+    }))
+    .filter((item) => item.values.every((value) => Number.isFinite(value)))
+
+  if (numericData.length === 0) {
+    return <p className="empty-hint">暂无数据</p>
+  }
+  const showImpressionAsinCount = lines.some((line) => line.key === 'total_impression')
+
+  const [hoveredPoint, setHoveredPoint] = useState<null | {
+    x: number
+    y: number
+    week_no: number
+    label: string
+    value: number
+    color: string
+    formatter: (value: number) => string
+    total_asin_count: number
+    active_asin_count: number
+    impression_asin_count: number
+  }>(null)
+
+  const width = expanded ? 1040 : 760
+  const height = expanded ? 520 : 360
+  const padLeft = 64
+  const padRight = 24
+  const padTop = 24
+  const padBottom = 64
+  const chartWidth = width - padLeft - padRight
+  const chartHeight = height - padTop - padBottom
+  const allValues = numericData.flatMap((item) => item.values)
+  let minValue = Math.min(...allValues, 0)
+  let maxValue = Math.max(...allValues, 0)
+  if (minValue === maxValue) {
+    const delta = Math.max(1, Math.abs(maxValue || 1) * 0.1)
+    minValue -= delta
+    maxValue += delta
+  }
+
+  const getX = (index: number) => (
+    padLeft + (numericData.length <= 1 ? chartWidth / 2 : (index * chartWidth) / (numericData.length - 1))
+  )
+  const getY = (value: number) => padTop + ((maxValue - value) / (maxValue - minValue)) * chartHeight
+  const yTicks = Array.from({ length: 5 }, (_, idx) => minValue + ((maxValue - minValue) * idx) / 4)
+
+  return (
+    <>
+      {showRelatedClickFormula && (
+        <p className="trend-chart-formula">related click = sessions - total clicks</p>
+      )}
+      <div className="trend-chart-legend">
+        {lines.map((line) => {
+          const latest = numericData[numericData.length - 1]?.values[lines.indexOf(line)] ?? 0
+          const formatter = line.formatter ?? ((value: number) => value.toLocaleString('zh-CN'))
+          return (
+            <span key={`${title}-${String(line.key)}`} className="trend-legend-item">
+              <span className="trend-legend-swatch" style={{ backgroundColor: line.color }} />
+              {`${line.label}: ${formatter(latest)}`}
+            </span>
+          )
+        })}
+      </div>
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        className="trend-chart-svg"
+        role="img"
+        aria-label={title}
+        onMouseLeave={() => setHoveredPoint(null)}
+      >
+        {yTicks.map((tick, idx) => {
+          const y = getY(tick)
+          return (
+            <g key={`${title}-tick-${idx}`}>
+              <line x1={padLeft} y1={y} x2={width - padRight} y2={y} className="trend-grid-line" />
+              <text x={padLeft - 8} y={y + 4} textAnchor="end" className="trend-axis-text">
+                {(lines[0]?.formatter ?? ((value: number) => value.toLocaleString('zh-CN')))(tick)}
+              </text>
+            </g>
+          )
+        })}
+        <line x1={padLeft} y1={padTop} x2={padLeft} y2={height - padBottom} className="trend-axis-line" />
+        <line x1={padLeft} y1={height - padBottom} x2={width - padRight} y2={height - padBottom} className="trend-axis-line" />
+        {lines.map((line, lineIdx) => {
+          const points = numericData
+            .map((item, index) => `${getX(index)},${getY(item.values[lineIdx])}`)
+            .join(' ')
+          return (
+            <g key={`${title}-${String(line.key)}`}>
+              <polyline fill="none" stroke={line.color} strokeWidth="3" points={points} />
+              {numericData.map((item, index) => (
+                <circle
+                  key={`${title}-${String(line.key)}-${item.week_no}`}
+                  cx={getX(index)}
+                  cy={getY(item.values[lineIdx])}
+                  r="5"
+                  fill={line.color}
+                  className="trend-point"
+                  onMouseEnter={() => setHoveredPoint({
+                    x: getX(index),
+                    y: getY(item.values[lineIdx]),
+                    week_no: item.week_no,
+                    label: line.label,
+                    value: item.values[lineIdx],
+                    color: line.color,
+                    formatter: line.formatter ?? ((value: number) => value.toLocaleString('zh-CN')),
+                    total_asin_count: item.total_asin_count,
+                    active_asin_count: item.active_asin_count,
+                    impression_asin_count: data[index]?.impression_asin_count ?? 0,
+                  })}
+                />
+              ))}
+            </g>
+          )
+        })}
+        {numericData.map((item, index) => (
+          <g key={`${title}-meta-${item.week_no}`} transform={`translate(${getX(index)}, ${height - 18}) rotate(45)`}>
+            <text x="0" y="0" textAnchor="start" className="trend-axis-text trend-axis-text--bold">
+              {item.week_no}
+            </text>
+          </g>
+        ))}
+        {hoveredPoint && (
+          <g transform={`translate(${Math.min(width - 220, hoveredPoint.x + 14)}, ${Math.max(18, hoveredPoint.y - (showImpressionAsinCount ? 94 : 78))})`}>
+            <rect width="200" height={showImpressionAsinCount ? 82 : 66} rx="8" ry="8" className="trend-tooltip-box" />
+            <text x="10" y="18" className="trend-tooltip-title">{`${hoveredPoint.week_no} | ${hoveredPoint.label}`}</text>
+            <text x="10" y="36" className="trend-tooltip-text">{`value: ${hoveredPoint.formatter(hoveredPoint.value)}`}</text>
+            <text x="10" y="52" className="trend-tooltip-text">{`asin: ${hoveredPoint.total_asin_count} | active: ${hoveredPoint.active_asin_count}`}</text>
+            {showImpressionAsinCount && (
+              <text x="10" y="68" className="trend-tooltip-text">
+                {`impression asin: ${hoveredPoint.impression_asin_count}`}
+              </text>
+            )}
+          </g>
+        )}
+      </svg>
+    </>
+  )
+}
+
+function TrendLineChartCard({
+  title,
+  data,
+  lines,
+  onExpand,
+}: {
+  title: string
+  data: TrendWeekPoint[]
+  lines: TrendLineDef[]
+  onExpand: () => void
+}) {
+  return (
+    <button type="button" className="trend-chart-card trend-chart-button" onClick={onExpand}>
+      <div className="trend-chart-header">
+        <div>
+          <h3>{title}</h3>
+          <p className="trend-chart-hint">点击放大查看</p>
+        </div>
+      </div>
+      <TrendChartFigure title={title} data={data} lines={lines} />
+    </button>
+  )
+}
+
+function TrendPage() {
+  const [filters, setFilters] = useState<TrendFilterState>(EMPTY_TREND_FILTERS)
+  const [appliedFilters, setAppliedFilters] = useState<TrendFilterState>(EMPTY_TREND_FILTERS)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [data, setData] = useState<TrendResponse | null>(null)
+  const [expandedChartKey, setExpandedChartKey] = useState<string | null>(null)
+  const [filtersExpanded, setFiltersExpanded] = useState(false)
+  const [weekNoSearch, setWeekNoSearch] = useState('')
+  const [weekDropdownOpen, setWeekDropdownOpen] = useState(false)
+  const weekMultiselectRef = useRef<HTMLDivElement | null>(null)
+
+  const options = data?.filter_options
+  /** 页面内即时生成 202515 → 本周，不等待接口，避免周次列表加载阻塞 */
+  const syntheticWeekChoices = useMemo(
+    () => buildListingTrackingWeekRange(TREND_WEEK_NO_MIN, new Date()),
+    [],
+  )
+  const weekChoices = useMemo(() => {
+    const set = new Set<number>(syntheticWeekChoices)
+    for (const w of filters.selected_week_nos) {
+      set.add(w)
+    }
+    return Array.from(set).sort((a, b) => a - b)
+  }, [syntheticWeekChoices, filters.selected_week_nos])
+
+  const filteredWeekChoices = useMemo(() => {
+    const q = weekNoSearch.trim().toLowerCase()
+    if (!q) return weekChoices
+    return weekChoices.filter((wn) => String(wn).toLowerCase().includes(q))
+  }, [weekChoices, weekNoSearch])
+
+  const appliedSummaryFull = useMemo(() => {
+    const parts: string[] = []
+    const af = appliedFilters
+    if (af.store_id.trim()) parts.push(`店铺 ${af.store_id}`)
+    if (af.batch_id.trim()) {
+      const bid = af.batch_id.trim()
+      const bo = options?.batch_options?.find((b) => String(b.id) === bid)
+      parts.push(bo?.label ? `批次 ${bo.label}` : `批次 id ${bid}`)
+    }
+    if (af.used_model.trim()) parts.push(`模型 ${af.used_model}`)
+    if (af.created_at_start.trim() || af.created_at_end.trim()) {
+      parts.push(`创建 ${af.created_at_start || '…'} ~ ${af.created_at_end || '…'}`)
+    }
+    if (af.pid_min.trim() || af.pid_max.trim()) {
+      parts.push(`PID ${af.pid_min || '…'}–${af.pid_max || '…'}`)
+    }
+    const asinTokens = af.parent_asin.split(/[\s,;]+/).map((s) => s.trim()).filter(Boolean)
+    if (asinTokens.length) parts.push(`父 ASIN ×${asinTokens.length}`)
+    if (af.selected_week_nos.length) {
+      const w = [...af.selected_week_nos].sort((a, b) => a - b)
+      parts.push(w.length <= 3 ? `周次 ${w.join(', ')}` : `周次 ${w.length} 项`)
+    }
+    return parts.length > 0 ? `已应用 · ${parts.join(' · ')}` : '已应用 · 未限定（全部）'
+  }, [appliedFilters, options?.batch_options])
+
+  const appliedSummaryShort =
+    appliedSummaryFull.length > 96 ? `${appliedSummaryFull.slice(0, 94)}…` : appliedSummaryFull
+
+  useEffect(() => {
+    const request = {
+      store_id: parseOptionalInt(appliedFilters.store_id),
+      used_model: appliedFilters.used_model.trim() || null,
+      created_at_start: appliedFilters.created_at_start.trim() || null,
+      created_at_end: appliedFilters.created_at_end.trim() || null,
+      pid_min: parseOptionalInt(appliedFilters.pid_min),
+      pid_max: parseOptionalInt(appliedFilters.pid_max),
+      parent_asin: appliedFilters.parent_asin.trim() || null,
+      week_nos:
+        appliedFilters.selected_week_nos.length > 0
+          ? [...appliedFilters.selected_week_nos].sort((a, b) => a - b)
+          : null,
+      batch_id: parseOptionalInt(appliedFilters.batch_id),
+    }
+
+    setLoading(true)
+    setError(null)
+    getTrendData(request)
+      .then(setData)
+      .catch((e) => setError(e instanceof Error ? e.message : 'Failed to load trend data'))
+      .finally(() => setLoading(false))
+  }, [appliedFilters])
+
+  useEffect(() => {
+    if (!weekDropdownOpen) return
+    const onDoc = (e: MouseEvent) => {
+      const el = weekMultiselectRef.current
+      if (el && !el.contains(e.target as Node)) {
+        setWeekDropdownOpen(false)
+      }
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setWeekDropdownOpen(false)
+    }
+    document.addEventListener('mousedown', onDoc)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDoc)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [weekDropdownOpen])
+
+  const handleApplyFilters = (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault()
+    const intFields: Array<keyof Pick<TrendFilterState, 'store_id' | 'pid_min' | 'pid_max' | 'batch_id'>> = [
+      'store_id',
+      'pid_min',
+      'pid_max',
+      'batch_id',
+    ]
+    for (const key of intFields) {
+      const raw = filters[key].trim()
+      if (raw && parseOptionalInt(raw) == null) {
+        setFiltersExpanded(true)
+        setError(`${key} 需要填写整数`)
+        return
+      }
+    }
+    const pm = filters.pid_min.trim()
+    const px = filters.pid_max.trim()
+    if (pm && px) {
+      const a = parseOptionalInt(pm)
+      const b = parseOptionalInt(px)
+      if (a != null && b != null && a > b) {
+        setFiltersExpanded(true)
+        setError('pid_min 不能大于 pid_max')
+        return
+      }
+    }
+    if (
+      filters.created_at_start.trim() &&
+      filters.created_at_end.trim() &&
+      filters.created_at_start.trim() > filters.created_at_end.trim()
+    ) {
+      setFiltersExpanded(true)
+      setError('created_at_start 不能晚于 created_at_end')
+      return
+    }
+    setAppliedFilters({
+      ...filters,
+      selected_week_nos: [...filters.selected_week_nos],
+    })
+  }
+
+  const handleResetFilters = () => {
+    setFilters(EMPTY_TREND_FILTERS)
+    setAppliedFilters(EMPTY_TREND_FILTERS)
+    setError(null)
+    setFiltersExpanded(false)
+    setWeekNoSearch('')
+    setWeekDropdownOpen(false)
+  }
+
+  const series = data?.series ?? []
+  const chartConfigs = useMemo<Array<{ key: string; title: string; lines: TrendLineDef[] }>>(
+    () => [
+      {
+        key: 'total_impression',
+        title: 'Total Impression',
+        lines: [{ key: 'total_impression', label: 'Impression', color: '#2563eb' }],
+      },
+      {
+        key: 'total_sessions',
+        title: 'Total Sessions',
+        lines: [{ key: 'total_sessions', label: 'Sessions', color: '#16a34a' }],
+      },
+      {
+        key: 'impression_asin_count',
+        title: 'Impression ASIN Count',
+        lines: [{ key: 'impression_asin_count', label: 'ASIN Count', color: '#7c3aed' }],
+      },
+      {
+        key: 'related_click',
+        title: 'Related Click vs Total Clicks',
+        lines: [
+          { key: 'related_click', label: 'Related Click', color: '#ea580c' },
+          { key: 'total_clicks', label: 'Total Clicks', color: '#0f766e' },
+        ],
+      },
+      {
+        key: 'impression_asin_rate',
+        title: 'Impression ASIN Rate',
+        lines: [
+          {
+            key: 'impression_asin_rate',
+            label: 'Impression / ASIN',
+            color: '#dc2626',
+            formatter: (value: number) => formatDecimal(value, 2),
+          },
+        ],
+      },
+    ],
+    [],
+  )
+  const expandedChart = useMemo(
+    () => chartConfigs.find((item) => item.key === expandedChartKey) ?? null,
+    [chartConfigs, expandedChartKey],
+  )
+
+  return (
+    <div className="app trend-page">
+      <h1>Trending</h1>
+      <p className="monitor-desc">基于 `listing_tracking` 按筛选条件聚合展示周趋势。</p>
+      <form className="trend-filters" onSubmit={handleApplyFilters}>
+        <div className="trend-filter-bar">
+          <div className="trend-filter-bar-top">
+            <div className="trend-filter-quick">
+              <label className="trend-filter-quick-field">
+                <span className="trend-filter-quick-label">store_id</span>
+                <select value={filters.store_id} onChange={(e) => setFilters((prev) => ({ ...prev, store_id: e.target.value }))}>
+                  <option value="">全部</option>
+                  {(options?.store_ids ?? []).map((item) => (
+                    <option key={item} value={String(item)}>{item}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="trend-filter-quick-field">
+                <span className="trend-filter-quick-label">used_model</span>
+                <select value={filters.used_model} onChange={(e) => setFilters((prev) => ({ ...prev, used_model: e.target.value }))}>
+                  <option value="">全部</option>
+                  {(options?.used_models ?? []).map((item) => (
+                    <option key={item} value={item}>{item}</option>
+                  ))}
+                </select>
+              </label>
+              <div
+                className={`trend-filter-quick-field trend-filter-quick-field--week${weekDropdownOpen ? ' is-week-dropdown-open' : ''}`}
+              >
+                <span className="trend-filter-quick-label">week_no（多选）</span>
+                <div className="trend-week-multiselect trend-week-multiselect--in-bar" ref={weekMultiselectRef}>
+                  <button
+                    type="button"
+                    className="trend-week-multiselect-trigger"
+                    aria-expanded={weekDropdownOpen}
+                    aria-haspopup="listbox"
+                    onClick={() => setWeekDropdownOpen((o) => !o)}
+                  >
+                    <span className="trend-week-multiselect-trigger-text">
+                      {filters.selected_week_nos.length === 0
+                        ? `全部周次（${TREND_WEEK_NO_MIN}–${weekChoices[weekChoices.length - 1] ?? '…'}，${weekChoices.length} 个）`
+                        : `已选 ${filters.selected_week_nos.length} / ${weekChoices.length} 周`}
+                    </span>
+                    <span
+                      className={`trend-week-multiselect-chevron ${weekDropdownOpen ? 'is-open' : ''}`}
+                      aria-hidden
+                    >
+                      ▼
+                    </span>
+                  </button>
+                  {filters.selected_week_nos.length > 0 && weekChoices.length > 0 && (
+                    <div className="trend-week-multiselect-chips">
+                      {[...filters.selected_week_nos]
+                        .sort((a, b) => a - b)
+                        .slice(0, 8)
+                        .map((wn) => (
+                          <button
+                            key={wn}
+                            type="button"
+                            className="trend-week-chip"
+                            title="移除此周"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              setFilters((prev) => ({
+                                ...prev,
+                                selected_week_nos: prev.selected_week_nos.filter((x) => x !== wn),
+                              }))
+                            }}
+                          >
+                            <span>{wn}</span>
+                            <span className="trend-week-chip-x" aria-hidden>×</span>
+                          </button>
+                        ))}
+                      {filters.selected_week_nos.length > 8 && (
+                        <span className="trend-week-chip-more">
+                          +{filters.selected_week_nos.length - 8}
+                        </span>
+                      )}
+                    </div>
+                  )}
+                  {weekDropdownOpen && weekChoices.length > 0 && (
+                    <div className="trend-week-multiselect-dropdown" role="listbox" aria-multiselectable>
+                      <div className="trend-week-ms-dropdown-top">
+                        <input
+                          type="search"
+                          className="trend-week-ms-search"
+                          value={weekNoSearch}
+                          onChange={(e) => setWeekNoSearch(e.target.value)}
+                          placeholder="搜索周次…"
+                          aria-label="在列表中筛选周次"
+                          onMouseDown={(e) => e.stopPropagation()}
+                        />
+                        <div className="trend-week-ms-actions">
+                          <button
+                            type="button"
+                            className="trend-week-ms-link"
+                            onClick={() =>
+                              setFilters((prev) => ({
+                                ...prev,
+                                selected_week_nos: [...syntheticWeekChoices],
+                              }))}
+                          >
+                            全选
+                          </button>
+                          <button
+                            type="button"
+                            className="trend-week-ms-link"
+                            onClick={() => setFilters((prev) => ({ ...prev, selected_week_nos: [] }))}
+                          >
+                            清空
+                          </button>
+                        </div>
+                      </div>
+                      <p className="trend-week-ms-count">
+                        共 {weekChoices.length} 周（自 {TREND_WEEK_NO_MIN} 至当前周）
+                        {weekNoSearch.trim() ? ` · 列表中 ${filteredWeekChoices.length} 个` : ''}
+                      </p>
+                      <div className="trend-week-ms-list">
+                        {filteredWeekChoices.length === 0 ? (
+                          <p className="trend-week-ms-empty">无匹配周次</p>
+                        ) : (
+                          filteredWeekChoices.map((wn) => {
+                            const checked = filters.selected_week_nos.includes(wn)
+                            return (
+                              <label
+                                key={wn}
+                                className={`trend-week-ms-option${checked ? ' is-checked' : ''}`}
+                                role="option"
+                                aria-selected={checked}
+                              >
+                                <input
+                                  type="checkbox"
+                                  className="trend-week-ms-checkbox"
+                                  checked={checked}
+                                  onChange={() => {
+                                    setFilters((prev) => ({
+                                      ...prev,
+                                      selected_week_nos: prev.selected_week_nos.includes(wn)
+                                        ? prev.selected_week_nos.filter((x) => x !== wn)
+                                        : [...prev.selected_week_nos, wn].sort((a, b) => a - b),
+                                    }))
+                                  }}
+                                />
+                                <span className="trend-week-ms-label">{wn}</span>
+                              </label>
+                            )
+                          })
+                        )}
+                      </div>
+                      <div className="trend-week-ms-footer">
+                        <button
+                          type="button"
+                          className="trend-week-ms-done"
+                          onClick={() => setWeekDropdownOpen(false)}
+                        >
+                          完成
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+               
+              </div>
+              <label className="trend-filter-quick-field trend-filter-quick-field--batch">
+                <span className="trend-filter-quick-label">batch_id_title</span>
+                <select value={filters.batch_id} onChange={(e) => setFilters((prev) => ({ ...prev, batch_id: e.target.value }))}>
+                  <option value="">全部</option>
+                  {(options?.batch_options ?? []).map((item) => (
+                    <option key={item.id} value={String(item.id)}>{item.label}</option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                className="trend-filter-expand-btn"
+                id="trend-filter-toggle"
+                aria-expanded={filtersExpanded}
+                aria-controls="trend-filter-panel"
+                aria-label={filtersExpanded ? '收起更多筛选条件' : '展开更多筛选条件'}
+                title={filtersExpanded ? '收起更多筛选' : '展开更多筛选'}
+                onClick={() => setFiltersExpanded((v) => !v)}
+              >
+                <span className={`trend-filter-chevron ${filtersExpanded ? 'is-open' : ''}`} aria-hidden>›</span>
+              </button>
+            </div>
+            <div className="trend-filter-bar-actions">
+              <button type="submit" className="trend-filter-bar-btn trend-filter-bar-btn--primary">查询</button>
+              <button type="button" className="trend-filter-bar-btn" onClick={handleResetFilters}>重置</button>
+            </div>
+          </div>
+          <p className="trend-filter-bar-summary" title={appliedSummaryFull}>
+            {appliedSummaryShort}
+          </p>
+        </div>
+
+        <div
+          id="trend-filter-panel"
+          className="trend-filter-details"
+          role="region"
+          aria-labelledby="trend-filter-toggle"
+          hidden={!filtersExpanded}
+        >
+        <div className="trend-filter-grid">
+          <p className="trend-filter-more-hint">更多条件：创建时间、PID 范围、父 ASIN</p>
+          <div className="trend-filter-row">
+            <div className="trend-filter-date-block">
+              <span className="trend-filter-label-text trend-filter-label-text--block">created_at</span>
+              <div className="trend-filter-date-pair">
+                <label className="trend-filter-field trend-filter-field--inline">
+                  <span className="trend-filter-sublabel">起始</span>
+                  <input
+                    type="date"
+                    value={filters.created_at_start}
+                    onChange={(e) => setFilters((prev) => ({ ...prev, created_at_start: e.target.value }))}
+                  />
+                </label>
+                <label className="trend-filter-field trend-filter-field--inline">
+                  <span className="trend-filter-sublabel">结束</span>
+                  <input
+                    type="date"
+                    value={filters.created_at_end}
+                    onChange={(e) => setFilters((prev) => ({ ...prev, created_at_end: e.target.value }))}
+                  />
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <div className="trend-filter-row trend-filter-row--pid-asin">
+            <div className="trend-filter-pid-range trend-filter-field">
+              <span className="trend-filter-label-text trend-filter-pid-range-label">pid 范围</span>
+              <div className="trend-filter-pid-inputs">
+                <label>
+                  <span className="trend-filter-sublabel">起</span>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={filters.pid_min}
+                    onChange={(e) => setFilters((prev) => ({ ...prev, pid_min: e.target.value }))}
+                    placeholder="下限"
+                  />
+                </label>
+                <label>
+                  <span className="trend-filter-sublabel">止</span>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={filters.pid_max}
+                    onChange={(e) => setFilters((prev) => ({ ...prev, pid_max: e.target.value }))}
+                    placeholder="上限"
+                  />
+                </label>
+              </div>
+            </div>
+            <label className="trend-filter-field trend-filter-parent-asin">
+              <span className="trend-filter-label-text">parent_asin</span>
+              <textarea
+                value={filters.parent_asin}
+                onChange={(e) => setFilters((prev) => ({ ...prev, parent_asin: e.target.value }))}
+                placeholder="多个父 ASIN：逗号、分号或换行分隔（精确匹配）"
+                rows={3}
+              />
+            </label>
+          </div>
+        </div>
+        </div>
+      </form>
+      {error && <p className="error">{error}</p>}
+      {loading && <p className="loading-hint">加载趋势数据...</p>}
+      {!loading && !error && data && (
+        <>
+          <p className="empty-hint">
+            匹配记录数：{data.matched_row_count}，周数：{data.weeks.length}
+          </p>
+          {series.length === 0 ? (
+            <p className="empty-hint">当前筛选条件下暂无可展示的趋势数据。</p>
+          ) : (
+            <>
+              <TrendBarOverviewCard data={series} />
+              <div className="trend-chart-grid">
+                {chartConfigs.map((chart) => (
+                  <TrendLineChartCard
+                    key={chart.key}
+                    title={chart.title}
+                    data={series}
+                    lines={chart.lines}
+                    onExpand={() => setExpandedChartKey(chart.key)}
+                  />
+                ))}
+              </div>
+            </>
+          )}
+        </>
+      )}
+      {expandedChart && (
+        <ZoomModal title={expandedChart.title} onClose={() => setExpandedChartKey(null)}>
+          <div className="trend-chart-card trend-chart-card--expanded">
+            <TrendChartFigure title={expandedChart.title} data={series} lines={expandedChart.lines} expanded />
+          </div>
+        </ZoomModal>
+      )}
+    </div>
+  )
+}
+
 function PagePlaceholder({ title }: { title: string }) {
   return (
     <div className="app">
@@ -1816,6 +2791,9 @@ function AppLayout() {
         <NavLink to="/monitor" className={({ isActive }) => `top-nav-link ${isActive ? 'is-active' : ''}`}>
           Monitor
         </NavLink>
+        <NavLink to="/trend" className={({ isActive }) => `top-nav-link ${isActive ? 'is-active' : ''}`}>
+          Trending
+        </NavLink>
       </nav>
       <div className="app-shell-content">
         <Outlet />
@@ -1835,6 +2813,7 @@ export default function App() {
         <Route path="/grpup/A" element={<Navigate to="/group/A" replace />} />
         <Route path="/tasks" element={<PagePlaceholder title="Tasks" />} />
         <Route path="/monitor" element={<MonitorPage />} />
+        <Route path="/trend" element={<TrendPage />} />
       </Route>
     </Routes>
   )

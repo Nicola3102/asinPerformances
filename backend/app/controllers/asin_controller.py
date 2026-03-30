@@ -1,10 +1,11 @@
 import csv
 import logging
+import re
 import threading
 import time
 import uuid
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from io import StringIO
 from decimal import Decimal
 from typing import List, Optional
@@ -13,13 +14,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import func, text, tuple_
+from sqlalchemy import func, literal_column, or_, text, tuple_
 
 from app.online_engine import get_online_engine
 
 from app.config import settings
 from app.database import get_db
-from app.models import AsinPerformance, GroupA
+from app.models import AsinPerformance, GroupA, ListingTracking
 from app.views import (
     AsinPerformanceCreate,
     AsinPerformanceResponse,
@@ -42,6 +43,10 @@ from app.views import (
     MonitorTrackRow,
     MonitorWeekStatus,
     MonitorTrackResponse,
+    TrendBatchOption,
+    TrendFilterOptions,
+    TrendWeekPoint,
+    TrendResponse,
 )
 from app.services.group_f_spark import (
     get_group_f,
@@ -52,7 +57,7 @@ from app.services.group_f_spark import (
 from app.services.groupA_impression import (
     sync_group_a_impression,
     _get_sync_date_range,
-    _date_to_week_no,
+    _date_to_week_no as _group_a_date_to_week_no,
 )
 from app.services.auto_monitor import check_parent_store_week_completed, get_parent_week_status_details
 
@@ -65,6 +70,23 @@ _group_f_slot = {"started_at": None, "request_id": None}
 _group_f_slot_lock = threading.Lock()
 _GROUP_F_STALE_SEC = 25 * 60   # 超过此时长视为过期，允许新请求
 _GROUP_F_STUCK_SEC = 20 * 60   # 超过此时长在 status 中标记为 is_stuck
+
+# Trend: filter options（store/batch/used_model/batch_title）全表 distinct + online title 查询较慢，做短 TTL 缓存
+_trend_filter_cache_lock = threading.Lock()
+_trend_filter_cache: dict = {"ts": 0.0, "value": None}
+_TREND_FILTER_CACHE_TTL_SEC = 300.0
+
+
+def _listing_tracking_week_start(d: date) -> date:
+    days_since_sunday = (d.weekday() + 1) % 7
+    return d - timedelta(days=days_since_sunday)
+
+
+def _listing_tracking_week_no(d: date) -> int:
+    # 与 services/listing_tracking.py 保持一致：周日到周六为一周，week_no 取该周周六所在 ISO 周。
+    week_end = _listing_tracking_week_start(d) + timedelta(days=6)
+    iso_year, iso_week, _ = week_end.isocalendar()
+    return int(f"{iso_year}{iso_week:02d}")
 
 
 def _normalize_group_a_sync_result(result: dict) -> dict:
@@ -255,6 +277,8 @@ def list_summary(
                 func.max(AsinPerformance.parent_order_total).label("parent_order_total"),
                 func.max(AsinPerformance.parent_asin_create_at).label("parent_asin_create_at"),
                 func.max(AsinPerformance.operation_status).label("operation_status"),
+                func.max(AsinPerformance.ad_check).label("ad_check"),
+                func.max(AsinPerformance.ad_created_at).label("ad_created_at"),
                 func.max(AsinPerformance.operated_at).label("operated_at"),
                 func.max(AsinPerformance.checked_status).label("checked_status"),
                 func.max(AsinPerformance.checked_at).label("checked_at"),
@@ -277,12 +301,46 @@ def list_summary(
                 sub.c.week_no,
                 sub.c.store_id,
                 sub.c.operation_status,
+                sub.c.ad_check,
+                sub.c.ad_created_at,
                 sub.c.operated_at,
                 sub.c.checked_status,
                 sub.c.checked_at,
             )
             .all()
         )
+        previous_ad_rows = (
+            db.query(
+                AsinPerformance.parent_asin,
+                func.max(AsinPerformance.ad_created_at).label("last_ad_created_at"),
+            )
+            .filter(
+                AsinPerformance.parent_asin.isnot(None),
+                AsinPerformance.parent_asin != "",
+                AsinPerformance.week_no < selected_week,
+                AsinPerformance.ad_check == True,
+                AsinPerformance.ad_created_at.isnot(None),
+            )
+            .group_by(AsinPerformance.parent_asin)
+            .all()
+        )
+        previous_operated_rows = (
+            db.query(
+                AsinPerformance.parent_asin,
+                func.max(AsinPerformance.operated_at).label("last_operated_at"),
+            )
+            .filter(
+                AsinPerformance.parent_asin.isnot(None),
+                AsinPerformance.parent_asin != "",
+                AsinPerformance.week_no < selected_week,
+                AsinPerformance.operation_status == True,
+                AsinPerformance.operated_at.isnot(None),
+            )
+            .group_by(AsinPerformance.parent_asin)
+            .all()
+        )
+        previous_ad_map = {r[0]: r[1] for r in previous_ad_rows if r[0]}
+        previous_operated_map = {r[0]: r[1] for r in previous_operated_rows if r[0]}
         out = []
         for r in rows:
             week_no = r[3]
@@ -306,6 +364,9 @@ def list_summary(
             op_status = r[5]
             if op_status is not None and not isinstance(op_status, bool):
                 op_status = bool(int(op_status)) if op_status is not None else False
+            ad_check = r[6]
+            if ad_check is not None and not isinstance(ad_check, bool):
+                ad_check = bool(int(ad_check)) if ad_check is not None else False
             out.append(
                 SummaryRow(
                     parent_asin=r[0] if r[0] is not None else None,
@@ -314,9 +375,13 @@ def list_summary(
                     week_no=week_no,
                     store_id=store_id,
                     operation_status=op_status,
-                    operated_at=r[6],
-                    checked_status=r[7],
-                    checked_at=r[8],
+                    last_operated_at=previous_operated_map.get(r[0]),
+                    ad_check=ad_check,
+                    ad_created_at=r[7],
+                    last_ad_created_at=previous_ad_map.get(r[0]),
+                    operated_at=r[8],
+                    checked_status=r[9],
+                    checked_at=r[10],
                 )
             )
         return out
@@ -343,6 +408,8 @@ def list_summary_consolidated(
                 func.max(AsinPerformance.parent_order_total).label("parent_order_total"),
                 func.max(AsinPerformance.parent_asin_create_at).label("parent_asin_create_at"),
                 func.max(AsinPerformance.operation_status).label("operation_status"),
+                func.max(AsinPerformance.ad_check).label("ad_check"),
+                func.max(AsinPerformance.ad_created_at).label("ad_created_at"),
                 func.max(AsinPerformance.operated_at).label("operated_at"),
                 func.max(AsinPerformance.checked_status).label("checked_status"),
                 func.max(AsinPerformance.checked_at).label("checked_at"),
@@ -364,6 +431,8 @@ def list_summary_consolidated(
                 sub.c.week_no,
                 sub.c.store_id,
                 sub.c.operation_status,
+                sub.c.ad_check,
+                sub.c.ad_created_at,
                 sub.c.operated_at,
                 sub.c.checked_status,
                 sub.c.checked_at,
@@ -371,6 +440,38 @@ def list_summary_consolidated(
             .order_by(sub.c.parent_order_total.desc())
             .all()
         )
+        previous_ad_rows = (
+            db.query(
+                AsinPerformance.parent_asin,
+                func.max(AsinPerformance.ad_created_at).label("last_ad_created_at"),
+            )
+            .filter(
+                AsinPerformance.parent_asin.isnot(None),
+                AsinPerformance.parent_asin != "",
+                AsinPerformance.week_no < selected_week,
+                AsinPerformance.ad_check == True,
+                AsinPerformance.ad_created_at.isnot(None),
+            )
+            .group_by(AsinPerformance.parent_asin)
+            .all()
+        )
+        previous_operated_rows = (
+            db.query(
+                AsinPerformance.parent_asin,
+                func.max(AsinPerformance.operated_at).label("last_operated_at"),
+            )
+            .filter(
+                AsinPerformance.parent_asin.isnot(None),
+                AsinPerformance.parent_asin != "",
+                AsinPerformance.week_no < selected_week,
+                AsinPerformance.operation_status == True,
+                AsinPerformance.operated_at.isnot(None),
+            )
+            .group_by(AsinPerformance.parent_asin)
+            .all()
+        )
+        previous_ad_map = {r[0]: r[1] for r in previous_ad_rows if r[0]}
+        previous_operated_map = {r[0]: r[1] for r in previous_operated_rows if r[0]}
         child_rows = (
             db.query(
                 AsinPerformance.parent_asin,
@@ -395,8 +496,8 @@ def list_summary_consolidated(
                 child_by_key[k].append(r[2])
         by_key = {}
         for r in rows:
-            pa, create_at, pot, wn, sid, op_status, op_at, chk_status, chk_at = (
-                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]
+            pa, create_at, pot, wn, sid, op_status, ad_status, ad_at, op_at, chk_status, chk_at = (
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10]
             )
             key = (pa, wn)
             if key not in by_key:
@@ -407,6 +508,7 @@ def list_summary_consolidated(
                     except Exception:
                         pot = None
                 op = op_status if isinstance(op_status, bool) else (bool(int(op_status)) if op_status is not None else False)
+                ad = ad_status if isinstance(ad_status, bool) else (bool(int(ad_status)) if ad_status is not None else False)
                 by_key[key] = {
                     "parent_asin": pa,
                     "parent_asin_create_at": create_at,
@@ -414,6 +516,10 @@ def list_summary_consolidated(
                     "week_no": week_no_int,
                     "store_ids": [int(sid)] if sid is not None else [],
                     "operation_status": op,
+                    "last_operated_at": previous_operated_map.get(pa),
+                    "ad_check": ad,
+                    "ad_created_at": ad_at,
+                    "last_ad_created_at": previous_ad_map.get(pa),
                     "operated_at": op_at,
                     "checked_status": chk_status,
                     "checked_at": chk_at,
@@ -426,6 +532,10 @@ def list_summary_consolidated(
                     g["store_ids"].append(int(sid))
                 if op_status is not None and (isinstance(op_status, bool) and op_status or (not isinstance(op_status, bool) and int(op_status))):
                     g["operation_status"] = True
+                if ad_status is not None and (isinstance(ad_status, bool) and ad_status or (not isinstance(ad_status, bool) and int(ad_status))):
+                    g["ad_check"] = True
+                if ad_at is not None and (g["ad_created_at"] is None or (ad_at > g["ad_created_at"])):
+                    g["ad_created_at"] = ad_at
                 if op_at is not None and (g["operated_at"] is None or (op_at > g["operated_at"])):
                     g["operated_at"] = op_at
                 if chk_status == "completed":
@@ -444,6 +554,10 @@ def list_summary_consolidated(
                     store_ids=g["store_ids"],
                     child_asins_with_orders=g["child_asins_with_orders"],
                     operation_status=g["operation_status"],
+                    last_operated_at=g["last_operated_at"],
+                    ad_check=g["ad_check"],
+                    ad_created_at=g["ad_created_at"],
+                    last_ad_created_at=g["last_ad_created_at"],
                     operated_at=g["operated_at"],
                     checked_status=g["checked_status"] or "pending",
                     checked_at=g["checked_at"],
@@ -457,6 +571,11 @@ def list_summary_consolidated(
 
 
 class OperateBody(BaseModel):
+    parent_asin: str
+    week_no: int | str
+
+
+class AdCheckBody(BaseModel):
     parent_asin: str
     week_no: int | str
 
@@ -492,6 +611,35 @@ def operate_by_parent_week(
     return {"updated": n, "parent_asin": parent_asin, "week_no": week_no, "operated_at": now.isoformat()}
 
 
+@router.post("/ad-check")
+def ad_check_by_parent_week(
+    body: AdCheckBody,
+    db: Session = Depends(get_db),
+):
+    """按 parent_asin 和 week_no 将符合条件的所有记录的 ad_check 置为 True，ad_created_at 置为当前时间。"""
+    parent_asin = (body.parent_asin or "").strip()
+    if parent_asin == "":
+        raise HTTPException(status_code=400, detail="parent_asin 不能为空")
+    week_raw = str(body.week_no).strip().replace(",", "")
+    if not week_raw.isdigit():
+        raise HTTPException(status_code=400, detail="week_no 格式不合法")
+    week_no = int(week_raw)
+    now = datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None)
+    n = (
+        db.query(AsinPerformance)
+        .filter(
+            func.trim(AsinPerformance.parent_asin) == parent_asin,
+            AsinPerformance.week_no == week_no,
+        )
+        .update(
+            {"ad_check": True, "ad_created_at": now},
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    return {"updated": n, "parent_asin": parent_asin, "week_no": week_no, "ad_created_at": now.isoformat()}
+
+
 class RefreshQueryStatusBody(BaseModel):
     week_no: int | str
 
@@ -510,7 +658,7 @@ def trigger_group_a_sync(
             date_start_str, date_end_str = _get_sync_date_range()
             date_end_d = datetime.strptime(date_end_str, "%Y-%m-%d").date()
             reference_date = date_end_d - timedelta(days=1)
-            wk_str, _ = _date_to_week_no(reference_date)
+            wk_str, _ = _group_a_date_to_week_no(reference_date)
             logger.info(
                 "[GroupA] API auto week_no by date_end-1: date_start=%s date_end=%s reference_date=%s -> week_no=%s",
                 date_start_str,
@@ -1339,6 +1487,284 @@ def list_monitor_parents(db: Session = Depends(get_db)):
         .all()
     )
     return [MonitorParentItem(parent_asin=r[0], operated_at=r[1]) for r in rows]
+
+
+def _split_asin_values(raw_value: str | None) -> set[str]:
+    if not raw_value:
+        return set()
+    return {part.strip() for part in str(raw_value).split(",") if part and part.strip()}
+
+
+def _parse_parent_asin_filter_list(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    parts = re.split(r"[\s,;]+", str(raw).strip())
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def _fetch_trend_batch_options(batch_ids: list[int]) -> list[TrendBatchOption]:
+    if not batch_ids:
+        return []
+
+    title_map: dict[int, str] = {}
+    if settings.ONLINE_DB_HOST and settings.ONLINE_DB_USER:
+        try:
+            with get_online_engine().connect() as conn:
+                placeholders = ", ".join([f":b{i}" for i in range(len(batch_ids))])
+                params = {f"b{i}": int(batch_id) for i, batch_id in enumerate(batch_ids)}
+                rows = conn.execute(
+                    text(
+                        f"SELECT id, test_title FROM ai_test_batch "
+                        f"WHERE id IN ({placeholders})"
+                    ),
+                    params,
+                ).fetchall()
+                for row in rows:
+                    try:
+                        batch_id = int(row[0])
+                    except (TypeError, ValueError):
+                        continue
+                    title_map[batch_id] = str(row[1] or "").strip()
+        except Exception as exc:
+            logger.warning("[Trend] failed to load ai_test_batch titles: %s", exc)
+
+    return [
+        TrendBatchOption(
+            id=int(batch_id),
+            label=f"{int(batch_id)}_{title_map.get(int(batch_id), '').strip()}".rstrip("_"),
+        )
+        for batch_id in batch_ids
+    ]
+
+def get_trend_data(
+    store_id: Optional[int] = Query(None, description="店铺 ID"),
+    used_model: Optional[str] = Query(None, description="used_text_model 或 used_image_model"),
+    created_at_start: Optional[str] = Query(None, description="创建开始日期，格式 YYYY-MM-DD"),
+    created_at_end: Optional[str] = Query(None, description="创建结束日期，格式 YYYY-MM-DD"),
+    pid_min: Optional[int] = Query(None, description="PID 范围下限（含）"),
+    pid_max: Optional[int] = Query(None, description="PID 范围上限（含）"),
+    parent_asin: Optional[str] = Query(
+        None, description="父 ASIN，多个用逗号、分号或空白分隔，精确匹配"
+    ),
+    week_no: Optional[List[int]] = Query(None, description="周序号，可重复传参多选"),
+    batch_id: Optional[int] = Query(None, description="批次 ID"),
+    db: Session = Depends(get_db),
+):
+    t0 = time.perf_counter()
+    created_start_day = None
+    created_end_day = None
+    if created_at_start:
+        try:
+            created_start_day = datetime.strptime(created_at_start.strip(), "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"created_at_start 格式错误，需为 YYYY-MM-DD: {exc}") from exc
+    if created_at_end:
+        try:
+            created_end_day = datetime.strptime(created_at_end.strip(), "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"created_at_end 格式错误，需为 YYYY-MM-DD: {exc}") from exc
+    if created_start_day is not None and created_end_day is not None and created_start_day > created_end_day:
+        raise HTTPException(status_code=400, detail="created_at_start 不能晚于 created_at_end")
+    if pid_min is not None and pid_max is not None and int(pid_min) > int(pid_max):
+        raise HTTPException(status_code=400, detail="pid_min 不能大于 pid_max")
+
+    parent_asin_list = _parse_parent_asin_filter_list(parent_asin)
+
+    def _apply_trend_listing_filters(q):
+        if store_id is not None:
+            q = q.filter(ListingTracking.store_id == store_id)
+        if used_model:
+            um = used_model.strip()
+            if um:
+                q = q.filter(
+                    or_(
+                        ListingTracking.used_text_model == um,
+                        ListingTracking.used_image_model == um,
+                    )
+                )
+        if created_start_day is not None:
+            q = q.filter(func.date(ListingTracking.created_at) >= created_start_day)
+        if created_end_day is not None:
+            q = q.filter(func.date(ListingTracking.created_at) <= created_end_day)
+        if pid_min is not None:
+            q = q.filter(ListingTracking.pid >= int(pid_min))
+        if pid_max is not None:
+            q = q.filter(ListingTracking.pid <= int(pid_max))
+        if parent_asin_list:
+            q = q.filter(ListingTracking.parent_asin.in_(parent_asin_list))
+        if week_no:
+            q = q.filter(ListingTracking.week_no.in_(week_no))
+        if batch_id is not None:
+            q = q.filter(ListingTracking.batch_id == batch_id)
+        return q
+
+    t_parse = time.perf_counter()
+    # 避免逐行拉取整表；在 MySQL 侧按 week_no 聚合。impression_asin 用 GROUP_CONCAT 合并后再解析。
+    # new_asin_count 与 _listing_tracking_week_no 对齐：created_at 所在业务周周六的 ISO 周 = 行 week_no 时计入 pid_asin_count。
+    db.execute(text("SET SESSION group_concat_max_len = 33554432"))
+    _new_asin_case_sql = (
+        "CASE WHEN listing_tracking.created_at IS NOT NULL AND listing_tracking.week_no = "
+        "YEARWEEK(DATE_ADD(DATE_SUB(DATE(listing_tracking.created_at), "
+        "INTERVAL ((WEEKDAY(DATE(listing_tracking.created_at)) + 1) % 7) DAY), INTERVAL 6 DAY), 3) "
+        "THEN COALESCE(listing_tracking.pid_asin_count, 0) ELSE 0 END"
+    )
+    agg_q = db.query(
+        ListingTracking.week_no,
+        func.count().label("grp_n"),
+        func.coalesce(func.sum(ListingTracking.total_impression), 0),
+        func.coalesce(func.sum(ListingTracking.total_session), 0),
+        func.coalesce(func.sum(ListingTracking.total_click), 0),
+        func.coalesce(func.sum(ListingTracking.pid_asin_count), 0),
+        func.coalesce(func.sum(ListingTracking.pid_active_asin_count), 0),
+        func.sum(literal_column(_new_asin_case_sql)),
+        literal_column(
+            "GROUP_CONCAT(listing_tracking.impression_asin SEPARATOR '||')"
+        ).label("imp_concat"),
+    )
+    agg_q = _apply_trend_listing_filters(agg_q)
+    agg_q = agg_q.filter(ListingTracking.week_no.isnot(None))
+    agg_q = agg_q.group_by(ListingTracking.week_no)
+    agg_q = agg_q.order_by(ListingTracking.week_no.asc())
+    t_sql = time.perf_counter()
+    agg_rows = agg_q.all()
+    t_sql_done = time.perf_counter()
+
+    matched_row_count = 0
+    weeks: List[int] = []
+    series: List[TrendWeekPoint] = []
+    for row in agg_rows:
+        current_week = int(row[0])
+        matched_row_count += int(row[1] or 0)
+        total_impression = int(row[2] or 0)
+        total_sessions = int(row[3] or 0)
+        total_clicks = int(row[4] or 0)
+        total_asin_count = int(row[5] or 0)
+        active_asin_count = int(row[6] or 0)
+        new_asin_count = int(row[7] or 0)
+        impression_asins: set[str] = set()
+        imp_blob = row[8]
+        if imp_blob:
+            for chunk in str(imp_blob).split("||"):
+                impression_asins.update(_split_asin_values(chunk))
+        impression_asin_count = len(impression_asins)
+        weeks.append(current_week)
+        series.append(
+            TrendWeekPoint(
+                week_no=current_week,
+                new_asin_count=new_asin_count,
+                total_impression=total_impression,
+                total_sessions=total_sessions,
+                total_clicks=total_clicks,
+                total_asin_count=total_asin_count,
+                active_asin_count=active_asin_count,
+                impression_asin_count=impression_asin_count,
+                related_click=total_sessions - total_clicks,
+                impression_asin_rate=(float(total_impression) / impression_asin_count) if impression_asin_count > 0 else 0.0,
+            )
+        )
+    t_agg = time.perf_counter()
+
+    # Filter options: cache to avoid repeated full-table distinct + online title lookup
+    now_ts = time.time()
+    cached = None
+    with _trend_filter_cache_lock:
+        if (
+            _trend_filter_cache.get("value") is not None
+            and (now_ts - float(_trend_filter_cache.get("ts") or 0.0)) < _TREND_FILTER_CACHE_TTL_SEC
+        ):
+            cached = _trend_filter_cache["value"]
+
+    if cached is not None:
+        store_ids = cached["store_ids"]
+        batch_ids = cached["batch_ids"]
+        batch_options = cached["batch_options"]
+        used_models = cached["used_models"]
+        week_nos = []  # 由前端生成
+    else:
+        store_ids = [
+            int(item[0])
+            for item in db.query(ListingTracking.store_id)
+            .filter(ListingTracking.store_id.isnot(None))
+            .distinct()
+            .order_by(ListingTracking.store_id.asc())
+            .all()
+            if item[0] is not None
+        ]
+        batch_ids = [
+            int(item[0])
+            for item in db.query(ListingTracking.batch_id)
+            .filter(ListingTracking.batch_id.isnot(None))
+            .distinct()
+            .order_by(ListingTracking.batch_id.asc())
+            .all()
+            if item[0] is not None
+        ]
+        batch_options = _fetch_trend_batch_options(batch_ids)
+        # 周次候选由前端按 listing_tracking 规则自 202515 生成至当前周，避免每次全表 distinct week_no。
+        week_nos: list[int] = []
+        used_model_rows = db.execute(
+            text(
+                "SELECT v FROM ( "
+                "SELECT DISTINCT used_text_model AS v FROM listing_tracking "
+                "WHERE used_text_model IS NOT NULL AND used_text_model != '' "
+                "UNION "
+                "SELECT DISTINCT used_image_model AS v FROM listing_tracking "
+                "WHERE used_image_model IS NOT NULL AND used_image_model != '' "
+                ") AS x ORDER BY v"
+            )
+        ).fetchall()
+        used_models = sorted(
+            {str(r[0]).strip() for r in used_model_rows if r[0] is not None and str(r[0]).strip()}
+        )
+        with _trend_filter_cache_lock:
+            _trend_filter_cache["ts"] = now_ts
+            _trend_filter_cache["value"] = {
+                "store_ids": store_ids,
+                "batch_ids": batch_ids,
+                "batch_options": batch_options,
+                "used_models": used_models,
+            }
+    t_opts = time.perf_counter()
+
+    out = TrendResponse(
+        matched_row_count=matched_row_count,
+        weeks=weeks,
+        filter_options=TrendFilterOptions(
+            store_ids=store_ids,
+            batch_ids=batch_ids,
+            batch_options=batch_options,
+            week_nos=week_nos,
+            used_models=used_models,
+        ),
+        series=series,
+    )
+    t_done = time.perf_counter()
+    try:
+        resp_bytes = len(out.model_dump_json().encode("utf-8"))
+    except Exception:
+        resp_bytes = -1
+    logger.info(
+        "[Trend] /api/trend timings parse=%.3fs sql_build=%.3fs sql=%.3fs agg=%.3fs opts=%.3fs total=%.3fs weeks=%s rows=%s resp_kb=%.1f filters={store_id=%s used_model=%s week_no=%s batch_id=%s pid=[%s,%s] parent_asin_n=%s created=[%s,%s]}",
+        (t_parse - t0),
+        (t_sql - t_parse),
+        (t_sql_done - t_sql),
+        (t_agg - t_sql_done),
+        (t_opts - t_agg),
+        (t_done - t0),
+        len(weeks),
+        matched_row_count,
+        (resp_bytes / 1024.0) if resp_bytes >= 0 else -1.0,
+        store_id,
+        used_model,
+        len(week_no) if week_no else 0,
+        batch_id,
+        pid_min,
+        pid_max,
+        len(parent_asin_list),
+        created_at_start,
+        created_at_end,
+    )
+    return out
 
 
 @router.get("/monitor/track", response_model=MonitorTrackResponse)
