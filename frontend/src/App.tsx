@@ -780,7 +780,8 @@ function AsinHomePage() {
             </thead>
             <tbody>
               {summary.map((row, i) => {
-                const opDone = row.operation_status === true || (row.operated_at != null && row.operated_at !== '')
+                // 以 operation_status=1 为准；operated_at 可能因历史数据/回填残留而非空，但不应单独触发“已操作”显示
+                const opDone = row.operation_status === true
                 const adDone = row.ad_check === true || (row.ad_created_at != null && row.ad_created_at !== '')
                 const hadOperationHistory = !opDone && !!row.last_operated_at
                 const hadAdHistory = !adDone && !!row.last_ad_created_at

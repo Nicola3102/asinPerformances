@@ -520,16 +520,28 @@ def sync_auto_monitor() -> dict:
                 else:
                     logger.info("[AutoMonitor] parent has no rows to upsert: parent_asin=%s", pa)
 
-                if week_ints:
-                    marked_operation = local_db.query(AsinPerformance).filter(
-                        AsinPerformance.parent_asin == pa,
-                        AsinPerformance.week_no.in_(week_ints),
-                    ).update({"operation_status": True}, synchronize_session=False)
-                    backfilled_operated_at = local_db.query(AsinPerformance).filter(
-                        AsinPerformance.parent_asin == pa,
-                        AsinPerformance.week_no.in_(week_ints),
-                        AsinPerformance.operated_at.is_(None),
-                    ).update({"operated_at": operated_at}, synchronize_session=False)
+                # 只在「实际操作发生的那一周」标记 operation_status / operated_at。
+                # 其他 target_weeks 仅做监控数据回填（checked_status 等），不应将已操作状态复制到后续 week_no，
+                # 否则 Monitor 页面会在未操作的 week_no 下错误展示“已操作于 <earliest_operated_at>”。
+                anchor_week_no = int(first_week_no) if first_week_no is not None else None
+                if anchor_week_no is not None:
+                    marked_operation = (
+                        local_db.query(AsinPerformance)
+                        .filter(
+                            AsinPerformance.parent_asin == pa,
+                            AsinPerformance.week_no == anchor_week_no,
+                        )
+                        .update({"operation_status": True}, synchronize_session=False)
+                    )
+                    backfilled_operated_at = (
+                        local_db.query(AsinPerformance)
+                        .filter(
+                            AsinPerformance.parent_asin == pa,
+                            AsinPerformance.week_no == anchor_week_no,
+                            AsinPerformance.operated_at.is_(None),
+                        )
+                        .update({"operated_at": operated_at}, synchronize_session=False)
+                    )
                 else:
                     marked_operation = 0
                     backfilled_operated_at = 0
