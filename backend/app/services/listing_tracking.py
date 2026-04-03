@@ -94,6 +94,24 @@ def _iter_week_nos(start_date: date, end_date: date) -> list[int]:
     return out
 
 
+def _iter_previous_week_nos(excluding_current_week: bool, count: int) -> list[int]:
+    """
+    返回最近 count 个 week_no。
+    - excluding_current_week=True：不包含当前 week_no，返回当前周前 count 个 week_no
+    - excluding_current_week=False：包含当前周起算
+    """
+    if count <= 0:
+        return []
+    today = date.today()
+    week_start_today = _week_start(today)
+    start_offset_weeks = 1 if excluding_current_week else 0
+    target_dates = [
+        week_start_today - timedelta(days=7 * (start_offset_weeks + i))
+        for i in range(count)
+    ]
+    return [_date_to_week_no(d) for d in target_dates]
+
+
 def _parse_batch_ids(argv: list[str]) -> list[int]:
     values, _ = _parse_cli_args(argv)
     return values
@@ -599,12 +617,17 @@ def _metric_cache_key(pid_row: dict) -> tuple[int, int, str]:
     )
 
 
-def _aggregate_metrics_for_keys(online_engine, metric_keys: list[tuple[int, int, str]]) -> dict[tuple[int, int, str], dict[str, dict[int, int] | dict[int, set[str]]]]:
+def _aggregate_metrics_for_keys(
+    online_engine,
+    metric_keys: list[tuple[int, int, str]],
+    start_week_no_override: int | None = None,
+    end_week_no_override: int | None = None,
+) -> dict[tuple[int, int, str], dict[str, dict[int, int] | dict[int, set[str]]]]:
     if not metric_keys:
         return {}
 
     total_chunks = (len(metric_keys) + METRIC_CHUNK_SIZE - 1) // METRIC_CHUNK_SIZE
-    end_week_no = _date_to_week_no(date.today())
+    end_week_no = end_week_no_override if end_week_no_override is not None else _date_to_week_no(date.today())
     end_date = (date.today() + timedelta(days=1)).strftime("%Y-%m-%d")
     aggregated: dict[tuple[int, int, str], dict[str, dict[int, int]]] = {}
 
@@ -629,6 +652,9 @@ def _aggregate_metrics_for_keys(online_engine, metric_keys: list[tuple[int, int,
             for key in chunk
         }
         start_week_no = min(meta["start_week_no"] for meta in key_meta.values())
+        if start_week_no_override is not None:
+            # 不要查询早于该 pid_row 的业务起点
+            start_week_no = max(int(start_week_no_override), int(start_week_no))
         min_created_date = min(key[2] for key in chunk)
 
         pid_values = sorted({str(pid) for pid, _, _ in chunk})
@@ -844,10 +870,20 @@ def _aggregate_metrics_for_keys(online_engine, metric_keys: list[tuple[int, int,
     return aggregated
 
 
-def _build_values_for_pid(pid_row: dict, model_used: str | None, metrics: dict[str, dict[int, int]]) -> list[dict]:
+def _build_values_for_pid(
+    pid_row: dict,
+    model_used: str | None,
+    metrics: dict[str, dict[int, int]],
+    target_week_nos: set[int] | None = None,
+) -> list[dict]:
     created_at = pid_row["created_at"]
     created_date = created_at.date() if isinstance(created_at, datetime) else created_at
-    week_nos = _iter_week_nos(created_date, date.today())
+    if target_week_nos is None:
+        week_nos = _iter_week_nos(created_date, date.today())
+    else:
+        created_start_week = _date_to_week_no(created_date)
+        end_week = _date_to_week_no(date.today())
+        week_nos = sorted(wn for wn in target_week_nos if wn >= created_start_week and wn <= end_week)
     if not week_nos:
         return []
     used_text_model, used_image_model = _split_model_used(model_used)
@@ -1070,18 +1106,36 @@ def _chunk_pid_groups(pid_groups: dict[int, list[dict]], chunk_size: int = PID_P
     return [items[idx : idx + chunk_size] for idx in range(0, len(items), chunk_size)]
 
 
-def _process_pid_group_chunk_once(pid_chunk: list[tuple[int, list[dict]]], model_map: dict[int, str | None]) -> list[dict]:
+def _process_pid_group_chunk_once(
+    pid_chunk: list[tuple[int, list[dict]]],
+    model_map: dict[int, str | None],
+    target_week_nos: set[int] | None = None,
+    start_week_no: int | None = None,
+    end_week_no: int | None = None,
+) -> list[dict]:
     started = time.time()
     online_engine = get_online_engine()
     metric_keys = sorted({_metric_cache_key(row) for _, pid_rows in pid_chunk for row in pid_rows})
-    metrics_map = _aggregate_metrics_for_keys(online_engine, metric_keys)
+    metrics_map = _aggregate_metrics_for_keys(
+        online_engine,
+        metric_keys,
+        start_week_no_override=start_week_no,
+        end_week_no_override=end_week_no,
+    )
     payloads = []
     for pid, pid_rows in pid_chunk:
         model_used = model_map.get(int(pid))
         values: list[dict] = []
         for pid_row in pid_rows:
             metric_key = _metric_cache_key(pid_row)
-            values.extend(_build_values_for_pid(pid_row, model_used, metrics_map.get(metric_key, {})))
+            values.extend(
+                _build_values_for_pid(
+                    pid_row,
+                    model_used,
+                    metrics_map.get(metric_key, {}),
+                    target_week_nos=target_week_nos,
+                )
+            )
         payloads.append(
             {
                 "pid": int(pid),
@@ -1105,10 +1159,22 @@ def _process_pid_group_chunk_once(pid_chunk: list[tuple[int, list[dict]]], model
 def _process_pid_group_chunk(
     pid_chunk: list[tuple[int, list[dict]]],
     model_map: dict[int, str | None],
+    target_week_nos: set[int] | None = None,
+    start_week_no: int | None = None,
+    end_week_no: int | None = None,
     depth: int = 0,
 ) -> tuple[list[dict], list[int]]:
     try:
-        return (_process_pid_group_chunk_once(pid_chunk, model_map), [])
+        return (
+            _process_pid_group_chunk_once(
+                pid_chunk,
+                model_map,
+                target_week_nos=target_week_nos,
+                start_week_no=start_week_no,
+                end_week_no=end_week_no,
+            ),
+            [],
+        )
     except Exception as exc:
         if len(pid_chunk) <= 1:
             failed_pid = int(pid_chunk[0][0]) if pid_chunk else None
@@ -1128,7 +1194,14 @@ def _process_pid_group_chunk(
                 PID_CHUNK_RETRY_SINGLE_MAX,
                 exc,
             )
-            return _process_pid_group_chunk(pid_chunk, model_map, depth + 1)
+            return _process_pid_group_chunk(
+                pid_chunk,
+                model_map,
+                target_week_nos=target_week_nos,
+                start_week_no=start_week_no,
+                end_week_no=end_week_no,
+                depth=depth + 1,
+            )
 
         mid = max(1, len(pid_chunk) // 2)
         left_chunk = pid_chunk[:mid]
@@ -1141,8 +1214,22 @@ def _process_pid_group_chunk(
             depth,
             exc,
         )
-        left_payloads, left_failed_pids = _process_pid_group_chunk(left_chunk, model_map, depth + 1)
-        right_payloads, right_failed_pids = _process_pid_group_chunk(right_chunk, model_map, depth + 1)
+        left_payloads, left_failed_pids = _process_pid_group_chunk(
+            left_chunk,
+            model_map,
+            target_week_nos=target_week_nos,
+            start_week_no=start_week_no,
+            end_week_no=end_week_no,
+            depth=depth + 1,
+        )
+        right_payloads, right_failed_pids = _process_pid_group_chunk(
+            right_chunk,
+            model_map,
+            target_week_nos=target_week_nos,
+            start_week_no=start_week_no,
+            end_week_no=end_week_no,
+            depth=depth + 1,
+        )
         return (left_payloads + right_payloads, left_failed_pids + right_failed_pids)
 
 
@@ -1187,7 +1274,11 @@ def _writer_loop(write_queue: Queue, stats_holder: dict, error_holder: list):
             pass
 
 
-def sync_listing_tracking(batch_ids: list[int] | None = None, pids: list[int] | None = None) -> dict:
+def sync_listing_tracking(
+    batch_ids: list[int] | None = None,
+    pids: list[int] | None = None,
+    target_week_nos: list[int] | None = None,
+) -> dict:
     if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
         raise ValueError("Online DB config missing: set online_db_host, online_db_user, online_db_pwd, online_db_name in .env")
 
@@ -1195,7 +1286,16 @@ def sync_listing_tracking(batch_ids: list[int] | None = None, pids: list[int] | 
     local_db = SessionLocal()
     online_engine = get_online_engine()
     t0 = time.time()
-    logger.info("[ListingTracking] sync start input_batch_ids=%s input_pids=%s", batch_ids or [], pids or [])
+    target_week_set = set(int(w) for w in target_week_nos) if target_week_nos else None
+    target_start_week_no = min(target_week_set) if target_week_set else None
+    target_end_week_no = max(target_week_set) if target_week_set else None
+
+    logger.info(
+        "[ListingTracking] sync start input_batch_ids=%s input_pids=%s target_week_nos=%s",
+        batch_ids or [],
+        pids or [],
+        sorted(target_week_set) if target_week_set else None,
+    )
     try:
         with online_engine.connect() as conn:
             all_pid_rows = []
@@ -1274,7 +1374,14 @@ def sync_listing_tracking(batch_ids: list[int] | None = None, pids: list[int] | 
         try:
             with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="listing-tracking-reader") as executor:
                 future_map = {
-                    executor.submit(_process_pid_group_chunk, pid_chunk, model_map): {
+                    executor.submit(
+                        _process_pid_group_chunk,
+                        pid_chunk,
+                        model_map,
+                        target_week_nos=target_week_set,
+                        start_week_no=target_start_week_no,
+                        end_week_no=target_end_week_no,
+                    ): {
                         "idx": idx,
                         "pid_count": len(pid_chunk),
                         "pids": [int(pid) for pid, _pid_rows in pid_chunk],
@@ -1382,6 +1489,50 @@ def sync_listing_tracking(batch_ids: list[int] | None = None, pids: list[int] | 
             local_db.close()
         except Exception:
             pass
+
+
+def sync_listing_tracking_recent_weeks_scheduled(recent_weeks: int | None = None) -> dict:
+    """
+    定时任务入口：
+    - 基于本地 listing_tracking 表内所有 pid
+    - 只回填最近 recent_weeks 个 week_no（不含当前周）
+    - 仅当记录字段有变化时才会更新（sync_listing_tracking 内部已做 unchanged 判断）
+    """
+    if recent_weeks is None:
+        recent_weeks = int(settings.LISTING_TRACKING_RECENT_WEEKS or 2)
+    recent_weeks = max(0, int(recent_weeks))
+    if recent_weeks <= 0:
+        return {"recent_weeks": 0, "target_week_nos": [], "pids": 0, "note": "recent_weeks <= 0"}
+
+    init_db()
+    local_db = SessionLocal()
+    try:
+        pid_rows = local_db.query(ListingTracking.pid).distinct().all()
+        pids = sorted({int(r[0]) for r in pid_rows if r and r[0] is not None})
+    finally:
+        try:
+            local_db.close()
+        except Exception:
+            pass
+
+    target_week_nos = _iter_previous_week_nos(excluding_current_week=True, count=recent_weeks)
+    if not pids or not target_week_nos:
+        return {
+            "recent_weeks": recent_weeks,
+            "target_week_nos": target_week_nos,
+            "pids": len(pids),
+            "note": "no pids or no target_week_nos",
+        }
+
+    logger.info(
+        "[ListingTracking] scheduled recent weeks sync: recent_weeks=%s target_week_nos=%s pid_count=%s",
+        recent_weeks,
+        target_week_nos,
+        len(pids),
+    )
+    out = sync_listing_tracking(pids=pids, target_week_nos=target_week_nos)
+    out.update({"recent_weeks": recent_weeks, "target_week_nos": target_week_nos, "pid_count_all": len(pids)})
+    return out
 
 
 def _main(argv: list[str]) -> int:

@@ -306,10 +306,28 @@ def _ensure_listing_tracking_indexes():
                 conn.execute(text(ddl))
                 conn.commit()
 
+def _ensure_daily_upload_open_date_column():
+    """若 daily_upload_asin_dates 表缺少 open_date 列则添加（兼容已有表）。"""
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        if engine.dialect.name != "mysql":
+            return
+        r = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'daily_upload_asin_dates' AND COLUMN_NAME = 'open_date'"
+            )
+        ).scalar()
+        if r == 0:
+            conn.execute(text("ALTER TABLE daily_upload_asin_dates ADD COLUMN open_date DATE NULL"))
+            conn.execute(text("CREATE INDEX ix_daily_upload_asin_dates_open_date ON daily_upload_asin_dates (open_date)"))
+            conn.commit()
+
 
 def init_db():
     """Create all tables. Called on startup. Retries if MySQL not ready (e.g. in Docker)."""
-    from app.models import asin_performance, group_a, listing_tracking  # noqa: F401
+    from app.models import asin_performance, group_a, listing_tracking, daily_upload_asin_data  # noqa: F401
 
     max_attempts = 10
     for attempt in range(1, max_attempts + 1):
@@ -320,6 +338,7 @@ def init_db():
             _ensure_group_a_operation_columns()
             _ensure_listing_tracking_schema()
             _ensure_listing_tracking_indexes()
+            _ensure_daily_upload_open_date_column()
             return
         except OperationalError as e:
             if attempt == max_attempts:

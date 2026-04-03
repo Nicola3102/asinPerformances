@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>amazon_sales_and_traffic_daily — 按日 sessions</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --text: #e8ecf1;
+      --muted: #8b9cb3;
+      --accent: #3d9dff;
+      --line-all: #7dd3c0;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    .wrap {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 1.75rem 1.25rem 2.5rem;
+    }
+    h1 {
+      font-weight: 600;
+      font-size: 1.35rem;
+      letter-spacing: -0.02em;
+      margin: 0 0 0.35rem;
+    }
+    .sub {
+      color: var(--muted);
+      font-size: 0.875rem;
+      margin-bottom: 1.25rem;
+      line-height: 1.5;
+    }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.75rem 1.25rem;
+      margin-bottom: 1rem;
+      padding: 0.85rem 1rem;
+      background: var(--panel);
+      border-radius: 10px;
+      border: 1px solid rgba(125, 211, 192, 0.12);
+    }
+    label { font-size: 0.8rem; color: var(--muted); }
+    select {
+      background: #243044;
+      color: var(--text);
+      border: 1px solid rgba(61, 157, 255, 0.35);
+      border-radius: 6px;
+      padding: 0.45rem 0.65rem;
+      font-size: 0.9rem;
+      min-width: 200px;
+    }
+    .chart-box {
+      background: var(--panel);
+      border-radius: 12px;
+      padding: 1rem 0.75rem 1.25rem;
+      border: 1px solid rgba(61, 157, 255, 0.1);
+    }
+    canvas { max-height: 420px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Traffic daily（线上库）</h1>
+    <p class="sub">
+      数据来源：<code>amazon_sales_and_traffic_daily</code>，按 <code>store_id</code> 与 <code>DATE(current_date)</code> 汇总 <code>SUM(sessions)</code>。
+      默认折线为全店合计；选择店铺后仅显示该店。鼠标悬停数据点可查看当日 sessions。
+    </p>
+    <div class="toolbar">
+      <div>
+        <label for="storeSel">店铺</label><br />
+        <select id="storeSel">
+          <option value="">全部店铺（合计）</option>
+        </select>
+      </div>
+    </div>
+    <div class="chart-box">
+      <canvas id="c" height="120"></canvas>
+    </div>
+  </div>
+  <script>
+    var payload = {"labels": ["2026-02-22", "2026-02-23", "2026-02-24", "2026-02-25", "2026-02-26", "2026-02-27", "2026-02-28", "2026-03-01", "2026-03-02", "2026-03-03", "2026-03-04", "2026-03-05", "2026-03-06", "2026-03-07", "2026-03-08", "2026-03-09", "2026-03-10", "2026-03-11", "2026-03-12", "2026-03-13", "2026-03-14", "2026-03-15", "2026-03-16", "2026-03-17", "2026-03-18", "2026-03-19", "2026-03-20", "2026-03-21", "2026-03-22", "2026-03-23", "2026-03-24", "2026-03-25", "2026-03-26", "2026-03-27", "2026-03-28", "2026-03-29", "2026-03-30", "2026-03-31"], "store_ids": [1, 7, 12, 25], "all_data": [5511, 5093, 5648, 5420, 5174, 4986, 5201, 6459, 6314, 6025, 5529, 4951, 5921, 6541, 6792, 5585, 5474, 5822, 5874, 5137, 5588, 6312, 5119, 5092, 5520, 5121, 5195, 5695, 5854, 5576, 4252, 4334, 4488, 4088, 4248, 4448, 4214, 3796], "by_store": {"1": [2717, 2357, 2584, 2396, 2382, 2265, 2511, 3180, 3088, 2945, 2623, 2309, 2921, 3360, 3463, 2748, 2690, 2873, 2872, 2474, 2787, 3310, 2463, 2423, 2615, 2528, 2576, 3094, 3036, 2879, 2703, 2837, 2632, 2456, 2875, 3157, 2718, 2458], "7": [71, 65, 75, 46, 43, 51, 68, 46, 54, 67, 64, 24, 42, 68, 90, 53, 31, 49, 58, 48, 83, 69, 66, 38, 47, 50, 55, 60, 57, 88, 76, 75, 110, 81, 95, 97, 85, 81], "12": [1036, 994, 1121, 1225, 1013, 1050, 945, 1231, 1250, 1160, 1006, 945, 1111, 1106, 1275, 1099, 969, 1021, 1145, 958, 981, 1029, 887, 845, 1066, 886, 821, 802, 906, 891, 928, 1024, 1388, 1179, 941, 860, 1049, 869], "25": [1687, 1677, 1868, 1753, 1736, 1620, 1677, 2002, 1922, 1853, 1836, 1673, 1847, 2007, 1964, 1685, 1784, 1879, 1799, 1657, 1737, 1904, 1703, 1786, 1792, 1657, 1743, 1739, 1855, 1718, 545, 398, 358, 372, 337, 334, 362, 388]}};
+    var labels = payload.labels;
+    var allData = payload.all_data;
+    var byStore = payload.by_store;
+    var storeIds = payload.store_ids || [];
+
+    var sel = document.getElementById('storeSel');
+    storeIds.forEach(function (sid) {
+      var o = document.createElement('option');
+      o.value = String(sid);
+      o.textContent = 'store_id = ' + sid;
+      sel.appendChild(o);
+    });
+
+    var ctx = document.getElementById('c').getContext('2d');
+    var chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: 'Sessions（合计）',
+          data: allData,
+          borderColor: '#7dd3c0',
+          backgroundColor: 'rgba(125, 211, 192, 0.12)',
+          fill: true,
+          tension: 0.22,
+          pointRadius: 2,
+          pointHoverRadius: 6,
+          borderWidth: 2,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: true,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { labels: { color: '#c5d0de' } },
+          tooltip: {
+            callbacks: {
+              label: function (ctx) {
+                var v = ctx.parsed.y;
+                if (v == null) return '';
+                return ' sessions: ' + v.toLocaleString();
+              },
+            },
+          },
+        },
+        scales: {
+          x: {
+            ticks: { color: '#8b9cb3', maxRotation: 45, minRotation: 0 },
+            grid: { color: 'rgba(139, 156, 179, 0.08)' },
+          },
+          y: {
+            beginAtZero: true,
+            ticks: {
+              color: '#8b9cb3',
+              callback: function (v) { return Number(v).toLocaleString(); },
+            },
+            grid: { color: 'rgba(139, 156, 179, 0.1)' },
+          },
+        },
+      },
+    });
+
+    function applyStore() {
+      var v = sel.value;
+      var ds = chart.data.datasets[0];
+      if (!v) {
+        ds.label = 'Sessions（全部店铺合计）';
+        ds.data = allData;
+        ds.borderColor = '#7dd3c0';
+        ds.backgroundColor = 'rgba(125, 211, 192, 0.12)';
+      } else {
+        ds.label = 'store_id ' + v;
+        ds.data = byStore[v] || labels.map(function () { return 0; });
+        ds.borderColor = '#3d9dff';
+        ds.backgroundColor = 'rgba(61, 157, 255, 0.12)';
+      }
+      chart.update();
+    }
+    sel.addEventListener('change', applyStore);
+  </script>
+</body>
+</html>

@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { NavLink, Navigate, Outlet, Route, Routes } from 'react-router-dom'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { NavLink, Navigate, Outlet, Route, Routes, useLocation } from 'react-router-dom'
 import {
   listSummaryConsolidatedByWeek,
   listWeeks,
@@ -38,6 +38,89 @@ import {
   type TrendWeekPoint,
 } from './api/client'
 import './App.css'
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  BarElement,
+  LineElement,
+  PointElement,
+  Legend,
+  Tooltip,
+} from 'chart.js'
+import { Chart } from 'react-chartjs-2'
+
+ChartJS.register(CategoryScale, LinearScale, BarElement, LineElement, PointElement, Legend, Tooltip)
+
+/** /api/trend/new-listing?format=json 的 views 中单店/全店视图 */
+interface TrendNewListingViewPayload {
+  labels: string[]
+  datasets: Array<{
+    type?: string
+    label?: string
+    data?: number[]
+    backgroundColor?: string
+    borderWidth?: number
+    stack?: string
+    yAxisID?: string
+  }>
+  lineTotal?: number[]
+  kpi: { totalAsin: number; activeAsin: number; listingSince: string }
+  /** 表格：每批上新(open_date)的上新数 + 上新后每天 sessions（第 1..N 天） */
+  cohortTable?: Array<{ cohortDate: string; newAsin: number; daySessions: number[] }>
+}
+
+interface TrendNewListingJsonPayload {
+  generatedAt?: string
+  views: Record<string, TrendNewListingViewPayload>
+  storeIds: number[]
+  listingSince: string
+  listingThrough: string
+  sessionChartStart: string
+  sessionChartEnd: string
+  chartRangeAutoExpanded?: boolean
+  cohortTrackDays?: number
+  kpiSource?: string
+}
+
+/** v3：cohort 上新数改与线上 amazon_listing（TRIM asin）一致，旧缓存丢弃 */
+const TREND_NEW_LISTING_CACHE_KEY = 'asinPerformances.v3.trendNewListingJson'
+
+function readTrendNewListingCache(): TrendNewListingJsonPayload | null {
+  try {
+    const raw = localStorage.getItem(TREND_NEW_LISTING_CACHE_KEY)
+    if (!raw) return null
+    const data = JSON.parse(raw) as TrendNewListingJsonPayload
+    if (!data || typeof data !== 'object' || !data.views || typeof data.views !== 'object') return null
+    return data
+  } catch {
+    return null
+  }
+}
+
+function writeTrendNewListingCache(data: TrendNewListingJsonPayload): void {
+  try {
+    localStorage.setItem(TREND_NEW_LISTING_CACHE_KEY, JSON.stringify(data))
+  } catch {
+    /* quota / 隐私模式等 */
+  }
+}
+
+/** 默认用缓存、不自动打接口；?refresh=1 或 ?nocache=1 强制走网络 */
+function getTrendNewListingBoot(): { payload: TrendNewListingJsonPayload | null; useCacheOnly: boolean } {
+  if (typeof window === 'undefined') return { payload: null, useCacheOnly: false }
+  try {
+    const sp = new URLSearchParams(window.location.search)
+    if (sp.get('refresh') === '1' || sp.get('nocache') === '1') {
+      return { payload: null, useCacheOnly: false }
+    }
+    const cached = readTrendNewListingCache()
+    if (cached) return { payload: cached, useCacheOnly: true }
+  } catch {
+    /* ignore */
+  }
+  return { payload: null, useCacheOnly: false }
+}
 
 function formatParentOrderTotal(v: string | number | null | undefined): string {
   if (v == null || v === '') return '–'
@@ -2239,6 +2322,492 @@ function TrendLineChartCard({
   )
 }
 
+/** SPA 内保留上次成功的 embed HTML，路由切回时先用内存展示，不必等 fetch */
+let sessionImpressionCachedHtml: string | null = null
+
+const SESSION_IMPRESSION_HTML_LS_KEY = 'asinPerformances.v1.sessionImpressionHtml'
+/** localStorage 单 key 上限附近，避免配额爆掉 */
+const SESSION_IMPRESSION_HTML_LS_MAX = 4_500_000
+
+const SESSION_IMPRESSION_FIRST_BUILD_STUB = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>生成中</title><style>body{margin:0;font-family:system-ui,"PingFang SC",sans-serif;padding:2rem;background:#0f1419;color:#94a3b8;line-height:1.6}</style></head><body><p>正在生成 session &amp; impression 报表（首次访问或后端内存缓存为空），请稍候…</p></body></html>`
+
+function readSessionImpressionHtmlLs(): string | null {
+  try {
+    const s = localStorage.getItem(SESSION_IMPRESSION_HTML_LS_KEY)
+    if (!s || s.length < 200) return null
+    return s
+  } catch {
+    return null
+  }
+}
+
+function writeSessionImpressionHtmlLs(html: string): void {
+  try {
+    if (!html || html.length < 200) return
+    if (html.length > SESSION_IMPRESSION_HTML_LS_MAX) return
+    localStorage.setItem(SESSION_IMPRESSION_HTML_LS_KEY, html)
+  } catch {
+    /* quota / 隐私模式 */
+  }
+}
+
+/** 路由切换：仅 embed=1 读服务端/浏览器缓存；浏览器刷新（reload）时再 rebuild=1 拉最新（用 timeOrigin 避免 SPA 返回页误触发） */
+function sessionImpressionRebuildStorageKey(): string {
+  if (typeof performance === 'undefined') return 'si-rebuilt-unknown'
+  const nav = performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined
+  const id =
+    typeof performance.timeOrigin === 'number' && performance.timeOrigin > 0
+      ? String(performance.timeOrigin)
+      : nav
+        ? `nav-${nav.startTime}-${nav.loadEventEnd}`
+        : `fallback-${Date.now()}`
+  return `si-rebuilt-${id}`
+}
+
+function shouldRunSessionImpressionRebuildAfterEmbed(): boolean {
+  if (typeof performance === 'undefined') return false
+  const nav = performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined
+  if (!nav || nav.type !== 'reload') return false
+  try {
+    return !sessionStorage.getItem(sessionImpressionRebuildStorageKey())
+  } catch {
+    return true
+  }
+}
+
+function markSessionImpressionRebuildDone(): void {
+  try {
+    sessionStorage.setItem(sessionImpressionRebuildStorageKey(), '1')
+  } catch {
+    /* ignore */
+  }
+}
+
+function getInitialSessionImpressionHtml(): string | null {
+  if (sessionImpressionCachedHtml) return sessionImpressionCachedHtml
+  return readSessionImpressionHtmlLs()
+}
+
+function TrendSessionImpressionEmbeddedPage() {
+  const [html, setHtml] = useState<string | null>(() => getInitialSessionImpressionHtml())
+  const [err, setErr] = useState<string | null>(null)
+  const [bgRefreshing, setBgRefreshing] = useState(false)
+  const [bgNotice, setBgNotice] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    setErr(null)
+    setBgNotice(null)
+    setBgRefreshing(false)
+
+    const runRebuild = shouldRunSessionImpressionRebuildAfterEmbed()
+
+    ;(async () => {
+      try {
+        const r1 = await fetch('/api/trend/session-impression?embed=1', {
+          cache: 'default',
+        })
+        const embedCacheHdr = (r1.headers.get('X-Session-Impression-Cache') || '').toLowerCase()
+        const t1 = await r1.text()
+        if (!r1.ok) {
+          throw new Error(`HTTP ${r1.status}: ${t1.slice(0, 200)}`)
+        }
+
+        const lsHtml = readSessionImpressionHtmlLs()
+        let display = t1
+        if (embedCacheHdr === 'miss') {
+          if (lsHtml) {
+            display = lsHtml
+            if (!cancelled) {
+              setBgNotice('展示浏览器本地缓存，正在向服务器同步最新报表…')
+            }
+          } else {
+            display = SESSION_IMPRESSION_FIRST_BUILD_STUB
+          }
+        }
+
+        if (!cancelled) {
+          sessionImpressionCachedHtml = display
+          setHtml(display)
+        }
+
+        if (embedCacheHdr === 'hit' && t1.length > 200) {
+          writeSessionImpressionHtmlLs(t1)
+        }
+
+        // 服务端内存无缓存时必须 rebuild；浏览器刷新时亦 rebuild 拉最新（原逻辑）
+        const needRebuild = runRebuild || embedCacheHdr === 'miss'
+        if (!needRebuild || cancelled) return
+
+        if (!cancelled) setBgRefreshing(true)
+        const r2 = await fetch('/api/trend/session-impression?rebuild=1')
+        const t2 = await r2.text()
+        if (!cancelled) setBgRefreshing(false)
+
+        if (!r2.ok) {
+          if (!cancelled) {
+            setBgNotice(
+              embedCacheHdr === 'miss' && !lsHtml
+                ? '报表生成失败，请稍后刷新页面重试，或新标签打开 /api/trend/session-impression?rebuild=1'
+                : '刷新后后台同步失败，仍显示缓存内容。可再次刷新重试。',
+            )
+          }
+          return
+        }
+        markSessionImpressionRebuildDone()
+        writeSessionImpressionHtmlLs(t2)
+        if (!cancelled) {
+          sessionImpressionCachedHtml = t2
+          setHtml(t2)
+          setBgNotice(null)
+          const cacheHdr2 = r2.headers.get('X-Session-Impression-Cache')
+          if (cacheHdr2 === 'stale-fallback') {
+            setBgNotice('后台刷新失败，已保留上次成功缓存。')
+          }
+        }
+      } catch (e: unknown) {
+        if (!cancelled) {
+          setBgRefreshing(false)
+          setErr(
+            e instanceof Error
+              ? e.message
+              : '请求失败。请确认后端已启动（如 :9090），且 dev 时 Vite 已代理 /api 到后端；Network 面板勿用会过滤掉该请求的关键字（例如 022）。',
+          )
+        }
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  if (err) {
+    return (
+      <div className="trend-embed-page trend-embed-page--message">
+        <h2 className="trend-embed-error-title">报表加载失败</h2>
+        <pre className="trend-embed-error-body">{err}</pre>
+        <p className="trend-embed-hint">
+          可直接访问{' '}
+          <a href="/api/trend/session-impression?rebuild=1" target="_blank" rel="noreferrer">
+            /api/trend/session-impression?rebuild=1
+          </a>{' '}
+          强制全量重算。进入本页会在服务端无缓存时自动触发重建；亦可<strong>刷新浏览器</strong>拉最新。
+        </p>
+      </div>
+    )
+  }
+  if (html === null) {
+    return (
+      <div className="trend-embed-page trend-embed-page--message">
+        <p className="trend-embed-loading">正在加载 session &amp; impression 报表…</p>
+        <p className="trend-embed-hint">
+          正在请求报表。服务端有内存缓存时较快；无缓存时会自动全量生成并写入浏览器本地缓存，下次进入可秒开。
+        </p>
+      </div>
+    )
+  }
+  const showBar = bgRefreshing || Boolean(bgNotice)
+  return (
+    <div className={`trend-embed-page${showBar ? ' trend-embed-page--with-bar' : ''}`}>
+      {showBar ? (
+        <div className="trend-embed-bgbar" role="status">
+          {bgRefreshing ? '正在后台与线上库同步最新报表…' : bgNotice}
+        </div>
+      ) : null}
+      <iframe
+        className="trend-embed-frame"
+        title="session & impression 报表"
+        srcDoc={html}
+      />
+    </div>
+  )
+}
+
+function TrendNewListingEmbeddedPage() {
+  const boot = useMemo(() => getTrendNewListingBoot(), [])
+  const [payload, setPayload] = useState<TrendNewListingJsonPayload | null>(boot.payload)
+  const [fromCache, setFromCache] = useState(boot.useCacheOnly)
+  const [storeKey, setStoreKey] = useState<string>('all')
+  const [err, setErr] = useState<string | null>(null)
+  const [refreshing, setRefreshing] = useState(false)
+
+  const fetchNewListingJson = useCallback(async (opts: { skipSync: boolean; writeCache: boolean }) => {
+    const url = `/api/trend/new-listing?format=json${opts.skipSync ? '&skip_sync=false' : ''}`
+    const res = await fetch(url)
+    const text = await res.text()
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`)
+    const data = JSON.parse(text) as TrendNewListingJsonPayload
+    if (opts.writeCache) writeTrendNewListingCache(data)
+    setPayload(data)
+    setFromCache(false)
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    setErr(null)
+    if (boot.useCacheOnly && boot.payload) {
+      return () => {
+        cancelled = true
+      }
+    }
+    const nav =
+      typeof performance !== 'undefined'
+        ? (performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined)
+        : undefined
+    const syncOnReload = nav?.type === 'reload'
+    fetchNewListingJson({ skipSync: syncOnReload, writeCache: true }).catch((e: unknown) => {
+      if (!cancelled) setErr(e instanceof Error ? e.message : '请求失败')
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [boot.useCacheOnly, boot.payload, fetchNewListingJson])
+
+  const view = payload?.views?.[storeKey] ?? payload?.views?.all
+
+  if (err) {
+    return (
+      <div className="trend-embed-page trend-embed-page--message">
+        <h2 className="trend-embed-error-title">页面加载失败</h2>
+        <pre className="trend-embed-error-body">{err}</pre>
+      </div>
+    )
+  }
+  if (payload === null || !view) {
+    return (
+      <div className="trend-embed-page trend-embed-page--message">
+        <p className="trend-embed-loading">正在加载 New Listing 报表…</p>
+      </div>
+    )
+  }
+
+  const barDatasets = (view.datasets || []).map((ds) => ({
+    type: 'bar' as const,
+    label: ds.label ?? '',
+    data: (ds.data ?? []).map((x) => Number(x)),
+    backgroundColor: ds.backgroundColor,
+    borderWidth: ds.borderWidth ?? 0,
+    stack: ds.stack ?? 'sess',
+    yAxisID: ds.yAxisID ?? 'y',
+  }))
+  const lt =
+    view.lineTotal && view.lineTotal.length === view.labels.length
+      ? view.lineTotal.map((n) => Number(n))
+      : view.labels.map((_, idx) =>
+          barDatasets.reduce((acc, ds) => acc + Number(ds.data[idx] ?? 0), 0),
+        )
+  const maxY = Math.max(1, ...lt) * 1.12
+  const chartData = {
+    labels: view.labels,
+    datasets: [
+      ...barDatasets,
+      {
+        type: 'line' as const,
+        label: '当日 sessions 合计',
+        data: lt,
+        borderColor: '#111827',
+        backgroundColor: 'transparent',
+        borderWidth: 2.5,
+        pointRadius: 4,
+        pointBackgroundColor: '#111827',
+        tension: 0.2,
+        order: 100,
+        yAxisID: 'y1',
+      },
+    ],
+  }
+
+  const storeOptions = [
+    { value: 'all', label: '全部店铺' },
+    ...(payload.storeIds || []).map((id) => ({ value: String(id), label: `店铺 ${id}` })),
+  ]
+
+  const cohortTrackDays = Math.max(1, Number(payload.cohortTrackDays ?? 30))
+  const cohortTable = Array.isArray((view as any)?.cohortTable) ? ((view as any).cohortTable as any[]) : []
+
+  return (
+    <div className="trend-embed-page trend-new-listing-page">
+      <div className="trend-new-listing-toolbar">
+        <label className="trend-new-listing-label" htmlFor="trend-nl-store">
+          店铺
+        </label>
+        <select
+          id="trend-nl-store"
+          className="trend-new-listing-select"
+          value={storeKey}
+          onChange={(e) => setStoreKey(e.target.value)}
+        >
+          {storeOptions.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          className="trend-new-listing-refresh-btn"
+          disabled={refreshing}
+          onClick={async () => {
+            setRefreshing(true)
+            setErr(null)
+            try {
+              await fetchNewListingJson({ skipSync: false, writeCache: true })
+            } catch (e: unknown) {
+              setErr(e instanceof Error ? e.message : '请求失败')
+            } finally {
+              setRefreshing(false)
+            }
+          }}
+        >
+          {refreshing ? '加载中…' : '重新从服务器加载'}
+        </button>
+        <button
+          type="button"
+          className="trend-new-listing-refresh-btn trend-new-listing-refresh-btn--secondary"
+          disabled={refreshing}
+          onClick={async () => {
+            setRefreshing(true)
+            setErr(null)
+            try {
+              await fetchNewListingJson({ skipSync: true, writeCache: true })
+            } catch (e: unknown) {
+              setErr(e instanceof Error ? e.message : '请求失败')
+            } finally {
+              setRefreshing(false)
+            }
+          }}
+        >
+          同步 listing 并重载
+        </button>
+        <span className="trend-new-listing-meta">
+          open_date ≥ {payload.listingSince} · 每批 {payload.cohortTrackDays ?? 30} 日 · 横轴{' '}
+          {payload.sessionChartStart}～{payload.sessionChartEnd}
+          {payload.chartRangeAutoExpanded ? '（已按本地数据扩展区间）' : ''}
+          {fromCache ? (
+            <>
+              {' '}
+              · 默认展示本地缓存（生成 {payload.generatedAt ?? '—'}），不自动请求接口
+            </>
+          ) : null}
+        </span>
+      </div>
+      <div className="trend-new-listing-kpi">
+        <div className="trend-new-listing-kpi-card">
+          <span className="trend-new-listing-kpi-title">Listing 行数（KPI）</span>
+          <strong>{Number(view.kpi?.totalAsin ?? 0).toLocaleString()}</strong>
+        </div>
+        <div className="trend-new-listing-kpi-card">
+          <span className="trend-new-listing-kpi-title">Active ASIN 数</span>
+          <strong>{Number(view.kpi?.activeAsin ?? 0).toLocaleString()}</strong>
+        </div>
+      </div>
+      <p className="trend-new-listing-hint">
+        柱形为各上新批次（open_date）贡献的 sessions 堆叠；黑色折线为每日合计。横坐标仅包含有 session 数据的日期。
+        首次进入若无缓存会自动请求一次；之后默认展示浏览器本地缓存，不自动打接口。地址栏加{' '}
+        <code className="trend-new-listing-code">?refresh=1</code> 可强制重新拉取。
+        {payload.kpiSource === 'amazon_listing'
+          ? ' KPI 与线上 amazon_listing 对账。'
+          : payload.kpiSource === 'amazon_listing_new_asin_local_kpi'
+            ? ' 上新日 / 各日上新 ASIN 数来自线上 amazon_listing；顶部 KPI 为本地表回退。'
+            : ''}
+      </p>
+      <div className="trend-new-listing-chart-wrap">
+        {view.labels.length === 0 || barDatasets.length === 0 ? (
+          <p className="trend-new-listing-empty">暂无图表数据（请确认已同步 daily_upload_asin_dates 且 open_date 非空）。</p>
+        ) : (
+          <Chart
+            type="bar"
+            data={chartData}
+            options={{
+              responsive: true,
+              maintainAspectRatio: false,
+              interaction: { mode: 'index', intersect: false },
+              plugins: {
+                legend: { position: 'top' },
+                tooltip: {
+                  callbacks: {
+                    footer: (items) => {
+                      if (!items.length) return ''
+                      const idx = items[0].dataIndex
+                      const total = lt[idx]
+                      return total != null ? `合计 ${Number(total).toLocaleString()} sessions` : ''
+                    },
+                  },
+                },
+              },
+              scales: {
+                x: {
+                  stacked: true,
+                  ticks: { maxRotation: 45, minRotation: 0 },
+                },
+                y: {
+                  stacked: true,
+                  beginAtZero: true,
+                  max: maxY,
+                  title: { display: true, text: 'Sessions（堆叠）' },
+                },
+                y1: {
+                  stacked: false,
+                  position: 'right',
+                  beginAtZero: true,
+                  max: maxY,
+                  grid: { drawOnChartArea: false },
+                  title: { display: true, text: '合计（折线）' },
+                },
+              },
+            }}
+          />
+        )}
+      </div>
+
+      <div className="trend-new-listing-table-wrap">
+        <h3 className="trend-new-listing-table-title">批次明细（上新数 &amp; 上新后每日 sessions）</h3>
+        <p className="trend-new-listing-table-caption">
+          前两列「上新日 / 上新 listing 行数」来自线上 <code className="trend-new-listing-code">amazon_listing</code>
+          （open_date ≥ {payload.listingSince}，asin 非空且去空格非空，与 KPI 同口径）；切换上方「店铺」按 store_id
+          切分。后列为本地 sessions 明细。
+        </p>
+        {!cohortTable.length ? (
+          <p className="trend-new-listing-table-empty">暂无表格数据（需要 open_date 批次与本地 sessions 明细）。</p>
+        ) : (
+          <div className="trend-new-listing-table-scroll">
+            <table className="trend-new-listing-table">
+              <thead>
+                <tr>
+                  <th className="is-sticky-col is-sticky-col--1">上新日（PST）</th>
+                  <th className="is-sticky-col is-sticky-col--2">上新 ASIN 数</th>
+                  {Array.from({ length: cohortTrackDays }, (_, i) => (
+                    <th key={`d${i + 1}`}>{`第${i + 1}天`}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {cohortTable.map((row: any) => {
+                  const cd = String(row?.cohortDate ?? '')
+                  const newAsin = Number(row?.newAsin ?? 0)
+                  const daySessions: number[] = Array.isArray(row?.daySessions)
+                    ? row.daySessions.map((x: any) => Number(x ?? 0))
+                    : []
+                  return (
+                    <tr key={cd || Math.random()}>
+                      <td className="is-sticky-col is-sticky-col--1">{cd || '–'}</td>
+                      <td className="is-sticky-col is-sticky-col--2">{newAsin.toLocaleString('zh-CN')}</td>
+                      {Array.from({ length: cohortTrackDays }, (_, i) => (
+                        <td key={`${cd}-s-${i}`}>{Number(daySessions[i] ?? 0).toLocaleString('zh-CN')}</td>
+                      ))}
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function TrendPage() {
   const [filters, setFilters] = useState<TrendFilterState>(EMPTY_TREND_FILTERS)
   const [appliedFilters, setAppliedFilters] = useState<TrendFilterState>(EMPTY_TREND_FILTERS)
@@ -2441,7 +3010,7 @@ function TrendPage() {
 
   return (
     <div className="app trend-page">
-      <h1>Trending</h1>
+      <h1>Weekly trend</h1>
       <p className="monitor-desc">基于 `listing_tracking` 按筛选条件聚合展示周趋势。</p>
       <form className="trend-filters" onSubmit={handleApplyFilters}>
         <div className="trend-filter-bar">
@@ -2754,14 +3323,27 @@ function PagePlaceholder({ title }: { title: string }) {
 }
 
 function AppLayout() {
+  const location = useLocation()
   const [groupOpen, setGroupOpen] = useState(false)
+  const [trendOpen, setTrendOpen] = useState(false)
   const groupRef = useRef<HTMLDivElement | null>(null)
+  const trendRef = useRef<HTMLDivElement | null>(null)
+
+  const trendingSubPaths =
+    location.pathname === '/trend' ||
+    location.pathname === '/trend/session-impression' ||
+    location.pathname === '/trend/session&impression' ||
+    location.pathname === '/trend/New Listing'
+  const trendingNavActive = trendingSubPaths || trendOpen
 
   useEffect(() => {
     const onDocMouseDown = (e: MouseEvent) => {
-      if (!groupRef.current) return
-      if (!groupRef.current.contains(e.target as Node)) {
+      const t = e.target as Node
+      if (groupRef.current && !groupRef.current.contains(t)) {
         setGroupOpen(false)
+      }
+      if (trendRef.current && !trendRef.current.contains(t)) {
+        setTrendOpen(false)
       }
     }
     document.addEventListener('mousedown', onDocMouseDown)
@@ -2792,9 +3374,40 @@ function AppLayout() {
         <NavLink to="/monitor" className={({ isActive }) => `top-nav-link ${isActive ? 'is-active' : ''}`}>
           Monitor
         </NavLink>
-        <NavLink to="/trend" className={({ isActive }) => `top-nav-link ${isActive ? 'is-active' : ''}`}>
-          Trending
-        </NavLink>
+        <div className="top-nav-group" ref={trendRef}>
+          <button
+            type="button"
+            className={`top-nav-link top-nav-group-toggle ${trendingNavActive ? 'is-active' : ''}`}
+            onClick={() => setTrendOpen((v) => !v)}
+            aria-expanded={trendOpen}
+            aria-haspopup="menu"
+          >
+            Trending
+          </button>
+          <div className={`top-nav-menu top-nav-menu--wide ${trendOpen ? 'is-open' : ''}`}>
+            <NavLink
+              to="/trend"
+              className="top-nav-menu-link"
+              onClick={() => setTrendOpen(false)}
+            >
+              Weekly trend
+            </NavLink>
+            <NavLink
+              to="/trend/session-impression"
+              className="top-nav-menu-link"
+              onClick={() => setTrendOpen(false)}
+            >
+              session & impression
+            </NavLink>
+            <NavLink
+              to="/trend/New Listing"
+              className="top-nav-menu-link"
+              onClick={() => setTrendOpen(false)}
+            >
+              New Listing
+            </NavLink>
+          </div>
+        </div>
       </nav>
       <div className="app-shell-content">
         <Outlet />
@@ -2815,6 +3428,9 @@ export default function App() {
         <Route path="/tasks" element={<PagePlaceholder title="Tasks" />} />
         <Route path="/monitor" element={<MonitorPage />} />
         <Route path="/trend" element={<TrendPage />} />
+        <Route path="/trend/session-impression" element={<TrendSessionImpressionEmbeddedPage />} />
+        <Route path="/trend/session&impression" element={<Navigate to="/trend/session-impression" replace />} />
+        <Route path="/trend/New Listing" element={<TrendNewListingEmbeddedPage />} />
       </Route>
     </Routes>
   )

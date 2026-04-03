@@ -1,21 +1,23 @@
 import logging
 import threading
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import date, timedelta
+from pathlib import Path
 from typing import Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.config import settings
 from app.online_engine import dispose_online_engine
 from app.controllers import asin_router
 from app.controllers.asin_controller import get_trend_data
 from app.controllers.sync_controller import router as sync_router
+from app.controllers.trend_reports import router as trend_reports_router
 from app.views.asin_schemas import TrendResponse
-from app.database import init_db
+from app.database import SessionLocal, init_db
 from app.logging_config import setup_logging
 from app.services.online_sync import sync_from_online_db
 from app.services.groupA_impression import (
@@ -24,6 +26,15 @@ from app.services.groupA_impression import (
     _date_to_week_no,
 )
 from app.services.auto_monitor import sync_auto_monitor
+from app.services.listing_tracking import sync_listing_tracking_recent_weeks_scheduled
+from app.services.daily_upload_asin_data import sync_with_default_date_range
+from app.services.daily_upload_asin_data_ds import sync_scheduled_listing_date_range_ds
+from app.services.daily_upload_session_report_html import (
+    DEFAULT_LISTING_SINCE,
+    build_report_payload,
+    render_html,
+    write_daily_upload_session_report_file,
+)
 from app.sync_run_record import (
     now_asia,
     is_n_hour_slot,
@@ -31,6 +42,8 @@ from app.sync_run_record import (
     should_run_scheduled_sync,
     record_monitor_run,
     record_sync_run,
+    should_run_listing_tracking_sync,
+    record_listing_tracking_run,
 )
 
 # 按日期将日志写入 app/log/YYYY-MM-DD.log
@@ -120,6 +133,83 @@ def _run_scheduled_group_a_sync():
         logger.exception("[GroupA] Scheduled sync failed: %s", e)
 
 
+_listing_tracking_lock = threading.Lock()
+_daily_upload_sync_lock = threading.Lock()
+_daily_upload_ds_lock = threading.Lock()
+
+
+def _run_scheduled_daily_upload_and_report():
+    """
+    东八区每 2 小时整点：按 daily_upload_asin_data 默认 listing 日区间同步，
+    再导出与 `python -m app.services.daily_upload_session_report_html --out ./charts/report4.html` 等价的 HTML。
+    """
+    if not _daily_upload_sync_lock.acquire(blocking=False):
+        logger.info("[DailyUpload] scheduled job skipped: previous run still in progress")
+        return
+    try:
+        logger.info("[DailyUpload] Scheduled sync + report starting")
+        out = sync_with_default_date_range()
+        logger.info("[DailyUpload] Scheduled sync done: %s", out)
+        report_path = Path(__file__).resolve().parent.parent / "charts" / "report4.html"
+        write_daily_upload_session_report_file(report_path)
+        logger.info("[DailyUpload] Report exported to %s", report_path)
+    except Exception as e:
+        logger.exception("[DailyUpload] Scheduled sync + report failed: %s", e)
+    finally:
+        try:
+            _daily_upload_sync_lock.release()
+        except Exception:
+            pass
+
+
+def _run_scheduled_daily_upload_ds():
+    """
+    东八区（SYNC_TIMEZONE）每 N 小时整点：按 daily_upload_asin_data_ds 同步 listing 日区间；
+    下界来自 .env daily_upload_ds_start_date（默认 2026-02-20），上界为当日日历日（含）。
+    """
+    if not _daily_upload_ds_lock.acquire(blocking=False):
+        logger.info("[DailyUploadDS] scheduled job skipped: previous run still in progress")
+        return
+    try:
+        logger.info(
+            "[DailyUploadDS] scheduled job starting (timezone=%s, start_date from daily_upload_ds_start_date)",
+            settings.SYNC_TIMEZONE,
+        )
+        out = sync_scheduled_listing_date_range_ds()
+        logger.info("[DailyUploadDS] scheduled job finished: %s", out)
+    except Exception as e:
+        logger.exception("[DailyUploadDS] scheduled job failed: %s", e)
+    finally:
+        try:
+            _daily_upload_ds_lock.release()
+        except Exception:
+            pass
+
+
+def _run_scheduled_listing_tracking():
+    """
+    定时任务（ListingTracking）：
+    - 依据本地 listing_tracking 表内所有 pid
+    - 回填最近 N 周（不含当前周）的所有字段
+    """
+    if not _listing_tracking_lock.acquire(blocking=False):
+        logger.info("[ListingTracking] scheduled job skipped: previous run still in progress")
+        return
+    try:
+        recent_weeks = int(settings.LISTING_TRACKING_RECENT_WEEKS or 2)
+        logger.info("[ListingTracking] Scheduled sync starting: recent_weeks=%s", recent_weeks)
+        out = sync_listing_tracking_recent_weeks_scheduled(recent_weeks=recent_weeks)
+        record_listing_tracking_run()
+        logger.info("[ListingTracking] Scheduled sync done: %s", out)
+    except Exception as e:
+        logger.exception("[ListingTracking] Scheduled sync failed: %s", e)
+    finally:
+        try:
+            _listing_tracking_lock.release()
+        except Exception:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _scheduler
@@ -161,6 +251,51 @@ async def lifespan(app: FastAPI):
                 id="group_a_sync",
                 misfire_grace_time=300,
             )
+
+            # ListingTracking：每天均匀执行若干次（minute=0）
+            listing_times = max(1, int(settings.LISTING_TRACKING_DAILY_TIMES or 1))
+            if listing_times == 1:
+                listing_hours_list = [0]
+            else:
+                listing_hours_list = sorted({int(round(i * 24 / listing_times)) % 24 for i in range(listing_times)})
+                # 去重后不足时，补到下一个整点
+                i = 0
+                while len(listing_hours_list) < listing_times and i < 24:
+                    candidate = (listing_hours_list[-1] + 1 + i) % 24 if listing_hours_list else i
+                    if candidate not in listing_hours_list:
+                        listing_hours_list.append(candidate)
+                    i += 1
+                listing_hours_list = sorted(listing_hours_list)[:listing_times]
+            listing_hours = ",".join(str(h) for h in listing_hours_list)
+            _scheduler.add_job(
+                _run_scheduled_listing_tracking,
+                "cron",
+                hour=listing_hours,
+                minute=0,
+                id="listing_tracking_recent_weeks",
+                misfire_grace_time=300,
+            )
+            daily_upload_hours = ",".join(str(h) for h in range(0, 24, 2))
+            _scheduler.add_job(
+                _run_scheduled_daily_upload_and_report,
+                "cron",
+                hour=daily_upload_hours,
+                minute=0,
+                id="daily_upload_asin_data_and_report",
+                misfire_grace_time=300,
+            )
+            ds_interval = max(1, int(settings.DAILY_UPLOAD_DS_INTERVAL_HOURS or 2))
+            ds_next_run = None
+            if settings.ENABLE_DAILY_UPLOAD_DS_SCHEDULE:
+                daily_upload_ds_hours = ",".join(str(h) for h in range(0, 24, ds_interval))
+                _scheduler.add_job(
+                    _run_scheduled_daily_upload_ds,
+                    "cron",
+                    hour=daily_upload_ds_hours,
+                    minute=0,
+                    id="daily_upload_asin_data_ds",
+                    misfire_grace_time=300,
+                )
             _scheduler.start()
             job = _scheduler.get_job("online_sync")
             next_run = job.next_run_time if job else None
@@ -168,6 +303,13 @@ async def lifespan(app: FastAPI):
             monitor_next_run = monitor_job.next_run_time if monitor_job else None
             group_a_job = _scheduler.get_job("group_a_sync")
             group_a_next_run = group_a_job.next_run_time if group_a_job else None
+            listing_job = _scheduler.get_job("listing_tracking_recent_weeks")
+            listing_next_run = listing_job.next_run_time if listing_job else None
+            daily_upload_job = _scheduler.get_job("daily_upload_asin_data_and_report")
+            daily_upload_next_run = daily_upload_job.next_run_time if daily_upload_job else None
+            if settings.ENABLE_DAILY_UPLOAD_DS_SCHEDULE:
+                ds_job = _scheduler.get_job("daily_upload_asin_data_ds")
+                ds_next_run = ds_job.next_run_time if ds_job else None
             # 若当前为东八区命中 online sync 的小时窗口且本小时内未执行过，启动时补跑一次
             now = now_asia()
             if is_n_hour_slot(now, sync_interval) and should_run_scheduled_sync():
@@ -203,6 +345,17 @@ async def lifespan(app: FastAPI):
                     t.start()
                 except Exception as e:
                     logger.exception("[GroupA] Startup sync failed: %s", e)
+            if now.hour in listing_hours_list and should_run_listing_tracking_sync():
+                logger.info(
+                    "[ListingTracking] Startup recent-weeks sync: current hour %s matches %s — running once in background.",
+                    now.hour,
+                    listing_hours_list,
+                )
+                try:
+                    t = threading.Thread(target=_run_scheduled_listing_tracking, daemon=True)
+                    t.start()
+                except Exception as e:
+                    logger.exception("[ListingTracking] Startup recent-weeks sync failed: %s", e)
             logger.info(
                 "Scheduled sync enabled: every %sh at :00 (Asia/Shanghai), next_run_time=%s",
                 sync_interval,
@@ -218,6 +371,25 @@ async def lifespan(app: FastAPI):
                 settings.GROUP_A_SYNC_INTERVAL_HOURS,
                 group_a_next_run,
             )
+            logger.info(
+                "[ListingTracking] Scheduled sync enabled: daily_times=%s at hours=%s (Asia/Shanghai), next_run_time=%s",
+                listing_times,
+                listing_hours_list,
+                listing_next_run,
+            )
+            logger.info(
+                "[DailyUpload] Scheduled sync + report enabled: every 2h at :00 (Asia/Shanghai), next_run_time=%s",
+                daily_upload_next_run,
+            )
+            if settings.ENABLE_DAILY_UPLOAD_DS_SCHEDULE:
+                logger.info(
+                    "[DailyUploadDS] Scheduled sync enabled: every %sh at :00 (%s), next_run_time=%s",
+                    ds_interval,
+                    settings.SYNC_TIMEZONE,
+                    ds_next_run,
+                )
+            else:
+                logger.info("[DailyUploadDS] Scheduled sync disabled (enable_daily_upload_ds_schedule=false)")
         except Exception as e:
             logger.warning("Scheduled sync not started: %s", e)
             _scheduler = None
@@ -262,6 +434,7 @@ app.add_middleware(
 )
 app.include_router(asin_router)
 app.include_router(sync_router)
+app.include_router(trend_reports_router, prefix="/api/trend")
 app.add_api_route(
     "/api/trend",
     get_trend_data,
@@ -274,3 +447,28 @@ app.add_api_route(
 def health():
     logger.debug("Health check")
     return {"status": "ok"}
+
+
+@app.get("/reports/daily-upload-sessions", response_class=HTMLResponse)
+def daily_upload_sessions_report(
+    listing_since: date = DEFAULT_LISTING_SINCE,
+    session_start: Optional[date] = None,
+    session_end: Optional[date] = None,
+):
+    """
+    交互式 HTML：按店铺筛选堆叠 session 柱图；KPI 为 listing_since 以来去重 ASIN 与 active 数。
+    session_end 默认当天；session_start 默认与 listing_since 相同。
+    """
+    end_d = session_end or date.today()
+    start_d = session_start or listing_since
+    if start_d > end_d:
+        return HTMLResponse(
+            "<p>session_start 不能晚于 session_end</p>",
+            status_code=400,
+        )
+    db = SessionLocal()
+    try:
+        payload = build_report_payload(db, listing_since, start_d, end_d)
+        return render_html(payload)
+    finally:
+        db.close()

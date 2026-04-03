@@ -27,6 +27,16 @@ class Settings(BaseSettings):
     SYNC_INTERVAL_HOURS: int = Field(default=2, validation_alias="sync_interval_hours")
     MONITOR_SYNC_INTERVAL_HOURS: int = Field(default=6, validation_alias="monitor_sync_interval_hours")
     GROUP_A_SYNC_INTERVAL_HOURS: int = Field(default=4, validation_alias="group_a_sync_interval_hours")
+    # ListingTracking 定时回填：更新最近 N 周（不含当前周），按本地 listing_tracking 表内已有 pid 推导。
+    LISTING_TRACKING_RECENT_WEEKS: int = Field(
+        default=2,
+        validation_alias="listing_tracking_recent_weeks",
+    )
+    # ListingTracking 每天执行次数（>=1）；若=1 则每天 00:00 执行；若>1 则在一天内均匀分配小时点。
+    LISTING_TRACKING_DAILY_TIMES: int = Field(
+        default=1,
+        validation_alias="listing_tracking_daily_times",
+    )
     LISTING_TRACKING_WRITE_CHUNK_SIZE: int = Field(
         default=500,
         validation_alias="listing_tracking_write_chunk_size",
@@ -44,6 +54,19 @@ class Settings(BaseSettings):
         validation_alias="listing_tracking_image_model_prefixes",
     )
     SYNC_TIMEZONE: str = Field(default="Asia/Shanghai", validation_alias="sync_timezone")
+    # daily_upload_asin_data_ds 定时：listing 扫描下界（YYYY-MM-DD）；上界为东八区当日（含）
+    ENABLE_DAILY_UPLOAD_DS_SCHEDULE: bool = Field(
+        default=True,
+        validation_alias="enable_daily_upload_ds_schedule",
+    )
+    DAILY_UPLOAD_DS_INTERVAL_HOURS: int = Field(
+        default=2,
+        validation_alias="daily_upload_ds_interval_hours",
+    )
+    DAILY_UPLOAD_DS_START_DATE: str = Field(
+        default="2026-02-20",
+        validation_alias="daily_upload_ds_start_date",
+    )
 
     @property
     def database_url(self) -> str:

@@ -16,8 +16,9 @@ export default defineConfig({
       '/api': {
         target: apiTarget,
         changeOrigin: true,
-        // Group F 查询实际耗时约 5–6 分钟（Step1~109s, Step3~203s），代理需足够长
-        timeout: 420000,
+        // Group F / traffic 报表等可能数分钟；timeout=客户端 socket，proxyTimeout=等后端首包/全程（过短会红字失败且 Response 空）
+        timeout: 900000,
+        proxyTimeout: 900000,
       },
     },
   },

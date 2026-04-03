@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sessions + amazon_search_data 周 Impression + 广告 Clicks / 日 Impressions</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --text: #e8ecf1;
+      --muted: #8b9cb3;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    .wrap {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 1.75rem 1.25rem 2.5rem;
+    }
+    h1 {
+      font-weight: 600;
+      font-size: 1.35rem;
+      margin: 0 0 0.35rem;
+    }
+    .sub { color: var(--muted); font-size: 0.875rem; margin-bottom: 1rem; line-height: 1.5; }
+    .query-cutoff {
+      font-size: 0.8125rem;
+      color: #a8b8cc;
+      margin: 0 0 0.65rem;
+      letter-spacing: 0.02em;
+    }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem 1.25rem;
+      margin-bottom: 1rem;
+      padding: 0.85rem 1rem;
+      background: var(--panel);
+      border-radius: 10px;
+      border: 1px solid rgba(125, 211, 192, 0.12);
+    }
+    label { font-size: 0.8rem; color: var(--muted); }
+    select {
+      background: #243044;
+      color: var(--text);
+      border: 1px solid rgba(61, 157, 255, 0.35);
+      border-radius: 6px;
+      padding: 0.45rem 0.65rem;
+      font-size: 0.9rem;
+      min-width: 200px;
+    }
+    .chart-box {
+      background: var(--panel);
+      border-radius: 12px;
+      padding: 1rem 0.75rem 1.25rem;
+      border: 1px solid rgba(61, 157, 255, 0.1);
+    }
+    .series-toggles {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.55rem 1rem;
+      align-items: center;
+      margin-bottom: 0.75rem;
+      padding: 0.5rem 0.15rem 0.15rem;
+    }
+    .series-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      cursor: pointer;
+      font-size: 0.78rem;
+      color: var(--text);
+      user-select: none;
+      max-width: 100%;
+    }
+    .series-toggle input {
+      width: 0.95rem;
+      height: 0.95rem;
+      accent-color: #5eb8ff;
+      flex-shrink: 0;
+    }
+    .series-swatch {
+      width: 11px;
+      height: 11px;
+      border-radius: 3px;
+      flex-shrink: 0;
+      border: 1px solid rgba(255,255,255,0.15);
+    }
+    canvas { max-height: 440px; }
+    #detailPanel {
+      display: none;
+      margin-top: 1rem;
+      padding: 1rem 1.1rem;
+      background: #243044;
+      border-radius: 10px;
+      border: 1px solid rgba(255, 179, 71, 0.35);
+      font-size: 0.9rem;
+      line-height: 1.55;
+    }
+    #detailPanel h3 { margin: 0 0 0.5rem; font-size: 1rem; color: #ffb347; }
+    #detailPanel .row { margin: 0.35rem 0; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Traffic daily + amazon_search_data 周 impression + 广告 Clicks / 日 Impressions</h1>
+    <p class="query-cutoff" id="queryCutoffUtc8Line"></p>
+    <p class="sub">
+      <strong>左轴（0～500～1000…，步长 500）</strong>：<code>amazon_sales_and_traffic_daily</code> 按日 <code>SUM(sessions)</code>（绿）与 <code>amazon_ads_ad_group_ad_report</code> 按日 <code>SUM(clicks)</code>（紫）共用。<br />
+      <strong>右轴（0～1万～2万…，步长 1 万）</strong>：<code>amazon_search_data</code> 按 <code>week_no</code> 汇总<strong>整周</strong>
+      <code>SUM(impression_count)</code>（橙点，横坐标为周<strong>三</strong>，如 202609→2026-02-25）与 <code>广告日 impressions</code>（黄线）共用。<br />
+    </p>
+    <div class="toolbar">
+      <div>
+        <label for="storeSel">店铺</label><br />
+        <select id="storeSel">
+          <option value="">全部店铺（合计）</option>
+        </select>
+      </div>
+    </div>
+    <div class="chart-box">
+      <div id="seriesToggles" class="series-toggles" aria-label="折线显示"></div>
+      <canvas id="c" height="120"></canvas>
+    </div>
+    <div id="detailPanel"><h3>amazon_search_data · week_no 整周 impression 汇总</h3><div id="detailBody"></div></div>
+  </div>
+  <script>
+    var payload = {"labels":["2026-02-22","2026-02-23","2026-02-24","2026-02-25","2026-02-26","2026-02-27","2026-02-28","2026-03-01","2026-03-02","2026-03-03","2026-03-04","2026-03-05","2026-03-06","2026-03-07","2026-03-08","2026-03-09","2026-03-10","2026-03-11","2026-03-12","2026-03-13","2026-03-14","2026-03-15","2026-03-16","2026-03-17","2026-03-18","2026-03-19","2026-03-20","2026-03-21","2026-03-22","2026-03-23","2026-03-24","2026-03-25","2026-03-26","2026-03-27","2026-03-28","2026-03-29","2026-03-30","2026-03-31","2026-04-01","2026-04-02","2026-04-03"],"store_ids":[1,7,12,25],"all_data":[5511,5093,5648,5420,5174,4986,5201,6459,6314,6025,5529,4951,5921,6541,6792,5585,5474,5822,5874,5137,5588,6312,5119,5092,5520,5121,5195,5695,5854,5576,4252,4334,4488,4088,4248,4448,4214,3796,3546,null,null],"by_store":{"1":[2717,2357,2584,2396,2382,2265,2511,3180,3088,2945,2623,2309,2921,3360,3463,2748,2690,2873,2872,2474,2787,3310,2463,2423,2615,2528,2576,3094,3036,2879,2703,2837,2632,2456,2875,3157,2718,2458,2344,null,null],"7":[71,65,75,46,43,51,68,46,54,67,64,24,42,68,90,53,31,49,58,48,83,69,66,38,47,50,55,60,57,88,76,75,110,81,95,97,85,81,95,null,null],"12":[1036,994,1121,1225,1013,1050,945,1231,1250,1160,1006,945,1111,1106,1275,1099,969,1021,1145,958,981,1029,887,845,1066,886,821,802,906,891,928,1024,1388,1179,941,860,1049,869,708,null,null],"25":[1687,1677,1868,1753,1736,1620,1677,2002,1922,1853,1836,1673,1847,2007,1964,1685,1784,1879,1799,1657,1737,1904,1703,1786,1792,1657,1743,1739,1855,1718,545,398,358,372,337,334,362,388,399,null,null]},"impressionEnabled":true,"impression_all":[null,null,null,152722,null,null,null,null,null,null,203017,null,null,null,null,null,null,403959,null,null,null,null,null,null,86075,null,null,null,null,null,null,66270,null,null,null,null,null,null,null,null,null],"impression_all_meta":[null,null,null,{"weeks":[{"week_no":"202609","impressions":152722,"d_min":"2026-02-22","d_max":"2026-02-28","mid":"2026-02-25"}]},null,null,null,null,null,null,{"weeks":[{"week_no":"202610","impressions":203017,"d_min":"2026-03-01","d_max":"2026-03-07","mid":"2026-03-04"}]},null,null,null,null,null,null,{"weeks":[{"week_no":"202611","impressions":403959,"d_min":"2026-03-08","d_max":"2026-03-14","mid":"2026-03-11"}]},null,null,null,null,null,null,{"weeks":[{"week_no":"202612","impressions":86075,"d_min":"2026-03-15","d_max":"2026-03-21","mid":"2026-03-18"}]},null,null,null,null,null,null,{"weeks":[{"week_no":"202613","impressions":66270,"d_min":"2026-03-22","d_max":"2026-03-28","mid":"2026-03-25"}]},null,null,null,null,null,null,null,null,null],"impression_by_store":{"1":[null,null,null,128860,null,null,null,null,null,null,197571,null,null,null,null,null,null,338906,null,null,null,null,null,null,70511,null,null,null,null,null,null,59702,null,null,null,null,null,null,null,null,null],"7":[null,null,null,23494,null,null,null,null,null,null,5446,null,null,null,null,null,null,65053,null,null,null,null,null,null,15564,null,null,null,null,null,null,6568,null,null,null,null,null,null,null,null,null],"12":[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],"25":[null,null,null,368,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null]},"impression_meta_by_store":{"1":[null,null,null,{"weeks":[{"week_no":"202609","impressions":128860,"d_min":"2026-02-22","d_max":"2026-02-28","mid":"2026-02-25","store_id":1}]},null,null,null,null,null,null,{"weeks":[{"week_no":"202610","impressions":197571,"d_min":"2026-03-01","d_max":"2026-03-07","mid":"2026-03-04","store_id":1}]},null,null,null,null,null,null,{"weeks":[{"week_no":"202611","impressions":338906,"d_min":"2026-03-08","d_max":"2026-03-14","mid":"2026-03-11","store_id":1}]},null,null,null,null,null,null,{"weeks":[{"week_no":"202612","impressions":70511,"d_min":"2026-03-15","d_max":"2026-03-21","mid":"2026-03-18","store_id":1}]},null,null,null,null,null,null,{"weeks":[{"week_no":"202613","impressions":59702,"d_min":"2026-03-22","d_max":"2026-03-28","mid":"2026-03-25","store_id":1}]},null,null,null,null,null,null,null,null,null],"7":[null,null,null,{"weeks":[{"week_no":"202609","impressions":23494,"d_min":"2026-02-22","d_max":"2026-02-28","mid":"2026-02-25","store_id":7}]},null,null,null,null,null,null,{"weeks":[{"week_no":"202610","impressions":5446,"d_min":"2026-03-01","d_max":"2026-03-07","mid":"2026-03-04","store_id":7}]},null,null,null,null,null,null,{"weeks":[{"week_no":"202611","impressions":65053,"d_min":"2026-03-08","d_max":"2026-03-14","mid":"2026-03-11","store_id":7}]},null,null,null,null,null,null,{"weeks":[{"week_no":"202612","impressions":15564,"d_min":"2026-03-15","d_max":"2026-03-21","mid":"2026-03-18","store_id":7}]},null,null,null,null,null,null,{"weeks":[{"week_no":"202613","impressions":6568,"d_min":"2026-03-22","d_max":"2026-03-28","mid":"2026-03-25","store_id":7}]},null,null,null,null,null,null,null,null,null],"12":[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],"25":[null,null,null,{"weeks":[{"week_no":"202609","impressions":368,"d_min":"2026-02-22","d_max":"2026-02-28","mid":"2026-02-25","store_id":25}]},null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null]},"adsEnabled":true,"ads_all_data":[174,176,158,191,221,199,223,212,208,183,161,162,197,233,243,197,202,217,188,200,218,278,253,263,242,269,255,279,340,271,289,297,301,299,309,331,349,415,399,null,null],"ads_by_store":{"1":[174,176,158,191,221,199,223,212,208,183,161,162,197,233,243,197,202,217,188,200,218,278,253,263,242,269,255,279,340,271,289,297,301,299,309,331,349,415,399,null,null],"7":[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],"12":[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],"25":[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null]},"ads_impressions_all_data":[6224,5111,6073,9086,14186,12015,13145,13850,9980,10679,11638,11526,11130,15000,14544,12602,11373,10999,10441,8297,10775,13705,14973,11817,13814,14932,12371,14030,14167,13366,14213,12794,16139,16073,18778,20372,23607,21428,25395,null,null],"ads_impressions_by_store":{"1":[6224,5111,6073,9086,14186,12015,13145,13850,9980,10679,11638,11526,11130,15000,14544,12602,11373,10999,10441,8297,10775,13705,14973,11817,13814,14932,12371,14030,14167,13366,14213,12794,16139,16073,18778,20372,23607,21428,25395,null,null],"7":[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],"12":[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],"25":[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null]},"queryCutoffUtc8":"2026-04-03 15-59-27"};
+    (function fillQueryCutoff() {
+      var el = document.getElementById('queryCutoffUtc8Line');
+      var t = payload.queryCutoffUtc8;
+      if (el && t) {
+        el.textContent = '数据查询截止时间（UTC+8）：' + t;
+      }
+    })();
+    var labels = payload.labels;
+    var allData = payload.all_data;
+    var byStore = payload.by_store;
+    var storeIds = payload.store_ids || [];
+    var impOn = payload.impressionEnabled;
+    var impAll = payload.impression_all || [];
+    var impAllMeta = payload.impression_all_meta || [];
+    var impByStore = payload.impression_by_store || {};
+    var impMetaByStore = payload.impression_meta_by_store || {};
+    var adsOn = payload.adsEnabled;
+    var adsAll = payload.ads_all_data || [];
+    var adsByStore = payload.ads_by_store || {};
+    var adsImpAll = payload.ads_impressions_all_data || [];
+    var adsImpByStore = payload.ads_impressions_by_store || {};
+
+    var idxSessions = 0;
+    var idxImp = impOn ? 1 : -1;
+    var idxAdsClicks = adsOn ? (impOn ? 2 : 1) : -1;
+    var idxAdsImp = adsOn ? (impOn ? 3 : 2) : -1;
+
+    var sel = document.getElementById('storeSel');
+    storeIds.forEach(function (sid) {
+      var o = document.createElement('option');
+      o.value = String(sid);
+      o.textContent = (sid === -1 || sid === '-1')
+        ? 'store_id 为空（仅广告）'
+        : ('store_id = ' + sid);
+      sel.appendChild(o);
+    });
+
+    var panel = document.getElementById('detailPanel');
+    var detailBody = document.getElementById('detailBody');
+
+    function currentImpressionSeries() {
+      var v = sel.value;
+      if (!impOn) return { data: [], meta: [] };
+      if (!v) return { data: impAll, meta: impAllMeta };
+      return {
+        data: impByStore[v] || labels.map(function () { return null; }),
+        meta: impMetaByStore[v] || labels.map(function () { return null; })
+      };
+    }
+
+    function hideDetail() {
+      panel.style.display = 'none';
+      detailBody.innerHTML = '';
+    }
+
+    function showDetail(meta) {
+      if (!meta || !meta.weeks || !meta.weeks.length) return;
+      var html = '';
+      meta.weeks.forEach(function (w) {
+        html += '<div class="row"><strong>week_no</strong> ' + escapeHtml(String(w.week_no));
+        if (w.store_id != null) html += ' · store_id ' + escapeHtml(String(w.store_id));
+        html += '</div>';
+        html += '<div class="row">impressions: <strong>' + Number(w.impressions).toLocaleString() + '</strong></div>';
+        html += '<hr style="border:none;border-top:1px solid rgba(255,255,255,0.12);margin:0.6rem 0"/>';
+      });
+      detailBody.innerHTML = html;
+      panel.style.display = 'block';
+    }
+
+    function escapeHtml(s) {
+      if (s == null) return '';
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    var impSeries = currentImpressionSeries();
+    var ctx = document.getElementById('c').getContext('2d');
+    var chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [
+          {
+            label: 'Sessions（左轴）',
+            data: allData,
+            yAxisID: 'y',
+            borderColor: '#7dd3c0',
+            backgroundColor: 'rgba(125, 211, 192, 0.12)',
+            fill: true,
+            spanGaps: false,
+            tension: 0.22,
+            pointRadius: 2,
+            pointHoverRadius: 5,
+            borderWidth: 2,
+            order: 2,
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: true,
+        interaction: { mode: 'nearest', intersect: true },
+        onClick: function (ev, els, ch) {
+          if (!els.length) return;
+          var el = els[0];
+          if (el.datasetIndex !== idxImp || idxImp < 0) return;
+          if (!ch.isDatasetVisible(idxImp)) return;
+          var ix = el.index;
+          var meta = null;
+          try {
+            var is = currentImpressionSeries();
+            meta = (is && is.meta && is.meta[ix]) ? is.meta[ix] : null;
+          } catch (e) {
+            meta = null;
+          }
+          if (meta) showDetail(meta);
+        },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              label: function (ctx) {
+                var v = ctx.parsed.y;
+                if (v == null) return '';
+                if (ctx.dataset.yAxisID === 'y1') {
+                  if (idxAdsImp >= 0 && ctx.datasetIndex === idxAdsImp)
+                    return ' 广告 impressions（日）: ' + Number(v).toLocaleString();
+                  var line = ' 自然 impression（week_no）: ' + Number(v).toLocaleString();
+                  if (idxImp >= 0 && ctx.datasetIndex === idxImp && ctx.dataset._impressionMeta) {
+                    var m = ctx.dataset._impressionMeta[ctx.dataIndex];
+                    if (m && m.weeks && m.weeks.length)
+                      line += ' [' + m.weeks.map(function (w) { return w.week_no; }).join(', ') + ']';
+                  }
+                  return line;
+                }
+                if (ctx.dataset.yAxisID === 'y') {
+                  if (idxAdsClicks >= 0 && ctx.datasetIndex === idxAdsClicks)
+                    return ' 广告 sessions: ' + Number(v).toLocaleString();
+                  return ' sessions: ' + Number(v).toLocaleString();
+                }
+                return '';
+              },
+            },
+          },
+        },
+        scales: {
+          x: {
+            ticks: { color: '#8b9cb3', maxRotation: 45 },
+            grid: { color: 'rgba(139, 156, 179, 0.08)' },
+          },
+          y: {
+            id: 'y',
+            type: 'linear',
+            position: 'left',
+            beginAtZero: true,
+            title: { display: true, text: 'Sessions + 广告 Sessions', color: '#8b9cb3' },
+            ticks: {
+              color: '#8b9cb3',
+              stepSize: 500,
+              callback: function (v) { return Number(v).toLocaleString(); },
+            },
+            grid: { color: 'rgba(139, 156, 179, 0.1)' },
+          },
+          y1: {
+            id: 'y1',
+            type: 'linear',
+            position: 'right',
+            beginAtZero: true,
+            display: true,
+            title: { display: true, text: '周 + 广告日 Impressions（步长 1 万）', color: '#c9b896' },
+            ticks: {
+              color: '#c9b896',
+              stepSize: 10000,
+              callback: function (v) { return Number(v).toLocaleString(); },
+            },
+            grid: { drawOnChartArea: false },
+          },
+        },
+      },
+    });
+
+    if (impOn) {
+      var dsImp = {
+        label: '自然 impression · week_no（右轴，点=周三）',
+        data: impSeries.data,
+        yAxisID: 'y1',
+        borderColor: '#ffb347',
+        backgroundColor: 'rgba(255, 179, 71, 0.15)',
+        fill: false,
+        tension: 0.2,
+        spanGaps: false,
+        pointRadius: 6,
+        pointHoverRadius: 9,
+        pointBackgroundColor: '#ffb347',
+        pointBorderColor: '#1a2332',
+        pointBorderWidth: 2,
+        borderWidth: 2,
+        order: 1,
+      };
+      dsImp._impressionMeta = impSeries.meta;
+      chart.data.datasets.push(dsImp);
+    }
+    if (adsOn) {
+      chart.data.datasets.push({
+        label: '广告 sessions（全部店铺合计，左轴）',
+        data: adsAll,
+        yAxisID: 'y',
+        borderColor: '#e879f9',
+        backgroundColor: 'rgba(232, 121, 249, 0.08)',
+        fill: false,
+        tension: 0.22,
+          spanGaps: false,
+        pointRadius: 3,
+        pointHoverRadius: 6,
+        pointBackgroundColor: '#e879f9',
+        pointBorderColor: '#1a2332',
+        pointBorderWidth: 1,
+        borderWidth: 2,
+        order: 2,
+      });
+      chart.data.datasets.push({
+        label: '广告 impressions 日汇总（全部店铺，右轴）',
+        data: adsImpAll,
+        yAxisID: 'y1',
+        borderColor: '#f5d547',
+        backgroundColor: 'rgba(245, 213, 71, 0.06)',
+        fill: false,
+        tension: 0.22,
+        spanGaps: false,
+        pointRadius: 3,
+        pointHoverRadius: 6,
+        pointBackgroundColor: '#f5d547',
+        pointBorderColor: '#1a2332',
+        pointBorderWidth: 1,
+        borderWidth: 2,
+        order: 3,
+      });
+    }
+    chart.update();
+
+    function syncY1AxisDisplay() {
+      var show = false;
+      for (var i = 0; i < chart.data.datasets.length; i++) {
+        if (chart.data.datasets[i].yAxisID === 'y1' && chart.isDatasetVisible(i)) {
+          show = true;
+          break;
+        }
+      }
+      chart.options.scales.y1.display = show;
+    }
+
+    function buildSeriesToggles() {
+      var host = document.getElementById('seriesToggles');
+      if (!host) return;
+      host.innerHTML = '';
+      var specs = [
+        { key: 'sess', idx: idxSessions, shortLabel: 'Sessions（左轴）', color: '#7dd3c0' },
+      ];
+      if (impOn && idxImp >= 0) {
+        specs.push({ key: 'imp', idx: idxImp, shortLabel: '自然 impression · week_no（右轴·周三）', color: '#ffb347' });
+      }
+      if (adsOn && idxAdsClicks >= 0) {
+        specs.push({ key: 'adclk', idx: idxAdsClicks, shortLabel: '广告 sessions（左轴）', color: '#e879f9' });
+      }
+      if (adsOn && idxAdsImp >= 0) {
+        specs.push({ key: 'adimp', idx: idxAdsImp, shortLabel: '广告 impressions 日汇总（右轴）', color: '#f5d547' });
+      }
+      specs.forEach(function (s) {
+        var lab = document.createElement('label');
+        lab.className = 'series-toggle';
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        // 默认全选：未勾选时隐藏对应折线
+        cb.checked = true;
+        cb.setAttribute('data-dataset-index', String(s.idx));
+        var sw = document.createElement('span');
+        sw.className = 'series-swatch';
+        sw.style.background = s.color;
+        var tx = document.createElement('span');
+        tx.textContent = s.shortLabel;
+        lab.appendChild(cb);
+        lab.appendChild(sw);
+        lab.appendChild(tx);
+        cb.addEventListener('change', function () {
+          chart.setDatasetVisibility(s.idx, cb.checked);
+          if (!cb.checked && s.idx === idxImp) hideDetail();
+          syncY1AxisDisplay();
+          chart.update();
+        });
+        host.appendChild(lab);
+      });
+    }
+
+    buildSeriesToggles();
+    syncY1AxisDisplay();
+    chart.update();
+
+    function applyStore() {
+      hideDetail();
+      var v = sel.value;
+      var ds0 = chart.data.datasets[idxSessions];
+      if (!v) {
+        ds0.label = 'Sessions（全部店铺合计）';
+        ds0.data = allData;
+        ds0.borderColor = '#7dd3c0';
+        ds0.backgroundColor = 'rgba(125, 211, 192, 0.12)';
+      } else {
+        ds0.label = (v === '-1')
+          ? 'store_id 为空（sessions 无此桶，折线为 0）'
+          : ('store_id ' + v + ' sessions');
+        ds0.data = byStore[v] || labels.map(function () { return null; });
+        ds0.borderColor = '#3d9dff';
+        ds0.backgroundColor = 'rgba(61, 157, 255, 0.12)';
+      }
+      if (impOn && idxImp >= 0) {
+        var is = currentImpressionSeries();
+        chart.data.datasets[idxImp].data = is.data;
+        chart.data.datasets[idxImp]._impressionMeta = is.meta;
+      }
+      if (adsOn && idxAdsClicks >= 0) {
+        var adData = !v ? adsAll : (adsByStore[v] || labels.map(function () { return null; }));
+        var adsDs = chart.data.datasets[idxAdsClicks];
+        adsDs.data = adData;
+        adsDs.label = !v
+          ? '广告 sessions'
+          : ((v === '-1')
+            ? '广告 sessions'
+            : ('store_id ' + v + ' 广告 sessions'));
+      }
+      if (adsOn && idxAdsImp >= 0) {
+        var impD = !v ? adsImpAll : (adsImpByStore[v] || labels.map(function () { return null; }));
+        var impDs = chart.data.datasets[idxAdsImp];
+        impDs.data = impD;
+        impDs.label = !v
+          ? '广告 impressions 日汇总（全部店铺，右轴）'
+          : ((v === '-1')
+            ? '广告 impressions（store_id 为空，右轴）'
+            : ('store_id ' + v + ' 广告 impressions 日（右轴）'));
+      }
+      syncY1AxisDisplay();
+      chart.update();
+    }
+    sel.addEventListener('change', applyStore);
+  </script>
+</body>
+</html>

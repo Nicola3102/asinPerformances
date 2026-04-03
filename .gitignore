@@ -16,6 +16,9 @@ venv/
 backend/app/log/
 backend/app/.last_sync_run
 
+# Trend HTML disk cache (GET /api/trend/session-impression)
+backend/charts/.cache/
+
 # Node / frontend (keep in sync with frontend/.gitignore)
 node_modules/
 frontend/dist/

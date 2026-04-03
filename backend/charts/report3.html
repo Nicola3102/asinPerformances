@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>每日上新 Session 报表</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; }
+    :root { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif; }
+    body {
+      margin: 0;
+      padding: clamp(10px, 2.5vw, 24px);
+      padding-bottom: max(clamp(10px, 2.5vw, 24px), env(safe-area-inset-bottom));
+      background: #f4f4f5;
+      color: #18181b;
+      min-height: 100dvh;
+      max-width: 100vw;
+      overflow-x: hidden;
+    }
+    .page {
+      width: 100%;
+      max-width: min(1280px, 100%);
+      margin: 0 auto;
+    }
+    h1 { font-size: clamp(1.05rem, 3.5vw, 1.35rem); margin: 0 0 10px; line-height: 1.3; }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: clamp(10px, 2vw, 16px);
+      align-items: flex-start;
+      margin-bottom: 16px;
+    }
+    .row > div:first-child { flex: 0 1 auto; }
+    #rangeHint {
+      flex: 1 1 200px;
+      min-width: 0;
+      word-break: break-word;
+    }
+    label { font-size: clamp(0.8rem, 2.2vw, 0.875rem); color: #52525b; }
+    select {
+      padding: 8px 12px;
+      border-radius: 8px;
+      border: 1px solid #d4d4d8;
+      min-width: 0;
+      width: 100%;
+      max-width: min(360px, 100%);
+      font-size: max(16px, 0.9rem);
+    }
+    .kpi {
+      display: flex;
+      flex-wrap: wrap;
+      gap: clamp(12px, 2vw, 20px);
+      margin-bottom: 20px;
+    }
+    .kpi-card {
+      background: #fff;
+      border-radius: 12px;
+      padding: clamp(12px, 2.5vw, 18px) clamp(14px, 3vw, 20px);
+      box-shadow: 0 1px 3px rgb(0 0 0 / 0.08);
+      flex: 1 1 240px;
+      min-width: min(100%, 200px);
+      max-width: 100%;
+    }
+    .kpi-card strong {
+      display: block;
+      font-size: clamp(1.35rem, 5vw, 1.75rem);
+      margin-top: 4px;
+      word-break: break-all;
+    }
+    .muted {
+      font-size: clamp(0.72rem, 2vw, 0.8rem);
+      color: #71717a;
+      margin-top: 4px;
+      line-height: 1.45;
+    }
+    .chart-wrap {
+      background: #fff;
+      border-radius: 12px;
+      padding: clamp(12px, 2.5vw, 18px);
+      box-shadow: 0 1px 3px rgb(0 0 0 / 0.08);
+      width: 100%;
+      max-width: 100%;
+    }
+    .chart-canvas-box {
+      position: relative;
+      width: 100%;
+      height: clamp(220px, 38vh, 520px);
+      min-height: 200px;
+      max-height: 70vh;
+    }
+    .chart-canvas-box canvas {
+      display: block;
+      width: 100% !important;
+      height: 100% !important;
+    }
+    .table-wrap {
+      margin-top: clamp(14px, 3vw, 22px);
+      width: 100%;
+      max-width: 100%;
+      border-radius: 12px;
+      box-shadow: 0 1px 3px rgb(0 0 0 / 0.08);
+      background: #fff;
+      padding: clamp(12px, 2.5vw, 18px);
+    }
+    .table-wrap h2 {
+      font-size: clamp(0.88rem, 2.8vw, 1rem);
+      margin: 0 0 12px;
+      font-weight: 600;
+      line-height: 1.35;
+    }
+    .table-scroll {
+      overflow-x: auto;
+      overflow-y: visible;
+      max-width: 100%;
+      -webkit-overflow-scrolling: touch;
+      margin: 0 -4px;
+      padding: 0 4px;
+    }
+    #cohortTbl { border-collapse: collapse; font-size: clamp(9px, 2.1vw, 11px); width: max-content; min-width: 100%; }
+    #cohortTbl th, #cohortTbl td {
+      border: 1px solid #e4e4e7;
+      padding: 3px clamp(4px, 1.2vw, 8px);
+      text-align: right;
+      white-space: nowrap;
+    }
+    #cohortTbl th:nth-child(1), #cohortTbl td:nth-child(1),
+    #cohortTbl th:nth-child(2), #cohortTbl td:nth-child(2) { text-align: left; }
+    #cohortTbl thead th { background: #f4f4f5; position: sticky; top: 0; z-index: 1; }
+    #cohortTbl tbody tr:nth-child(even) { background: #fafafa; }
+    @media (max-width: 480px) {
+      .kpi-card { flex-basis: 100%; }
+    }
+    .chart-tooltip-external {
+      position: fixed;
+      z-index: 10050;
+      max-width: min(92vw, 440px);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      background: rgba(28, 28, 30, 0.97);
+      color: #fafafa;
+      border-radius: 10px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.38);
+      font-size: 12px;
+      line-height: 1.45;
+      pointer-events: auto;
+    }
+    .chart-tooltip-external-title {
+      font-weight: 600;
+      padding: 10px 12px 8px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+      flex-shrink: 0;
+    }
+    .chart-tooltip-external-scroll {
+      overflow-y: auto;
+      overflow-x: hidden;
+      -webkit-overflow-scrolling: touch;
+      padding: 8px 12px 12px;
+      max-height: min(62vh, 500px);
+    }
+    .chart-tooltip-external-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      margin: 5px 0;
+    }
+    .chart-tooltip-external-row .swatch {
+      width: 12px;
+      height: 12px;
+      border-radius: 2px;
+      flex-shrink: 0;
+      margin-top: 3px;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+    }
+    .chart-tooltip-external-row .txt {
+      flex: 1;
+      min-width: 0;
+      word-break: break-word;
+    }
+    .chart-tooltip-external-sep { opacity: 0.55; margin: 10px 0 6px; font-size: 11px; }
+    .chart-tooltip-external-footer { font-size: 11px; }
+    .chart-tooltip-external-sub { margin-top: 3px; opacity: 0.92; }
+  </style>
+</head>
+<body>
+<div class="page">
+  <h1>每日上新 Session（按批次堆叠）</h1>
+  <div class="row">
+    <div>
+      <label for="storeSel">店铺</label><br/>
+      <select id="storeSel"></select>
+    </div>
+    <div class="muted" id="rangeHint"></div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-card">
+      <span>自 <span id="sinceLbl"></span> 起上新 ASIN 总数</span>
+      <strong id="kpiTotal">—</strong>
+      <div class="muted">amazon_listing 行数，不按 ASIN/店铺去重 · 详见下方说明</div>
+    </div>
+    <div class="kpi-card">
+      <span>其中 Active（listing status=active）</span>
+      <strong id="kpiActive">—</strong>
+      <div class="muted">该 ASIN 在 listing 中至少一条为 active</div>
+    </div>
+  </div>
+  <p class="muted" id="kpiSourceHint" style="margin-bottom:16px"></p>
+  <div class="chart-wrap">
+    <p class="muted" style="margin-top:0">柱形为各上新批次贡献的 sessions 堆叠；黑色折线为每日 sessions 合计。悬停主列表中各批次数字为 amazon_listing 该批次日的 listing 行数 COUNT(*)；底部为当日 session 明细与合计。</p>
+    <p id="noData" class="muted" style="display:none"></p>
+    <div class="chart-canvas-box"><canvas id="ch"></canvas></div>
+  </div>
+
+  <div class="table-wrap" id="cohortTableWrap">
+    <h2>批次上新 ASIN 的 30 日 session 变化（listing 定 ASIN，本地表取 session）</h2>
+    <p class="muted" style="margin:0 0 10px" id="cohortTableHint"></p>
+    <div class="table-scroll">
+      <table id="cohortTbl"></table>
+    </div>
+  </div>
+
+  <script type="application/json" id="payload">{"generatedAt": "2026-04-01", "listingSince": "2026-02-20", "listingThrough": "2026-04-01", "sessionRequestedStart": "2026-02-20", "sessionRequestedEnd": "2026-04-01", "sessionChartStart": "2026-02-20", "sessionChartEnd": "2026-04-01", "chartRangeAutoExpanded": false, "localSessionMin": "2026-02-22", "localSessionMax": "2026-03-30", "storeIds": [1, 7, 12, 25], "views": {"all": {"key": "all", "storeId": null, "labels": ["2026-02-22", "2026-02-23", "2026-02-24", "2026-02-25", "2026-02-26", "2026-02-27", "2026-02-28", "2026-03-01", "2026-03-02", "2026-03-03", "2026-03-04", "2026-03-05", "2026-03-06", "2026-03-07", "2026-03-08", "2026-03-09", "2026-03-10", "2026-03-11", "2026-03-12", "2026-03-13", "2026-03-14", "2026-03-15", "2026-03-16", "2026-03-17", "2026-03-18", "2026-03-19", "2026-03-20", "2026-03-21", "2026-03-22", "2026-03-23", "2026-03-24", "2026-03-25", "2026-03-26", "2026-03-27", "2026-03-28", "2026-03-29", "2026-03-30"], "cohortLabels": ["2026-02-20", "2026-02-21", "2026-02-28", "2026-03-01", "2026-03-05", "2026-03-06", "2026-03-07", "2026-03-11", "2026-03-13", "2026-03-16", "2026-03-19", "2026-03-20", "2026-03-21", "2026-03-25"], "datasets": [{"type": "bar", "label": "批次 2026-02-20", "data": [8, 35, 69, 97, 108, 117, 130, 182, 121, 157, 170, 69, 107, 140, 135, 86, 31, 24, 34, 20, 15, 17, 13, 13, 16, 21, 13, 25, 10, 0, 0, 0, 0, 0, 0, 0, 0], "backgroundColor": "#1f77b4", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-02-21", "data": [9, 19, 149, 111, 174, 155, 228, 166, 173, 190, 179, 146, 161, 146, 169, 116, 46, 53, 32, 29, 26, 20, 41, 32, 30, 21, 18, 7, 10, 17, 0, 0, 0, 0, 0, 0, 0], "backgroundColor": "#ff7f0e", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-02-28", "data": [0, 0, 0, 0, 0, 0, 25, 9, 23, 17, 61, 53, 83, 151, 99, 134, 230, 293, 168, 175, 141, 184, 137, 42, 44, 53, 42, 29, 37, 221, 51, 34, 26, 18, 22, 36, 24], "backgroundColor": "#2ca02c", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-01", "data": [0, 0, 0, 0, 0, 0, 0, 0, 3, 2, 6, 4, 7, 4, 6, 9, 27, 13, 14, 12, 11, 15, 6, 2, 14, 2, 0, 2, 4, 18, 3, 0, 0, 3, 1, 7, 0], "backgroundColor": "#d62728", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-05", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 3, 1, 1, 1, 1, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0], "backgroundColor": "#9467bd", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-06", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 6, 29, 51, 154, 211, 218, 212, 181, 181, 148, 63, 91, 52, 44, 18, 18, 105, 21, 27, 24, 27, 19, 25, 18], "backgroundColor": "#8c564b", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-07", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 3, 23, 10, 22, 22, 21, 9, 5, 31, 3, 4, 0, 8, 0, 7, 2, 0, 2, 0, 2, 1, 1], "backgroundColor": "#e377c2", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-11", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "backgroundColor": "#7f7f7f", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-13", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 10, 12, 51, 159, 163, 167, 217, 224, 321, 157, 61, 24, 13, 12, 7, 22, 14], "backgroundColor": "#bcbd22", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-16", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 141, 157, 155, 120, 177, 191, 205, 142, 190, 168, 187, 153, 196, 181, 166], "backgroundColor": "#17becf", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-19", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 6, 6, 5, 16, 11, 24, 22, 17, 18, 22, 23], "backgroundColor": "#aec7e8", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-20", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 4, 53, 108, 140, 130, 169, 130, 178, 138], "backgroundColor": "#ffbb78", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-21", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 38, 64, 98, 80, 97, 85, 113, 66], "backgroundColor": "#98df8a", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-25", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 77, 75, 102, 96, 73, 110], "backgroundColor": "#ff9896", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}], "lineTotal": [17, 54, 218, 208, 282, 272, 383, 357, 320, 366, 416, 273, 368, 447, 442, 400, 511, 604, 493, 479, 405, 439, 545, 500, 517, 449, 519, 515, 615, 774, 512, 592, 559, 598, 576, 658, 560], "byDay": [{"sessionDate": "2026-02-22", "totalSessions": 17, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 9}, {"cohort": "2026-02-20", "sessions": 8}]}, {"sessionDate": "2026-02-23", "totalSessions": 54, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-20", "sessions": 35}, {"cohort": "2026-02-21", "sessions": 19}]}, {"sessionDate": "2026-02-24", "totalSessions": 218, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 149}, {"cohort": "2026-02-20", "sessions": 69}]}, {"sessionDate": "2026-02-25", "totalSessions": 208, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 111}, {"cohort": "2026-02-20", "sessions": 97}]}, {"sessionDate": "2026-02-26", "totalSessions": 282, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 174}, {"cohort": "2026-02-20", "sessions": 108}]}, {"sessionDate": "2026-02-27", "totalSessions": 272, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 155}, {"cohort": "2026-02-20", "sessions": 117}]}, {"sessionDate": "2026-02-28", "totalSessions": 383, "newAsinCount": 706966, "cohortParts": [{"cohort": "2026-02-21", "sessions": 228}, {"cohort": "2026-02-20", "sessions": 130}, {"cohort": "2026-02-28", "sessions": 25}]}, {"sessionDate": "2026-03-01", "totalSessions": 357, "newAsinCount": 60816, "cohortParts": [{"cohort": "2026-02-20", "sessions": 182}, {"cohort": "2026-02-21", "sessions": 166}, {"cohort": "2026-02-28", "sessions": 9}]}, {"sessionDate": "2026-03-02", "totalSessions": 320, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 173}, {"cohort": "2026-02-20", "sessions": 121}, {"cohort": "2026-02-28", "sessions": 23}, {"cohort": "2026-03-01", "sessions": 3}]}, {"sessionDate": "2026-03-03", "totalSessions": 366, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 190}, {"cohort": "2026-02-20", "sessions": 157}, {"cohort": "2026-02-28", "sessions": 17}, {"cohort": "2026-03-01", "sessions": 2}]}, {"sessionDate": "2026-03-04", "totalSessions": 416, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 179}, {"cohort": "2026-02-20", "sessions": 170}, {"cohort": "2026-02-28", "sessions": 61}, {"cohort": "2026-03-01", "sessions": 6}]}, {"sessionDate": "2026-03-05", "totalSessions": 273, "newAsinCount": 1, "cohortParts": [{"cohort": "2026-02-21", "sessions": 146}, {"cohort": "2026-02-20", "sessions": 69}, {"cohort": "2026-02-28", "sessions": 53}, {"cohort": "2026-03-01", "sessions": 4}, {"cohort": "2026-03-05", "sessions": 1}]}, {"sessionDate": "2026-03-06", "totalSessions": 368, "newAsinCount": 657836, "cohortParts": [{"cohort": "2026-02-21", "sessions": 161}, {"cohort": "2026-02-20", "sessions": 107}, {"cohort": "2026-02-28", "sessions": 83}, {"cohort": "2026-03-06", "sessions": 10}, {"cohort": "2026-03-01", "sessions": 7}]}, {"sessionDate": "2026-03-07", "totalSessions": 447, "newAsinCount": 94188, "cohortParts": [{"cohort": "2026-02-28", "sessions": 151}, {"cohort": "2026-02-21", "sessions": 146}, {"cohort": "2026-02-20", "sessions": 140}, {"cohort": "2026-03-06", "sessions": 6}, {"cohort": "2026-03-01", "sessions": 4}]}, {"sessionDate": "2026-03-08", "totalSessions": 442, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 169}, {"cohort": "2026-02-20", "sessions": 135}, {"cohort": "2026-02-28", "sessions": 99}, {"cohort": "2026-03-06", "sessions": 29}, {"cohort": "2026-03-01", "sessions": 6}, {"cohort": "2026-03-07", "sessions": 3}, {"cohort": "2026-03-05", "sessions": 1}]}, {"sessionDate": "2026-03-09", "totalSessions": 400, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-28", "sessions": 134}, {"cohort": "2026-02-21", "sessions": 116}, {"cohort": "2026-02-20", "sessions": 86}, {"cohort": "2026-03-06", "sessions": 51}, {"cohort": "2026-03-01", "sessions": 9}, {"cohort": "2026-03-07", "sessions": 3}, {"cohort": "2026-03-05", "sessions": 1}]}, {"sessionDate": "2026-03-10", "totalSessions": 511, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-28", "sessions": 230}, {"cohort": "2026-03-06", "sessions": 154}, {"cohort": "2026-02-21", "sessions": 46}, {"cohort": "2026-02-20", "sessions": 31}, {"cohort": "2026-03-01", "sessions": 27}, {"cohort": "2026-03-07", "sessions": 23}]}, {"sessionDate": "2026-03-11", "totalSessions": 604, "newAsinCount": 168, "cohortParts": [{"cohort": "2026-02-28", "sessions": 293}, {"cohort": "2026-03-06", "sessions": 211}, {"cohort": "2026-02-21", "sessions": 53}, {"cohort": "2026-02-20", "sessions": 24}, {"cohort": "2026-03-01", "sessions": 13}, {"cohort": "2026-03-07", "sessions": 10}]}, {"sessionDate": "2026-03-12", "totalSessions": 493, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-06", "sessions": 218}, {"cohort": "2026-02-28", "sessions": 168}, {"cohort": "2026-02-20", "sessions": 34}, {"cohort": "2026-02-21", "sessions": 32}, {"cohort": "2026-03-07", "sessions": 22}, {"cohort": "2026-03-01", "sessions": 14}, {"cohort": "2026-03-11", "sessions": 5}]}, {"sessionDate": "2026-03-13", "totalSessions": 479, "newAsinCount": 753294, "cohortParts": [{"cohort": "2026-03-06", "sessions": 212}, {"cohort": "2026-02-28", "sessions": 175}, {"cohort": "2026-02-21", "sessions": 29}, {"cohort": "2026-03-07", "sessions": 22}, {"cohort": "2026-02-20", "sessions": 20}, {"cohort": "2026-03-01", "sessions": 12}, {"cohort": "2026-03-13", "sessions": 9}]}, {"sessionDate": "2026-03-14", "totalSessions": 405, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-06", "sessions": 181}, {"cohort": "2026-02-28", "sessions": 141}, {"cohort": "2026-02-21", "sessions": 26}, {"cohort": "2026-03-07", "sessions": 21}, {"cohort": "2026-02-20", "sessions": 15}, {"cohort": "2026-03-01", "sessions": 11}, {"cohort": "2026-03-13", "sessions": 10}]}, {"sessionDate": "2026-03-15", "totalSessions": 439, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-28", "sessions": 184}, {"cohort": "2026-03-06", "sessions": 181}, {"cohort": "2026-02-21", "sessions": 20}, {"cohort": "2026-02-20", "sessions": 17}, {"cohort": "2026-03-01", "sessions": 15}, {"cohort": "2026-03-13", "sessions": 12}, {"cohort": "2026-03-07", "sessions": 9}, {"cohort": "2026-03-05", "sessions": 1}]}, {"sessionDate": "2026-03-16", "totalSessions": 545, "newAsinCount": 55, "cohortParts": [{"cohort": "2026-03-06", "sessions": 148}, {"cohort": "2026-03-16", "sessions": 141}, {"cohort": "2026-02-28", "sessions": 137}, {"cohort": "2026-03-13", "sessions": 51}, {"cohort": "2026-02-21", "sessions": 41}, {"cohort": "2026-02-20", "sessions": 13}, {"cohort": "2026-03-01", "sessions": 6}, {"cohort": "2026-03-07", "sessions": 5}, {"cohort": "2026-03-05", "sessions": 3}]}, {"sessionDate": "2026-03-17", "totalSessions": 500, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-13", "sessions": 159}, {"cohort": "2026-03-16", "sessions": 157}, {"cohort": "2026-03-06", "sessions": 63}, {"cohort": "2026-02-28", "sessions": 42}, {"cohort": "2026-02-21", "sessions": 32}, {"cohort": "2026-03-07", "sessions": 31}, {"cohort": "2026-02-20", "sessions": 13}, {"cohort": "2026-03-01", "sessions": 2}, {"cohort": "2026-03-05", "sessions": 1}]}, {"sessionDate": "2026-03-18", "totalSessions": 517, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-13", "sessions": 163}, {"cohort": "2026-03-16", "sessions": 155}, {"cohort": "2026-03-06", "sessions": 91}, {"cohort": "2026-02-28", "sessions": 44}, {"cohort": "2026-02-21", "sessions": 30}, {"cohort": "2026-02-20", "sessions": 16}, {"cohort": "2026-03-01", "sessions": 14}, {"cohort": "2026-03-07", "sessions": 3}, {"cohort": "2026-03-05", "sessions": 1}]}, {"sessionDate": "2026-03-19", "totalSessions": 449, "newAsinCount": 10, "cohortParts": [{"cohort": "2026-03-13", "sessions": 167}, {"cohort": "2026-03-16", "sessions": 120}, {"cohort": "2026-02-28", "sessions": 53}, {"cohort": "2026-03-06", "sessions": 52}, {"cohort": "2026-02-20", "sessions": 21}, {"cohort": "2026-02-21", "sessions": 21}, {"cohort": "2026-03-19", "sessions": 8}, {"cohort": "2026-03-07", "sessions": 4}, {"cohort": "2026-03-01", "sessions": 2}, {"cohort": "2026-03-05", "sessions": 1}]}, {"sessionDate": "2026-03-20", "totalSessions": 519, "newAsinCount": 415034, "cohortParts": [{"cohort": "2026-03-13", "sessions": 217}, {"cohort": "2026-03-16", "sessions": 177}, {"cohort": "2026-03-06", "sessions": 44}, {"cohort": "2026-02-28", "sessions": 42}, {"cohort": "2026-02-21", "sessions": 18}, {"cohort": "2026-02-20", "sessions": 13}, {"cohort": "2026-03-19", "sessions": 6}, {"cohort": "2026-03-05", "sessions": 1}, {"cohort": "2026-03-20", "sessions": 1}]}, {"sessionDate": "2026-03-21", "totalSessions": 515, "newAsinCount": 417720, "cohortParts": [{"cohort": "2026-03-13", "sessions": 224}, {"cohort": "2026-03-16", "sessions": 191}, {"cohort": "2026-02-28", "sessions": 29}, {"cohort": "2026-02-20", "sessions": 25}, {"cohort": "2026-03-06", "sessions": 18}, {"cohort": "2026-03-07", "sessions": 8}, {"cohort": "2026-02-21", "sessions": 7}, {"cohort": "2026-03-19", "sessions": 6}, {"cohort": "2026-03-01", "sessions": 2}, {"cohort": "2026-03-05", "sessions": 2}, {"cohort": "2026-03-21", "sessions": 2}, {"cohort": "2026-03-20", "sessions": 1}]}, {"sessionDate": "2026-03-22", "totalSessions": 615, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-13", "sessions": 321}, {"cohort": "2026-03-16", "sessions": 205}, {"cohort": "2026-02-28", "sessions": 37}, {"cohort": "2026-03-06", "sessions": 18}, {"cohort": "2026-02-20", "sessions": 10}, {"cohort": "2026-02-21", "sessions": 10}, {"cohort": "2026-03-19", "sessions": 5}, {"cohort": "2026-03-01", "sessions": 4}, {"cohort": "2026-03-20", "sessions": 4}, {"cohort": "2026-03-21", "sessions": 1}]}, {"sessionDate": "2026-03-23", "totalSessions": 774, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-28", "sessions": 221}, {"cohort": "2026-03-13", "sessions": 157}, {"cohort": "2026-03-16", "sessions": 142}, {"cohort": "2026-03-06", "sessions": 105}, {"cohort": "2026-03-20", "sessions": 53}, {"cohort": "2026-03-21", "sessions": 38}, {"cohort": "2026-03-01", "sessions": 18}, {"cohort": "2026-02-21", "sessions": 17}, {"cohort": "2026-03-19", "sessions": 16}, {"cohort": "2026-03-07", "sessions": 7}]}, {"sessionDate": "2026-03-24", "totalSessions": 512, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-16", "sessions": 190}, {"cohort": "2026-03-20", "sessions": 108}, {"cohort": "2026-03-21", "sessions": 64}, {"cohort": "2026-03-13", "sessions": 61}, {"cohort": "2026-02-28", "sessions": 51}, {"cohort": "2026-03-06", "sessions": 21}, {"cohort": "2026-03-19", "sessions": 11}, {"cohort": "2026-03-01", "sessions": 3}, {"cohort": "2026-03-07", "sessions": 2}, {"cohort": "2026-03-05", "sessions": 1}]}, {"sessionDate": "2026-03-25", "totalSessions": 592, "newAsinCount": 45, "cohortParts": [{"cohort": "2026-03-16", "sessions": 168}, {"cohort": "2026-03-20", "sessions": 140}, {"cohort": "2026-03-21", "sessions": 98}, {"cohort": "2026-03-25", "sessions": 77}, {"cohort": "2026-02-28", "sessions": 34}, {"cohort": "2026-03-06", "sessions": 27}, {"cohort": "2026-03-13", "sessions": 24}, {"cohort": "2026-03-19", "sessions": 24}]}, {"sessionDate": "2026-03-26", "totalSessions": 559, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-16", "sessions": 187}, {"cohort": "2026-03-20", "sessions": 130}, {"cohort": "2026-03-21", "sessions": 80}, {"cohort": "2026-03-25", "sessions": 75}, {"cohort": "2026-02-28", "sessions": 26}, {"cohort": "2026-03-06", "sessions": 24}, {"cohort": "2026-03-19", "sessions": 22}, {"cohort": "2026-03-13", "sessions": 13}, {"cohort": "2026-03-07", "sessions": 2}]}, {"sessionDate": "2026-03-27", "totalSessions": 598, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-20", "sessions": 169}, {"cohort": "2026-03-16", "sessions": 153}, {"cohort": "2026-03-25", "sessions": 102}, {"cohort": "2026-03-21", "sessions": 97}, {"cohort": "2026-03-06", "sessions": 27}, {"cohort": "2026-02-28", "sessions": 18}, {"cohort": "2026-03-19", "sessions": 17}, {"cohort": "2026-03-13", "sessions": 12}, {"cohort": "2026-03-01", "sessions": 3}]}, {"sessionDate": "2026-03-28", "totalSessions": 576, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-16", "sessions": 196}, {"cohort": "2026-03-20", "sessions": 130}, {"cohort": "2026-03-25", "sessions": 96}, {"cohort": "2026-03-21", "sessions": 85}, {"cohort": "2026-02-28", "sessions": 22}, {"cohort": "2026-03-06", "sessions": 19}, {"cohort": "2026-03-19", "sessions": 18}, {"cohort": "2026-03-13", "sessions": 7}, {"cohort": "2026-03-07", "sessions": 2}, {"cohort": "2026-03-01", "sessions": 1}]}, {"sessionDate": "2026-03-29", "totalSessions": 658, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-16", "sessions": 181}, {"cohort": "2026-03-20", "sessions": 178}, {"cohort": "2026-03-21", "sessions": 113}, {"cohort": "2026-03-25", "sessions": 73}, {"cohort": "2026-02-28", "sessions": 36}, {"cohort": "2026-03-06", "sessions": 25}, {"cohort": "2026-03-13", "sessions": 22}, {"cohort": "2026-03-19", "sessions": 22}, {"cohort": "2026-03-01", "sessions": 7}, {"cohort": "2026-03-07", "sessions": 1}]}, {"sessionDate": "2026-03-30", "totalSessions": 560, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-16", "sessions": 166}, {"cohort": "2026-03-20", "sessions": 138}, {"cohort": "2026-03-25", "sessions": 110}, {"cohort": "2026-03-21", "sessions": 66}, {"cohort": "2026-02-28", "sessions": 24}, {"cohort": "2026-03-19", "sessions": 23}, {"cohort": "2026-03-06", "sessions": 18}, {"cohort": "2026-03-13", "sessions": 14}, {"cohort": "2026-03-07", "sessions": 1}]}], "kpi": {"totalAsin": 3902842, "activeAsin": 3674015, "listingSince": "2026-02-20"}, "cohortTable": [{"cohortDate": "2026-02-20", "newAsin": 256802, "daySessions": [0, 0, 8, 35, 69, 97, 108, 117, 130, 182, 121, 157, 170, 69, 107, 140, 135, 86, 31, 24, 34, 20, 15, 17, 13, 13, 16, 21, 13, 25]}, {"cohortDate": "2026-02-21", "newAsin": 504168, "daySessions": [0, 9, 19, 149, 111, 174, 155, 228, 166, 173, 190, 179, 146, 161, 146, 169, 116, 46, 53, 32, 29, 26, 20, 41, 32, 30, 21, 18, 7, 10]}, {"cohortDate": "2026-02-28", "newAsin": 706966, "daySessions": [25, 9, 23, 17, 61, 53, 83, 151, 99, 134, 230, 293, 168, 175, 141, 184, 137, 42, 44, 53, 42, 29, 37, 221, 51, 34, 26, 18, 22, 36]}, {"cohortDate": "2026-03-01", "newAsin": 60816, "daySessions": [0, 3, 2, 6, 4, 7, 4, 6, 9, 27, 13, 14, 12, 11, 15, 6, 2, 14, 2, 0, 2, 4, 18, 3, 0, 0, 3, 1, 7, 0]}, {"cohortDate": "2026-03-05", "newAsin": 1, "daySessions": [1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 3, 1, 1, 1, 1, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-06", "newAsin": 657836, "daySessions": [10, 6, 29, 51, 154, 211, 218, 212, 181, 181, 148, 63, 91, 52, 44, 18, 18, 105, 21, 27, 24, 27, 19, 25, 18, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-07", "newAsin": 94188, "daySessions": [0, 3, 3, 23, 10, 22, 22, 21, 9, 5, 31, 3, 4, 0, 8, 0, 7, 2, 0, 2, 0, 2, 1, 1, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-11", "newAsin": 168, "daySessions": [0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-13", "newAsin": 753294, "daySessions": [9, 10, 12, 51, 159, 163, 167, 217, 224, 321, 157, 61, 24, 13, 12, 7, 22, 14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-16", "newAsin": 55, "daySessions": [141, 157, 155, 120, 177, 191, 205, 142, 190, 168, 187, 153, 196, 181, 166, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-19", "newAsin": 10, "daySessions": [8, 6, 6, 5, 16, 11, 24, 22, 17, 18, 22, 23, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-20", "newAsin": 415034, "daySessions": [1, 1, 4, 53, 108, 140, 130, 169, 130, 178, 138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-21", "newAsin": 417720, "daySessions": [2, 1, 38, 64, 98, 80, 97, 85, 113, 66, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-25", "newAsin": 45, "daySessions": [77, 75, 102, 96, 73, 110, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-31", "newAsin": 18648, "daySessions": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-04-01", "newAsin": 17091, "daySessions": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}], "cohortListingAsin": {"2026-02-20": 256802, "2026-02-21": 504168, "2026-02-28": 706966, "2026-03-01": 60816, "2026-03-05": 1, "2026-03-06": 657836, "2026-03-07": 94188, "2026-03-11": 168, "2026-03-13": 753294, "2026-03-16": 55, "2026-03-19": 10, "2026-03-20": 415034, "2026-03-21": 417720, "2026-03-25": 45}}, "1": {"key": "1", "storeId": 1, "labels": ["2026-02-22", "2026-02-23", "2026-02-24", "2026-02-25", "2026-02-26", "2026-02-27", "2026-02-28", "2026-03-01", "2026-03-02", "2026-03-03", "2026-03-04", "2026-03-05", "2026-03-06", "2026-03-07", "2026-03-08", "2026-03-09", "2026-03-10", "2026-03-11", "2026-03-12", "2026-03-13", "2026-03-14", "2026-03-15", "2026-03-16", "2026-03-17", "2026-03-18", "2026-03-19", "2026-03-20", "2026-03-21", "2026-03-22", "2026-03-23", "2026-03-24", "2026-03-25", "2026-03-26", "2026-03-27", "2026-03-28", "2026-03-29", "2026-03-30"], "cohortLabels": ["2026-02-20", "2026-02-28", "2026-03-05", "2026-03-06", "2026-03-07", "2026-03-11", "2026-03-13", "2026-03-16", "2026-03-19", "2026-03-20", "2026-03-21", "2026-03-25"], "datasets": [{"type": "bar", "label": "批次 2026-02-20", "data": [8, 8, 67, 96, 107, 117, 128, 180, 119, 150, 169, 67, 105, 140, 133, 85, 31, 24, 33, 20, 14, 17, 13, 13, 16, 21, 13, 25, 10, 0, 0, 0, 0, 0, 0, 0, 0], "backgroundColor": "#1f77b4", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-02-28", "data": [0, 0, 0, 0, 0, 0, 9, 3, 6, 12, 10, 20, 35, 52, 31, 91, 110, 139, 66, 97, 83, 108, 58, 19, 24, 29, 16, 16, 26, 202, 27, 12, 16, 10, 10, 25, 15], "backgroundColor": "#ff7f0e", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-05", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 3, 1, 1, 1, 1, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0], "backgroundColor": "#2ca02c", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-06", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 30, 70, 91, 100, 86, 91, 92, 57, 29, 24, 24, 16, 8, 4, 49, 11, 15, 13, 14, 9, 16, 6], "backgroundColor": "#d62728", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-07", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 7, 2, 16, 5, 9, 3, 0, 5, 1, 0, 0, 5, 0, 1, 0, 0, 0, 0, 0, 0, 1], "backgroundColor": "#9467bd", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-11", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "backgroundColor": "#8c564b", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-13", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 23, 63, 38, 35, 56, 79, 85, 60, 12, 4, 3, 5, 0, 7, 2], "backgroundColor": "#e377c2", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-16", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 140, 156, 155, 118, 177, 191, 202, 138, 187, 166, 186, 153, 192, 178, 164], "backgroundColor": "#7f7f7f", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-19", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 1, 0, 1, 1, 0, 0, 1, 1, 0], "backgroundColor": "#bcbd22", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-20", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 41, 61, 84, 57, 76, 70, 77, 77], "backgroundColor": "#17becf", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-21", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 17, 29, 25, 23, 27, 29, 31], "backgroundColor": "#aec7e8", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-25", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 71, 71, 99, 88, 70, 105], "backgroundColor": "#ffbb78", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}], "lineTotal": [8, 8, 67, 96, 107, 117, 137, 183, 125, 162, 179, 88, 140, 192, 177, 208, 218, 256, 220, 208, 197, 228, 294, 286, 259, 228, 280, 328, 329, 500, 317, 382, 371, 380, 397, 403, 401], "byDay": [{"sessionDate": "2026-02-22", "totalSessions": 8, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-20", "sessions": 8}]}, {"sessionDate": "2026-02-23", "totalSessions": 8, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-20", "sessions": 8}]}, {"sessionDate": "2026-02-24", "totalSessions": 67, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-20", "sessions": 67}]}, {"sessionDate": "2026-02-25", "totalSessions": 96, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-20", "sessions": 96}]}, {"sessionDate": "2026-02-26", "totalSessions": 107, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-20", "sessions": 107}]}, {"sessionDate": "2026-02-27", "totalSessions": 117, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-20", "sessions": 117}]}, {"sessionDate": "2026-02-28", "totalSessions": 137, "newAsinCount": 251766, "cohortParts": [{"cohort": "2026-02-20", "sessions": 128}, {"cohort": "2026-02-28", "sessions": 9}]}, {"sessionDate": "2026-03-01", "totalSessions": 183, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-20", "sessions": 180}, {"cohort": "2026-02-28", "sessions": 3}]}, {"sessionDate": "2026-03-02", "totalSessions": 125, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-20", "sessions": 119}, {"cohort": "2026-02-28", "sessions": 6}]}, {"sessionDate": "2026-03-03", "totalSessions": 162, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-20", "sessions": 150}, {"cohort": "2026-02-28", "sessions": 12}]}, {"sessionDate": "2026-03-04", "totalSessions": 179, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-20", "sessions": 169}, {"cohort": "2026-02-28", "sessions": 10}]}, {"sessionDate": "2026-03-05", "totalSessions": 88, "newAsinCount": 1, "cohortParts": [{"cohort": "2026-02-20", "sessions": 67}, {"cohort": "2026-02-28", "sessions": 20}, {"cohort": "2026-03-05", "sessions": 1}]}, {"sessionDate": "2026-03-06", "totalSessions": 140, "newAsinCount": 230040, "cohortParts": [{"cohort": "2026-02-20", "sessions": 105}, {"cohort": "2026-02-28", "sessions": 35}]}, {"sessionDate": "2026-03-07", "totalSessions": 192, "newAsinCount": 21396, "cohortParts": [{"cohort": "2026-02-20", "sessions": 140}, {"cohort": "2026-02-28", "sessions": 52}]}, {"sessionDate": "2026-03-08", "totalSessions": 177, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-20", "sessions": 133}, {"cohort": "2026-02-28", "sessions": 31}, {"cohort": "2026-03-06", "sessions": 12}, {"cohort": "2026-03-05", "sessions": 1}]}, {"sessionDate": "2026-03-09", "totalSessions": 208, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-28", "sessions": 91}, {"cohort": "2026-02-20", "sessions": 85}, {"cohort": "2026-03-06", "sessions": 30}, {"cohort": "2026-03-05", "sessions": 1}, {"cohort": "2026-03-07", "sessions": 1}]}, {"sessionDate": "2026-03-10", "totalSessions": 218, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-28", "sessions": 110}, {"cohort": "2026-03-06", "sessions": 70}, {"cohort": "2026-02-20", "sessions": 31}, {"cohort": "2026-03-07", "sessions": 7}]}, {"sessionDate": "2026-03-11", "totalSessions": 256, "newAsinCount": 168, "cohortParts": [{"cohort": "2026-02-28", "sessions": 139}, {"cohort": "2026-03-06", "sessions": 91}, {"cohort": "2026-02-20", "sessions": 24}, {"cohort": "2026-03-07", "sessions": 2}]}, {"sessionDate": "2026-03-12", "totalSessions": 220, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-06", "sessions": 100}, {"cohort": "2026-02-28", "sessions": 66}, {"cohort": "2026-02-20", "sessions": 33}, {"cohort": "2026-03-07", "sessions": 16}, {"cohort": "2026-03-11", "sessions": 5}]}, {"sessionDate": "2026-03-13", "totalSessions": 208, "newAsinCount": 251496, "cohortParts": [{"cohort": "2026-02-28", "sessions": 97}, {"cohort": "2026-03-06", "sessions": 86}, {"cohort": "2026-02-20", "sessions": 20}, {"cohort": "2026-03-07", "sessions": 5}]}, {"sessionDate": "2026-03-14", "totalSessions": 197, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-06", "sessions": 91}, {"cohort": "2026-02-28", "sessions": 83}, {"cohort": "2026-02-20", "sessions": 14}, {"cohort": "2026-03-07", "sessions": 9}]}, {"sessionDate": "2026-03-15", "totalSessions": 228, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-28", "sessions": 108}, {"cohort": "2026-03-06", "sessions": 92}, {"cohort": "2026-02-20", "sessions": 17}, {"cohort": "2026-03-13", "sessions": 7}, {"cohort": "2026-03-07", "sessions": 3}, {"cohort": "2026-03-05", "sessions": 1}]}, {"sessionDate": "2026-03-16", "totalSessions": 294, "newAsinCount": 52, "cohortParts": [{"cohort": "2026-03-16", "sessions": 140}, {"cohort": "2026-02-28", "sessions": 58}, {"cohort": "2026-03-06", "sessions": 57}, {"cohort": "2026-03-13", "sessions": 23}, {"cohort": "2026-02-20", "sessions": 13}, {"cohort": "2026-03-05", "sessions": 3}]}, {"sessionDate": "2026-03-17", "totalSessions": 286, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-16", "sessions": 156}, {"cohort": "2026-03-13", "sessions": 63}, {"cohort": "2026-03-06", "sessions": 29}, {"cohort": "2026-02-28", "sessions": 19}, {"cohort": "2026-02-20", "sessions": 13}, {"cohort": "2026-03-07", "sessions": 5}, {"cohort": "2026-03-05", "sessions": 1}]}, {"sessionDate": "2026-03-18", "totalSessions": 259, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-16", "sessions": 155}, {"cohort": "2026-03-13", "sessions": 38}, {"cohort": "2026-02-28", "sessions": 24}, {"cohort": "2026-03-06", "sessions": 24}, {"cohort": "2026-02-20", "sessions": 16}, {"cohort": "2026-03-05", "sessions": 1}, {"cohort": "2026-03-07", "sessions": 1}]}, {"sessionDate": "2026-03-19", "totalSessions": 228, "newAsinCount": 8, "cohortParts": [{"cohort": "2026-03-16", "sessions": 118}, {"cohort": "2026-03-13", "sessions": 35}, {"cohort": "2026-02-28", "sessions": 29}, {"cohort": "2026-03-06", "sessions": 24}, {"cohort": "2026-02-20", "sessions": 21}, {"cohort": "2026-03-05", "sessions": 1}]}, {"sessionDate": "2026-03-20", "totalSessions": 280, "newAsinCount": 178194, "cohortParts": [{"cohort": "2026-03-16", "sessions": 177}, {"cohort": "2026-03-13", "sessions": 56}, {"cohort": "2026-02-28", "sessions": 16}, {"cohort": "2026-03-06", "sessions": 16}, {"cohort": "2026-02-20", "sessions": 13}, {"cohort": "2026-03-05", "sessions": 1}, {"cohort": "2026-03-19", "sessions": 1}]}, {"sessionDate": "2026-03-21", "totalSessions": 328, "newAsinCount": 73002, "cohortParts": [{"cohort": "2026-03-16", "sessions": 191}, {"cohort": "2026-03-13", "sessions": 79}, {"cohort": "2026-02-20", "sessions": 25}, {"cohort": "2026-02-28", "sessions": 16}, {"cohort": "2026-03-06", "sessions": 8}, {"cohort": "2026-03-07", "sessions": 5}, {"cohort": "2026-03-05", "sessions": 2}, {"cohort": "2026-03-19", "sessions": 2}]}, {"sessionDate": "2026-03-22", "totalSessions": 329, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-16", "sessions": 202}, {"cohort": "2026-03-13", "sessions": 85}, {"cohort": "2026-02-28", "sessions": 26}, {"cohort": "2026-02-20", "sessions": 10}, {"cohort": "2026-03-06", "sessions": 4}, {"cohort": "2026-03-19", "sessions": 1}, {"cohort": "2026-03-20", "sessions": 1}]}, {"sessionDate": "2026-03-23", "totalSessions": 500, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-28", "sessions": 202}, {"cohort": "2026-03-16", "sessions": 138}, {"cohort": "2026-03-13", "sessions": 60}, {"cohort": "2026-03-06", "sessions": 49}, {"cohort": "2026-03-20", "sessions": 41}, {"cohort": "2026-03-21", "sessions": 9}, {"cohort": "2026-03-07", "sessions": 1}]}, {"sessionDate": "2026-03-24", "totalSessions": 317, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-16", "sessions": 187}, {"cohort": "2026-03-20", "sessions": 61}, {"cohort": "2026-02-28", "sessions": 27}, {"cohort": "2026-03-21", "sessions": 17}, {"cohort": "2026-03-13", "sessions": 12}, {"cohort": "2026-03-06", "sessions": 11}, {"cohort": "2026-03-05", "sessions": 1}, {"cohort": "2026-03-19", "sessions": 1}]}, {"sessionDate": "2026-03-25", "totalSessions": 382, "newAsinCount": 38, "cohortParts": [{"cohort": "2026-03-16", "sessions": 166}, {"cohort": "2026-03-20", "sessions": 84}, {"cohort": "2026-03-25", "sessions": 71}, {"cohort": "2026-03-21", "sessions": 29}, {"cohort": "2026-03-06", "sessions": 15}, {"cohort": "2026-02-28", "sessions": 12}, {"cohort": "2026-03-13", "sessions": 4}, {"cohort": "2026-03-19", "sessions": 1}]}, {"sessionDate": "2026-03-26", "totalSessions": 371, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-16", "sessions": 186}, {"cohort": "2026-03-25", "sessions": 71}, {"cohort": "2026-03-20", "sessions": 57}, {"cohort": "2026-03-21", "sessions": 25}, {"cohort": "2026-02-28", "sessions": 16}, {"cohort": "2026-03-06", "sessions": 13}, {"cohort": "2026-03-13", "sessions": 3}]}, {"sessionDate": "2026-03-27", "totalSessions": 380, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-16", "sessions": 153}, {"cohort": "2026-03-25", "sessions": 99}, {"cohort": "2026-03-20", "sessions": 76}, {"cohort": "2026-03-21", "sessions": 23}, {"cohort": "2026-03-06", "sessions": 14}, {"cohort": "2026-02-28", "sessions": 10}, {"cohort": "2026-03-13", "sessions": 5}]}, {"sessionDate": "2026-03-28", "totalSessions": 397, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-16", "sessions": 192}, {"cohort": "2026-03-25", "sessions": 88}, {"cohort": "2026-03-20", "sessions": 70}, {"cohort": "2026-03-21", "sessions": 27}, {"cohort": "2026-02-28", "sessions": 10}, {"cohort": "2026-03-06", "sessions": 9}, {"cohort": "2026-03-19", "sessions": 1}]}, {"sessionDate": "2026-03-29", "totalSessions": 403, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-16", "sessions": 178}, {"cohort": "2026-03-20", "sessions": 77}, {"cohort": "2026-03-25", "sessions": 70}, {"cohort": "2026-03-21", "sessions": 29}, {"cohort": "2026-02-28", "sessions": 25}, {"cohort": "2026-03-06", "sessions": 16}, {"cohort": "2026-03-13", "sessions": 7}, {"cohort": "2026-03-19", "sessions": 1}]}, {"sessionDate": "2026-03-30", "totalSessions": 401, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-16", "sessions": 164}, {"cohort": "2026-03-25", "sessions": 105}, {"cohort": "2026-03-20", "sessions": 77}, {"cohort": "2026-03-21", "sessions": 31}, {"cohort": "2026-02-28", "sessions": 15}, {"cohort": "2026-03-06", "sessions": 6}, {"cohort": "2026-03-13", "sessions": 2}, {"cohort": "2026-03-07", "sessions": 1}]}], "kpi": {"totalAsin": 1276515, "activeAsin": 1220825, "listingSince": "2026-02-20"}, "cohortTable": [{"cohortDate": "2026-02-20", "newAsin": 251994, "daySessions": [0, 0, 8, 8, 67, 96, 107, 117, 128, 180, 119, 150, 169, 67, 105, 140, 133, 85, 31, 24, 33, 20, 14, 17, 13, 13, 16, 21, 13, 25]}, {"cohortDate": "2026-02-28", "newAsin": 251766, "daySessions": [9, 3, 6, 12, 10, 20, 35, 52, 31, 91, 110, 139, 66, 97, 83, 108, 58, 19, 24, 29, 16, 16, 26, 202, 27, 12, 16, 10, 10, 25]}, {"cohortDate": "2026-03-05", "newAsin": 1, "daySessions": [1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 3, 1, 1, 1, 1, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-06", "newAsin": 230040, "daySessions": [0, 0, 12, 30, 70, 91, 100, 86, 91, 92, 57, 29, 24, 24, 16, 8, 4, 49, 11, 15, 13, 14, 9, 16, 6, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-07", "newAsin": 21396, "daySessions": [0, 0, 1, 7, 2, 16, 5, 9, 3, 0, 5, 1, 0, 0, 5, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-11", "newAsin": 168, "daySessions": [0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-13", "newAsin": 251496, "daySessions": [0, 0, 7, 23, 63, 38, 35, 56, 79, 85, 60, 12, 4, 3, 5, 0, 7, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-16", "newAsin": 52, "daySessions": [140, 156, 155, 118, 177, 191, 202, 138, 187, 166, 186, 153, 192, 178, 164, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-19", "newAsin": 8, "daySessions": [0, 1, 2, 1, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-20", "newAsin": 178194, "daySessions": [0, 0, 1, 41, 61, 84, 57, 76, 70, 77, 77, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-21", "newAsin": 73002, "daySessions": [0, 0, 9, 17, 29, 25, 23, 27, 29, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-25", "newAsin": 38, "daySessions": [71, 71, 99, 88, 70, 105, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-31", "newAsin": 9360, "daySessions": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-04-01", "newAsin": 9000, "daySessions": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}], "cohortListingAsin": {"2026-02-20": 251994, "2026-02-28": 251766, "2026-03-05": 1, "2026-03-06": 230040, "2026-03-07": 21396, "2026-03-11": 168, "2026-03-13": 251496, "2026-03-16": 52, "2026-03-19": 8, "2026-03-20": 178194, "2026-03-21": 73002, "2026-03-25": 38}}, "7": {"key": "7", "storeId": 7, "labels": ["2026-02-28", "2026-03-03", "2026-03-04", "2026-03-05", "2026-03-08", "2026-03-09", "2026-03-10", "2026-03-11", "2026-03-13", "2026-03-14", "2026-03-15", "2026-03-16", "2026-03-18", "2026-03-19", "2026-03-21", "2026-03-25", "2026-03-30"], "cohortLabels": ["2026-02-20", "2026-02-28", "2026-03-06", "2026-03-13", "2026-03-20"], "datasets": [{"type": "bar", "label": "批次 2026-02-20", "data": [1, 7, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "backgroundColor": "#1f77b4", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-02-28", "data": [0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0, 2, 0, 1, 0, 0, 0], "backgroundColor": "#ff7f0e", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-06", "data": [0, 0, 0, 0, 0, 0, 1, 1, 2, 8, 1, 2, 1, 0, 0, 0, 1], "backgroundColor": "#2ca02c", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-13", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0], "backgroundColor": "#d62728", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-20", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], "backgroundColor": "#9467bd", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}], "lineTotal": [1, 7, 1, 1, 1, 1, 1, 4, 2, 8, 1, 4, 1, 1, 2, 1, 2], "byDay": [{"sessionDate": "2026-02-28", "totalSessions": 1, "newAsinCount": 1822, "cohortParts": [{"cohort": "2026-02-20", "sessions": 1}]}, {"sessionDate": "2026-03-03", "totalSessions": 7, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-20", "sessions": 7}]}, {"sessionDate": "2026-03-04", "totalSessions": 1, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-20", "sessions": 1}]}, {"sessionDate": "2026-03-05", "totalSessions": 1, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-28", "sessions": 1}]}, {"sessionDate": "2026-03-08", "totalSessions": 1, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-20", "sessions": 1}]}, {"sessionDate": "2026-03-09", "totalSessions": 1, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-20", "sessions": 1}]}, {"sessionDate": "2026-03-10", "totalSessions": 1, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-06", "sessions": 1}]}, {"sessionDate": "2026-03-11", "totalSessions": 4, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-28", "sessions": 3}, {"cohort": "2026-03-06", "sessions": 1}]}, {"sessionDate": "2026-03-13", "totalSessions": 2, "newAsinCount": 1590, "cohortParts": [{"cohort": "2026-03-06", "sessions": 2}]}, {"sessionDate": "2026-03-14", "totalSessions": 8, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-06", "sessions": 8}]}, {"sessionDate": "2026-03-15", "totalSessions": 1, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-06", "sessions": 1}]}, {"sessionDate": "2026-03-16", "totalSessions": 4, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-28", "sessions": 2}, {"cohort": "2026-03-06", "sessions": 2}]}, {"sessionDate": "2026-03-18", "totalSessions": 1, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-06", "sessions": 1}]}, {"sessionDate": "2026-03-19", "totalSessions": 1, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-28", "sessions": 1}]}, {"sessionDate": "2026-03-21", "totalSessions": 2, "newAsinCount": 1032, "cohortParts": [{"cohort": "2026-03-13", "sessions": 2}]}, {"sessionDate": "2026-03-25", "totalSessions": 1, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-13", "sessions": 1}]}, {"sessionDate": "2026-03-30", "totalSessions": 2, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-06", "sessions": 1}, {"cohort": "2026-03-20", "sessions": 1}]}], "kpi": {"totalAsin": 9778, "activeAsin": 8866, "listingSince": "2026-02-20"}, "cohortTable": [{"cohortDate": "2026-02-20", "newAsin": 2570, "daySessions": [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 7, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-02-28", "newAsin": 1822, "daySessions": [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-06", "newAsin": 2276, "daySessions": [0, 0, 0, 0, 1, 1, 0, 2, 8, 1, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-13", "newAsin": 1590, "daySessions": [0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-20", "newAsin": 488, "daySessions": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-21", "newAsin": 1032, "daySessions": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}], "cohortListingAsin": {"2026-02-20": 2570, "2026-02-28": 1822, "2026-03-06": 2276, "2026-03-13": 1590, "2026-03-20": 488}}, "12": {"key": "12", "storeId": 12, "labels": ["2026-02-22", "2026-02-23", "2026-02-24", "2026-02-25", "2026-02-26", "2026-02-27", "2026-02-28", "2026-03-01", "2026-03-02", "2026-03-03", "2026-03-04", "2026-03-05", "2026-03-06", "2026-03-07", "2026-03-08", "2026-03-09", "2026-03-10", "2026-03-11", "2026-03-12", "2026-03-13", "2026-03-14", "2026-03-15", "2026-03-16", "2026-03-17", "2026-03-18", "2026-03-19", "2026-03-20", "2026-03-21", "2026-03-22", "2026-03-23", "2026-03-24", "2026-03-25", "2026-03-26", "2026-03-27", "2026-03-28", "2026-03-29", "2026-03-30"], "cohortLabels": ["2026-02-20", "2026-02-21", "2026-02-28", "2026-03-01", "2026-03-06", "2026-03-13", "2026-03-16", "2026-03-19", "2026-03-20", "2026-03-21", "2026-03-25"], "datasets": [{"type": "bar", "label": "批次 2026-02-20", "data": [0, 0, 1, 1, 1, 0, 0, 1, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "backgroundColor": "#1f77b4", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-02-21", "data": [1, 10, 65, 62, 91, 97, 105, 77, 69, 85, 71, 65, 90, 86, 77, 42, 33, 8, 12, 10, 3, 14, 7, 14, 12, 17, 7, 1, 3, 5, 0, 0, 0, 0, 0, 0, 0], "backgroundColor": "#ff7f0e", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-02-28", "data": [0, 0, 0, 0, 0, 0, 14, 1, 8, 1, 10, 5, 6, 25, 35, 15, 59, 77, 48, 30, 26, 36, 43, 15, 11, 8, 4, 5, 5, 7, 4, 17, 3, 6, 0, 0, 0], "backgroundColor": "#2ca02c", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-01", "data": [0, 0, 0, 0, 0, 0, 0, 0, 3, 2, 6, 4, 7, 4, 6, 9, 27, 13, 14, 12, 11, 15, 6, 2, 14, 2, 0, 2, 4, 18, 3, 0, 0, 3, 1, 7, 0], "backgroundColor": "#d62728", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-06", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 13, 10, 49, 57, 72, 50, 32, 42, 34, 24, 32, 13, 12, 2, 3, 27, 7, 8, 10, 7, 2, 6, 5], "backgroundColor": "#9467bd", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-13", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 8, 3, 9, 66, 75, 70, 92, 74, 139, 56, 36, 10, 1, 3, 3, 13, 2], "backgroundColor": "#8c564b", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-16", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 2, 0, 0, 3, 4, 3, 2, 1, 0, 4, 3, 2], "backgroundColor": "#e377c2", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-19", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 5, 4, 4, 16, 10, 23, 22, 17, 17, 21, 23], "backgroundColor": "#7f7f7f", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-20", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 5, 30, 32, 44, 62, 40, 48, 31], "backgroundColor": "#bcbd22", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-21", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 6, 20, 46, 32, 33, 26, 30, 14], "backgroundColor": "#17becf", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-25", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 4, 3, 8, 3, 5], "backgroundColor": "#aec7e8", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}], "lineTotal": [1, 10, 66, 63, 92, 97, 119, 79, 82, 88, 87, 75, 105, 117, 131, 76, 168, 155, 147, 103, 81, 110, 100, 122, 144, 120, 121, 91, 163, 144, 113, 144, 117, 134, 101, 131, 82], "byDay": [{"sessionDate": "2026-02-22", "totalSessions": 1, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 1}]}, {"sessionDate": "2026-02-23", "totalSessions": 10, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 10}]}, {"sessionDate": "2026-02-24", "totalSessions": 66, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 65}, {"cohort": "2026-02-20", "sessions": 1}]}, {"sessionDate": "2026-02-25", "totalSessions": 63, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 62}, {"cohort": "2026-02-20", "sessions": 1}]}, {"sessionDate": "2026-02-26", "totalSessions": 92, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 91}, {"cohort": "2026-02-20", "sessions": 1}]}, {"sessionDate": "2026-02-27", "totalSessions": 97, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 97}]}, {"sessionDate": "2026-02-28", "totalSessions": 119, "newAsinCount": 196326, "cohortParts": [{"cohort": "2026-02-21", "sessions": 105}, {"cohort": "2026-02-28", "sessions": 14}]}, {"sessionDate": "2026-03-01", "totalSessions": 79, "newAsinCount": 60816, "cohortParts": [{"cohort": "2026-02-21", "sessions": 77}, {"cohort": "2026-02-20", "sessions": 1}, {"cohort": "2026-02-28", "sessions": 1}]}, {"sessionDate": "2026-03-02", "totalSessions": 82, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 69}, {"cohort": "2026-02-28", "sessions": 8}, {"cohort": "2026-03-01", "sessions": 3}, {"cohort": "2026-02-20", "sessions": 2}]}, {"sessionDate": "2026-03-03", "totalSessions": 88, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 85}, {"cohort": "2026-03-01", "sessions": 2}, {"cohort": "2026-02-28", "sessions": 1}]}, {"sessionDate": "2026-03-04", "totalSessions": 87, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 71}, {"cohort": "2026-02-28", "sessions": 10}, {"cohort": "2026-03-01", "sessions": 6}]}, {"sessionDate": "2026-03-05", "totalSessions": 75, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 65}, {"cohort": "2026-02-28", "sessions": 5}, {"cohort": "2026-03-01", "sessions": 4}, {"cohort": "2026-02-20", "sessions": 1}]}, {"sessionDate": "2026-03-06", "totalSessions": 105, "newAsinCount": 212760, "cohortParts": [{"cohort": "2026-02-21", "sessions": 90}, {"cohort": "2026-03-01", "sessions": 7}, {"cohort": "2026-02-28", "sessions": 6}, {"cohort": "2026-03-06", "sessions": 2}]}, {"sessionDate": "2026-03-07", "totalSessions": 117, "newAsinCount": 36396, "cohortParts": [{"cohort": "2026-02-21", "sessions": 86}, {"cohort": "2026-02-28", "sessions": 25}, {"cohort": "2026-03-01", "sessions": 4}, {"cohort": "2026-03-06", "sessions": 2}]}, {"sessionDate": "2026-03-08", "totalSessions": 131, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 77}, {"cohort": "2026-02-28", "sessions": 35}, {"cohort": "2026-03-06", "sessions": 13}, {"cohort": "2026-03-01", "sessions": 6}]}, {"sessionDate": "2026-03-09", "totalSessions": 76, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 42}, {"cohort": "2026-02-28", "sessions": 15}, {"cohort": "2026-03-06", "sessions": 10}, {"cohort": "2026-03-01", "sessions": 9}]}, {"sessionDate": "2026-03-10", "totalSessions": 168, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-28", "sessions": 59}, {"cohort": "2026-03-06", "sessions": 49}, {"cohort": "2026-02-21", "sessions": 33}, {"cohort": "2026-03-01", "sessions": 27}]}, {"sessionDate": "2026-03-11", "totalSessions": 155, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-28", "sessions": 77}, {"cohort": "2026-03-06", "sessions": 57}, {"cohort": "2026-03-01", "sessions": 13}, {"cohort": "2026-02-21", "sessions": 8}]}, {"sessionDate": "2026-03-12", "totalSessions": 147, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-06", "sessions": 72}, {"cohort": "2026-02-28", "sessions": 48}, {"cohort": "2026-03-01", "sessions": 14}, {"cohort": "2026-02-21", "sessions": 12}, {"cohort": "2026-02-20", "sessions": 1}]}, {"sessionDate": "2026-03-13", "totalSessions": 103, "newAsinCount": 250116, "cohortParts": [{"cohort": "2026-03-06", "sessions": 50}, {"cohort": "2026-02-28", "sessions": 30}, {"cohort": "2026-03-01", "sessions": 12}, {"cohort": "2026-02-21", "sessions": 10}, {"cohort": "2026-03-13", "sessions": 1}]}, {"sessionDate": "2026-03-14", "totalSessions": 81, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-06", "sessions": 32}, {"cohort": "2026-02-28", "sessions": 26}, {"cohort": "2026-03-01", "sessions": 11}, {"cohort": "2026-03-13", "sessions": 8}, {"cohort": "2026-02-21", "sessions": 3}, {"cohort": "2026-02-20", "sessions": 1}]}, {"sessionDate": "2026-03-15", "totalSessions": 110, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-06", "sessions": 42}, {"cohort": "2026-02-28", "sessions": 36}, {"cohort": "2026-03-01", "sessions": 15}, {"cohort": "2026-02-21", "sessions": 14}, {"cohort": "2026-03-13", "sessions": 3}]}, {"sessionDate": "2026-03-16", "totalSessions": 100, "newAsinCount": 3, "cohortParts": [{"cohort": "2026-02-28", "sessions": 43}, {"cohort": "2026-03-06", "sessions": 34}, {"cohort": "2026-03-13", "sessions": 9}, {"cohort": "2026-02-21", "sessions": 7}, {"cohort": "2026-03-01", "sessions": 6}, {"cohort": "2026-03-16", "sessions": 1}]}, {"sessionDate": "2026-03-17", "totalSessions": 122, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-13", "sessions": 66}, {"cohort": "2026-03-06", "sessions": 24}, {"cohort": "2026-02-28", "sessions": 15}, {"cohort": "2026-02-21", "sessions": 14}, {"cohort": "2026-03-01", "sessions": 2}, {"cohort": "2026-03-16", "sessions": 1}]}, {"sessionDate": "2026-03-18", "totalSessions": 144, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-13", "sessions": 75}, {"cohort": "2026-03-06", "sessions": 32}, {"cohort": "2026-03-01", "sessions": 14}, {"cohort": "2026-02-21", "sessions": 12}, {"cohort": "2026-02-28", "sessions": 11}]}, {"sessionDate": "2026-03-19", "totalSessions": 120, "newAsinCount": 2, "cohortParts": [{"cohort": "2026-03-13", "sessions": 70}, {"cohort": "2026-02-21", "sessions": 17}, {"cohort": "2026-03-06", "sessions": 13}, {"cohort": "2026-02-28", "sessions": 8}, {"cohort": "2026-03-19", "sessions": 8}, {"cohort": "2026-03-01", "sessions": 2}, {"cohort": "2026-03-16", "sessions": 2}]}, {"sessionDate": "2026-03-20", "totalSessions": 121, "newAsinCount": 117696, "cohortParts": [{"cohort": "2026-03-13", "sessions": 92}, {"cohort": "2026-03-06", "sessions": 12}, {"cohort": "2026-02-21", "sessions": 7}, {"cohort": "2026-03-19", "sessions": 5}, {"cohort": "2026-02-28", "sessions": 4}, {"cohort": "2026-03-20", "sessions": 1}]}, {"sessionDate": "2026-03-21", "totalSessions": 91, "newAsinCount": 167394, "cohortParts": [{"cohort": "2026-03-13", "sessions": 74}, {"cohort": "2026-02-28", "sessions": 5}, {"cohort": "2026-03-19", "sessions": 4}, {"cohort": "2026-03-01", "sessions": 2}, {"cohort": "2026-03-06", "sessions": 2}, {"cohort": "2026-03-21", "sessions": 2}, {"cohort": "2026-02-21", "sessions": 1}, {"cohort": "2026-03-20", "sessions": 1}]}, {"sessionDate": "2026-03-22", "totalSessions": 163, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-13", "sessions": 139}, {"cohort": "2026-02-28", "sessions": 5}, {"cohort": "2026-03-01", "sessions": 4}, {"cohort": "2026-03-19", "sessions": 4}, {"cohort": "2026-02-21", "sessions": 3}, {"cohort": "2026-03-06", "sessions": 3}, {"cohort": "2026-03-16", "sessions": 3}, {"cohort": "2026-03-20", "sessions": 1}, {"cohort": "2026-03-21", "sessions": 1}]}, {"sessionDate": "2026-03-23", "totalSessions": 144, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-13", "sessions": 56}, {"cohort": "2026-03-06", "sessions": 27}, {"cohort": "2026-03-01", "sessions": 18}, {"cohort": "2026-03-19", "sessions": 16}, {"cohort": "2026-02-28", "sessions": 7}, {"cohort": "2026-03-21", "sessions": 6}, {"cohort": "2026-02-21", "sessions": 5}, {"cohort": "2026-03-20", "sessions": 5}, {"cohort": "2026-03-16", "sessions": 4}]}, {"sessionDate": "2026-03-24", "totalSessions": 113, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-13", "sessions": 36}, {"cohort": "2026-03-20", "sessions": 30}, {"cohort": "2026-03-21", "sessions": 20}, {"cohort": "2026-03-19", "sessions": 10}, {"cohort": "2026-03-06", "sessions": 7}, {"cohort": "2026-02-28", "sessions": 4}, {"cohort": "2026-03-01", "sessions": 3}, {"cohort": "2026-03-16", "sessions": 3}]}, {"sessionDate": "2026-03-25", "totalSessions": 144, "newAsinCount": 7, "cohortParts": [{"cohort": "2026-03-21", "sessions": 46}, {"cohort": "2026-03-20", "sessions": 32}, {"cohort": "2026-03-19", "sessions": 23}, {"cohort": "2026-02-28", "sessions": 17}, {"cohort": "2026-03-13", "sessions": 10}, {"cohort": "2026-03-06", "sessions": 8}, {"cohort": "2026-03-25", "sessions": 6}, {"cohort": "2026-03-16", "sessions": 2}]}, {"sessionDate": "2026-03-26", "totalSessions": 117, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-20", "sessions": 44}, {"cohort": "2026-03-21", "sessions": 32}, {"cohort": "2026-03-19", "sessions": 22}, {"cohort": "2026-03-06", "sessions": 10}, {"cohort": "2026-03-25", "sessions": 4}, {"cohort": "2026-02-28", "sessions": 3}, {"cohort": "2026-03-13", "sessions": 1}, {"cohort": "2026-03-16", "sessions": 1}]}, {"sessionDate": "2026-03-27", "totalSessions": 134, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-20", "sessions": 62}, {"cohort": "2026-03-21", "sessions": 33}, {"cohort": "2026-03-19", "sessions": 17}, {"cohort": "2026-03-06", "sessions": 7}, {"cohort": "2026-02-28", "sessions": 6}, {"cohort": "2026-03-01", "sessions": 3}, {"cohort": "2026-03-13", "sessions": 3}, {"cohort": "2026-03-25", "sessions": 3}]}, {"sessionDate": "2026-03-28", "totalSessions": 101, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-20", "sessions": 40}, {"cohort": "2026-03-21", "sessions": 26}, {"cohort": "2026-03-19", "sessions": 17}, {"cohort": "2026-03-25", "sessions": 8}, {"cohort": "2026-03-16", "sessions": 4}, {"cohort": "2026-03-13", "sessions": 3}, {"cohort": "2026-03-06", "sessions": 2}, {"cohort": "2026-03-01", "sessions": 1}]}, {"sessionDate": "2026-03-29", "totalSessions": 131, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-20", "sessions": 48}, {"cohort": "2026-03-21", "sessions": 30}, {"cohort": "2026-03-19", "sessions": 21}, {"cohort": "2026-03-13", "sessions": 13}, {"cohort": "2026-03-01", "sessions": 7}, {"cohort": "2026-03-06", "sessions": 6}, {"cohort": "2026-03-16", "sessions": 3}, {"cohort": "2026-03-25", "sessions": 3}]}, {"sessionDate": "2026-03-30", "totalSessions": 82, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-20", "sessions": 31}, {"cohort": "2026-03-19", "sessions": 23}, {"cohort": "2026-03-21", "sessions": 14}, {"cohort": "2026-03-06", "sessions": 5}, {"cohort": "2026-03-25", "sessions": 5}, {"cohort": "2026-03-13", "sessions": 2}, {"cohort": "2026-03-16", "sessions": 2}]}], "kpi": {"totalAsin": 1303220, "activeAsin": 1185010, "listingSince": "2026-02-20"}, "cohortTable": [{"cohortDate": "2026-02-20", "newAsin": 1062, "daySessions": [0, 0, 0, 0, 1, 1, 1, 0, 0, 1, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-02-21", "newAsin": 252438, "daySessions": [0, 1, 10, 65, 62, 91, 97, 105, 77, 69, 85, 71, 65, 90, 86, 77, 42, 33, 8, 12, 10, 3, 14, 7, 14, 12, 17, 7, 1, 3]}, {"cohortDate": "2026-02-28", "newAsin": 196326, "daySessions": [14, 1, 8, 1, 10, 5, 6, 25, 35, 15, 59, 77, 48, 30, 26, 36, 43, 15, 11, 8, 4, 5, 5, 7, 4, 17, 3, 6, 0, 0]}, {"cohortDate": "2026-03-01", "newAsin": 60816, "daySessions": [0, 3, 2, 6, 4, 7, 4, 6, 9, 27, 13, 14, 12, 11, 15, 6, 2, 14, 2, 0, 2, 4, 18, 3, 0, 0, 3, 1, 7, 0]}, {"cohortDate": "2026-03-06", "newAsin": 212760, "daySessions": [2, 2, 13, 10, 49, 57, 72, 50, 32, 42, 34, 24, 32, 13, 12, 2, 3, 27, 7, 8, 10, 7, 2, 6, 5, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-07", "newAsin": 36396, "daySessions": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-13", "newAsin": 250116, "daySessions": [1, 8, 3, 9, 66, 75, 70, 92, 74, 139, 56, 36, 10, 1, 3, 3, 13, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-16", "newAsin": 3, "daySessions": [1, 1, 0, 2, 0, 0, 3, 4, 3, 2, 1, 0, 4, 3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-19", "newAsin": 2, "daySessions": [8, 5, 4, 4, 16, 10, 23, 22, 17, 17, 21, 23, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-20", "newAsin": 117696, "daySessions": [1, 1, 1, 5, 30, 32, 44, 62, 40, 48, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-21", "newAsin": 167394, "daySessions": [2, 1, 6, 20, 46, 32, 33, 26, 30, 14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-25", "newAsin": 7, "daySessions": [6, 4, 3, 8, 3, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-31", "newAsin": 4608, "daySessions": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-04-01", "newAsin": 3596, "daySessions": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}], "cohortListingAsin": {"2026-02-20": 1062, "2026-02-21": 252438, "2026-02-28": 196326, "2026-03-01": 60816, "2026-03-06": 212760, "2026-03-13": 250116, "2026-03-16": 3, "2026-03-19": 2, "2026-03-20": 117696, "2026-03-21": 167394, "2026-03-25": 7}}, "25": {"key": "25", "storeId": 25, "labels": ["2026-02-22", "2026-02-23", "2026-02-24", "2026-02-25", "2026-02-26", "2026-02-27", "2026-02-28", "2026-03-01", "2026-03-02", "2026-03-03", "2026-03-04", "2026-03-05", "2026-03-06", "2026-03-07", "2026-03-08", "2026-03-09", "2026-03-10", "2026-03-11", "2026-03-12", "2026-03-13", "2026-03-14", "2026-03-15", "2026-03-16", "2026-03-17", "2026-03-18", "2026-03-19", "2026-03-20", "2026-03-21", "2026-03-22", "2026-03-23", "2026-03-24", "2026-03-25", "2026-03-26", "2026-03-27", "2026-03-28", "2026-03-29", "2026-03-30"], "cohortLabels": ["2026-02-20", "2026-02-21", "2026-02-28", "2026-03-06", "2026-03-07", "2026-03-13", "2026-03-20", "2026-03-21"], "datasets": [{"type": "bar", "label": "批次 2026-02-20", "data": [0, 27, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "backgroundColor": "#1f77b4", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-02-21", "data": [8, 9, 84, 49, 83, 58, 123, 89, 104, 105, 108, 81, 71, 60, 92, 74, 13, 45, 20, 19, 23, 6, 34, 18, 18, 4, 11, 6, 7, 12, 0, 0, 0, 0, 0, 0, 0], "backgroundColor": "#ff7f0e", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-02-28", "data": [0, 0, 0, 0, 0, 0, 2, 5, 9, 4, 41, 27, 42, 74, 33, 28, 61, 74, 54, 48, 32, 40, 34, 8, 9, 15, 22, 8, 6, 12, 20, 5, 7, 2, 12, 11, 9], "backgroundColor": "#2ca02c", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-06", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 4, 4, 11, 34, 62, 46, 74, 50, 46, 55, 10, 34, 15, 16, 8, 11, 29, 3, 4, 1, 6, 8, 3, 6], "backgroundColor": "#d62728", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-07", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 2, 16, 8, 6, 17, 12, 6, 5, 26, 2, 4, 0, 3, 0, 6, 2, 0, 2, 0, 2, 1, 0], "backgroundColor": "#9467bd", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-13", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 2, 2, 19, 30, 50, 62, 69, 69, 97, 41, 13, 9, 9, 4, 4, 2, 10], "backgroundColor": "#8c564b", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-20", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 7, 17, 24, 29, 31, 20, 53, 29], "backgroundColor": "#e377c2", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}, {"type": "bar", "label": "批次 2026-03-21", "data": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 23, 27, 23, 23, 41, 32, 54, 21], "backgroundColor": "#7f7f7f", "borderWidth": 0, "stack": "sess", "yAxisID": "y"}], "lineTotal": [8, 36, 85, 49, 83, 58, 126, 95, 113, 109, 149, 109, 123, 138, 133, 115, 124, 189, 126, 166, 119, 100, 147, 92, 113, 100, 118, 94, 123, 130, 82, 65, 71, 84, 78, 124, 75], "byDay": [{"sessionDate": "2026-02-22", "totalSessions": 8, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 8}]}, {"sessionDate": "2026-02-23", "totalSessions": 36, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-20", "sessions": 27}, {"cohort": "2026-02-21", "sessions": 9}]}, {"sessionDate": "2026-02-24", "totalSessions": 85, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 84}, {"cohort": "2026-02-20", "sessions": 1}]}, {"sessionDate": "2026-02-25", "totalSessions": 49, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 49}]}, {"sessionDate": "2026-02-26", "totalSessions": 83, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 83}]}, {"sessionDate": "2026-02-27", "totalSessions": 58, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 58}]}, {"sessionDate": "2026-02-28", "totalSessions": 126, "newAsinCount": 257052, "cohortParts": [{"cohort": "2026-02-21", "sessions": 123}, {"cohort": "2026-02-28", "sessions": 2}, {"cohort": "2026-02-20", "sessions": 1}]}, {"sessionDate": "2026-03-01", "totalSessions": 95, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 89}, {"cohort": "2026-02-28", "sessions": 5}, {"cohort": "2026-02-20", "sessions": 1}]}, {"sessionDate": "2026-03-02", "totalSessions": 113, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 104}, {"cohort": "2026-02-28", "sessions": 9}]}, {"sessionDate": "2026-03-03", "totalSessions": 109, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 105}, {"cohort": "2026-02-28", "sessions": 4}]}, {"sessionDate": "2026-03-04", "totalSessions": 149, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 108}, {"cohort": "2026-02-28", "sessions": 41}]}, {"sessionDate": "2026-03-05", "totalSessions": 109, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 81}, {"cohort": "2026-02-28", "sessions": 27}, {"cohort": "2026-02-20", "sessions": 1}]}, {"sessionDate": "2026-03-06", "totalSessions": 123, "newAsinCount": 212760, "cohortParts": [{"cohort": "2026-02-21", "sessions": 71}, {"cohort": "2026-02-28", "sessions": 42}, {"cohort": "2026-03-06", "sessions": 8}, {"cohort": "2026-02-20", "sessions": 2}]}, {"sessionDate": "2026-03-07", "totalSessions": 138, "newAsinCount": 36396, "cohortParts": [{"cohort": "2026-02-28", "sessions": 74}, {"cohort": "2026-02-21", "sessions": 60}, {"cohort": "2026-03-06", "sessions": 4}]}, {"sessionDate": "2026-03-08", "totalSessions": 133, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 92}, {"cohort": "2026-02-28", "sessions": 33}, {"cohort": "2026-03-06", "sessions": 4}, {"cohort": "2026-03-07", "sessions": 3}, {"cohort": "2026-02-20", "sessions": 1}]}, {"sessionDate": "2026-03-09", "totalSessions": 115, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-21", "sessions": 74}, {"cohort": "2026-02-28", "sessions": 28}, {"cohort": "2026-03-06", "sessions": 11}, {"cohort": "2026-03-07", "sessions": 2}]}, {"sessionDate": "2026-03-10", "totalSessions": 124, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-28", "sessions": 61}, {"cohort": "2026-03-06", "sessions": 34}, {"cohort": "2026-03-07", "sessions": 16}, {"cohort": "2026-02-21", "sessions": 13}]}, {"sessionDate": "2026-03-11", "totalSessions": 189, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-28", "sessions": 74}, {"cohort": "2026-03-06", "sessions": 62}, {"cohort": "2026-02-21", "sessions": 45}, {"cohort": "2026-03-07", "sessions": 8}]}, {"sessionDate": "2026-03-12", "totalSessions": 126, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-02-28", "sessions": 54}, {"cohort": "2026-03-06", "sessions": 46}, {"cohort": "2026-02-21", "sessions": 20}, {"cohort": "2026-03-07", "sessions": 6}]}, {"sessionDate": "2026-03-13", "totalSessions": 166, "newAsinCount": 250092, "cohortParts": [{"cohort": "2026-03-06", "sessions": 74}, {"cohort": "2026-02-28", "sessions": 48}, {"cohort": "2026-02-21", "sessions": 19}, {"cohort": "2026-03-07", "sessions": 17}, {"cohort": "2026-03-13", "sessions": 8}]}, {"sessionDate": "2026-03-14", "totalSessions": 119, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-06", "sessions": 50}, {"cohort": "2026-02-28", "sessions": 32}, {"cohort": "2026-02-21", "sessions": 23}, {"cohort": "2026-03-07", "sessions": 12}, {"cohort": "2026-03-13", "sessions": 2}]}, {"sessionDate": "2026-03-15", "totalSessions": 100, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-06", "sessions": 46}, {"cohort": "2026-02-28", "sessions": 40}, {"cohort": "2026-02-21", "sessions": 6}, {"cohort": "2026-03-07", "sessions": 6}, {"cohort": "2026-03-13", "sessions": 2}]}, {"sessionDate": "2026-03-16", "totalSessions": 147, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-06", "sessions": 55}, {"cohort": "2026-02-21", "sessions": 34}, {"cohort": "2026-02-28", "sessions": 34}, {"cohort": "2026-03-13", "sessions": 19}, {"cohort": "2026-03-07", "sessions": 5}]}, {"sessionDate": "2026-03-17", "totalSessions": 92, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-13", "sessions": 30}, {"cohort": "2026-03-07", "sessions": 26}, {"cohort": "2026-02-21", "sessions": 18}, {"cohort": "2026-03-06", "sessions": 10}, {"cohort": "2026-02-28", "sessions": 8}]}, {"sessionDate": "2026-03-18", "totalSessions": 113, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-13", "sessions": 50}, {"cohort": "2026-03-06", "sessions": 34}, {"cohort": "2026-02-21", "sessions": 18}, {"cohort": "2026-02-28", "sessions": 9}, {"cohort": "2026-03-07", "sessions": 2}]}, {"sessionDate": "2026-03-19", "totalSessions": 100, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-13", "sessions": 62}, {"cohort": "2026-02-28", "sessions": 15}, {"cohort": "2026-03-06", "sessions": 15}, {"cohort": "2026-02-21", "sessions": 4}, {"cohort": "2026-03-07", "sessions": 4}]}, {"sessionDate": "2026-03-20", "totalSessions": 118, "newAsinCount": 118656, "cohortParts": [{"cohort": "2026-03-13", "sessions": 69}, {"cohort": "2026-02-28", "sessions": 22}, {"cohort": "2026-03-06", "sessions": 16}, {"cohort": "2026-02-21", "sessions": 11}]}, {"sessionDate": "2026-03-21", "totalSessions": 94, "newAsinCount": 176292, "cohortParts": [{"cohort": "2026-03-13", "sessions": 69}, {"cohort": "2026-02-28", "sessions": 8}, {"cohort": "2026-03-06", "sessions": 8}, {"cohort": "2026-02-21", "sessions": 6}, {"cohort": "2026-03-07", "sessions": 3}]}, {"sessionDate": "2026-03-22", "totalSessions": 123, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-13", "sessions": 97}, {"cohort": "2026-03-06", "sessions": 11}, {"cohort": "2026-02-21", "sessions": 7}, {"cohort": "2026-02-28", "sessions": 6}, {"cohort": "2026-03-20", "sessions": 2}]}, {"sessionDate": "2026-03-23", "totalSessions": 130, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-13", "sessions": 41}, {"cohort": "2026-03-06", "sessions": 29}, {"cohort": "2026-03-21", "sessions": 23}, {"cohort": "2026-02-21", "sessions": 12}, {"cohort": "2026-02-28", "sessions": 12}, {"cohort": "2026-03-20", "sessions": 7}, {"cohort": "2026-03-07", "sessions": 6}]}, {"sessionDate": "2026-03-24", "totalSessions": 82, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-21", "sessions": 27}, {"cohort": "2026-02-28", "sessions": 20}, {"cohort": "2026-03-20", "sessions": 17}, {"cohort": "2026-03-13", "sessions": 13}, {"cohort": "2026-03-06", "sessions": 3}, {"cohort": "2026-03-07", "sessions": 2}]}, {"sessionDate": "2026-03-25", "totalSessions": 65, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-20", "sessions": 24}, {"cohort": "2026-03-21", "sessions": 23}, {"cohort": "2026-03-13", "sessions": 9}, {"cohort": "2026-02-28", "sessions": 5}, {"cohort": "2026-03-06", "sessions": 4}]}, {"sessionDate": "2026-03-26", "totalSessions": 71, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-20", "sessions": 29}, {"cohort": "2026-03-21", "sessions": 23}, {"cohort": "2026-03-13", "sessions": 9}, {"cohort": "2026-02-28", "sessions": 7}, {"cohort": "2026-03-07", "sessions": 2}, {"cohort": "2026-03-06", "sessions": 1}]}, {"sessionDate": "2026-03-27", "totalSessions": 84, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-21", "sessions": 41}, {"cohort": "2026-03-20", "sessions": 31}, {"cohort": "2026-03-06", "sessions": 6}, {"cohort": "2026-03-13", "sessions": 4}, {"cohort": "2026-02-28", "sessions": 2}]}, {"sessionDate": "2026-03-28", "totalSessions": 78, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-21", "sessions": 32}, {"cohort": "2026-03-20", "sessions": 20}, {"cohort": "2026-02-28", "sessions": 12}, {"cohort": "2026-03-06", "sessions": 8}, {"cohort": "2026-03-13", "sessions": 4}, {"cohort": "2026-03-07", "sessions": 2}]}, {"sessionDate": "2026-03-29", "totalSessions": 124, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-21", "sessions": 54}, {"cohort": "2026-03-20", "sessions": 53}, {"cohort": "2026-02-28", "sessions": 11}, {"cohort": "2026-03-06", "sessions": 3}, {"cohort": "2026-03-13", "sessions": 2}, {"cohort": "2026-03-07", "sessions": 1}]}, {"sessionDate": "2026-03-30", "totalSessions": 75, "newAsinCount": 0, "cohortParts": [{"cohort": "2026-03-20", "sessions": 29}, {"cohort": "2026-03-21", "sessions": 21}, {"cohort": "2026-03-13", "sessions": 10}, {"cohort": "2026-02-28", "sessions": 9}, {"cohort": "2026-03-06", "sessions": 6}]}], "kpi": {"totalAsin": 1313329, "activeAsin": 1259314, "listingSince": "2026-02-20"}, "cohortTable": [{"cohortDate": "2026-02-20", "newAsin": 1176, "daySessions": [0, 0, 0, 27, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-02-21", "newAsin": 251730, "daySessions": [0, 8, 9, 84, 49, 83, 58, 123, 89, 104, 105, 108, 81, 71, 60, 92, 74, 13, 45, 20, 19, 23, 6, 34, 18, 18, 4, 11, 6, 7]}, {"cohortDate": "2026-02-28", "newAsin": 257052, "daySessions": [2, 5, 9, 4, 41, 27, 42, 74, 33, 28, 61, 74, 54, 48, 32, 40, 34, 8, 9, 15, 22, 8, 6, 12, 20, 5, 7, 2, 12, 11]}, {"cohortDate": "2026-03-06", "newAsin": 212760, "daySessions": [8, 4, 4, 11, 34, 62, 46, 74, 50, 46, 55, 10, 34, 15, 16, 8, 11, 29, 3, 4, 1, 6, 8, 3, 6, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-07", "newAsin": 36396, "daySessions": [0, 3, 2, 16, 8, 6, 17, 12, 6, 5, 26, 2, 4, 0, 3, 0, 6, 2, 0, 2, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-13", "newAsin": 250092, "daySessions": [8, 2, 2, 19, 30, 50, 62, 69, 69, 97, 41, 13, 9, 9, 4, 4, 2, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-20", "newAsin": 118656, "daySessions": [0, 0, 2, 7, 17, 24, 29, 31, 20, 53, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-21", "newAsin": 176292, "daySessions": [0, 0, 23, 27, 23, 23, 41, 32, 54, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-03-31", "newAsin": 4680, "daySessions": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, {"cohortDate": "2026-04-01", "newAsin": 4675, "daySessions": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}], "cohortListingAsin": {"2026-02-20": 1176, "2026-02-21": 251730, "2026-02-28": 257052, "2026-03-06": 212760, "2026-03-07": 36396, "2026-03-13": 250092, "2026-03-20": 118656, "2026-03-21": 176292}}}, "kpiSource": "amazon_listing", "cohortTrackDays": 30}</script>
+  <script>
+  const P = JSON.parse(document.getElementById('payload').textContent);
+  const sel = document.getElementById('storeSel');
+  const sinceLbl = document.getElementById('sinceLbl');
+  const rangeHint = document.getElementById('rangeHint');
+  const kpiTotal = document.getElementById('kpiTotal');
+  const kpiActive = document.getElementById('kpiActive');
+
+  sinceLbl.textContent = P.listingSince;
+  (function setRangeHint() {
+    var rq0 = P.sessionRequestedStart || P.sessionChartStart;
+    var rq1 = P.sessionRequestedEnd || P.sessionChartEnd;
+    var h = '请求 session 区间：' + rq0 + ' ~ ' + rq1;
+    if (P.sessionChartStart && (P.chartRangeAutoExpanded || P.sessionChartStart !== rq0 || P.sessionChartEnd !== rq1)) {
+      h += ' · 图表使用：' + P.sessionChartStart + ' ~ ' + P.sessionChartEnd;
+    }
+    if (P.chartRangeAutoExpanded) {
+      h += '（本地在请求区间内无数据，已自动扩展到表内 session_date 范围）';
+    }
+    h += ' · 生成日 ' + P.generatedAt;
+    rangeHint.textContent = h;
+  })();
+  (function setNoDataText() {
+    var el = document.getElementById('noData');
+    var parts = ['当前视图下仍无 session 数据（本地 daily_upload_asin_dates 在该区间为空）。'];
+    if (P.localSessionMin && P.localSessionMax) {
+      parts.push('表中已有 session_date 约在 ' + P.localSessionMin + ' ~ ' + P.localSessionMax + '，请检查店铺筛选或先执行 daily_upload 同步。');
+    } else {
+      parts.push('本地表尚无数据，请在 backend 目录运行：python3.11 -m app.services.daily_upload_asin_data --start-date … --end-date …');
+    }
+    el.textContent = parts.join('');
+  })();
+  var kpiHint = document.getElementById('kpiSourceHint');
+  if (P.kpiSource === 'amazon_listing') {
+    kpiHint.textContent = '说明：KPI 与表格第二列为 amazon_listing 全表行数 COUNT(*)（含 asin 为空），与 `COUNT(*), DATE(created_at) GROUP BY DATE(created_at)` 一致；第1～30天为本地表按 created_at 批次的 session。若请求区间内无 session，图表会按本地 session_date 全局范围扩展。';
+  } else {
+    kpiHint.textContent = '说明：线上库未配置或不可用，上新相关数字回退为本地 daily_upload_asin_dates（与 listing 口径可能不一致）。';
+  }
+  document.getElementById('cohortTableHint').textContent =
+    '上新统计区间：' + P.listingSince + ' ～ ' + P.listingThrough + '（与图表 session 区间无关）。「listing 当日行数」= online 全表 COUNT(*), DATE(created_at)（含 asin 为空，与 ad-hoc SQL 一致）。「第 k 天」= 本地 created_at=该上新日 且 session_date=上新日+(k-1) 的 sessions。Online 不可用时第二列由本地表按 created_at 估算。';
+
+  sel.innerHTML = '';
+  const optAll = document.createElement('option');
+  optAll.value = 'all';
+  optAll.textContent = '全部店铺（聚合）';
+  sel.appendChild(optAll);
+  (P.storeIds || []).forEach(function (id) {
+    const o = document.createElement('option');
+    o.value = String(id);
+    o.textContent = '店铺 ' + id;
+    sel.appendChild(o);
+  });
+
+  let chart = null;
+  var currentTooltipView = null;
+
+  function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function hideChartTooltipEl() {
+    var el = document.getElementById('daily-report-chart-tooltip');
+    if (el) {
+      el.style.opacity = '0';
+      el.style.visibility = 'hidden';
+      el.style.pointerEvents = 'none';
+    }
+  }
+
+  function ensureChartTooltipEl() {
+    var el = document.getElementById('daily-report-chart-tooltip');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'daily-report-chart-tooltip';
+      el.className = 'chart-tooltip-external';
+      el.setAttribute('role', 'tooltip');
+      document.body.appendChild(el);
+    }
+    return el;
+  }
+
+  function positionChartTooltipEl(el, context) {
+    var tooltip = context.tooltip;
+    var canvas = context.chart.canvas;
+    var rect = canvas.getBoundingClientRect();
+    var pad = 8;
+    el.style.transform = 'translateX(-50%)';
+    el.style.left = (rect.left + tooltip.caretX) + 'px';
+    el.style.top = (rect.top + tooltip.caretY + 12) + 'px';
+    var br = el.getBoundingClientRect();
+    var left = br.left;
+    if (br.right > window.innerWidth - pad) {
+      left = window.innerWidth - pad - br.width;
+    }
+    if (left < pad) left = pad;
+    el.style.left = left + 'px';
+    el.style.transform = 'none';
+    br = el.getBoundingClientRect();
+    if (br.bottom > window.innerHeight - pad) {
+      el.style.top = Math.max(pad, rect.top + tooltip.caretY - el.offsetHeight - 12) + 'px';
+    }
+  }
+
+  function renderExternalTooltip(context) {
+    var tooltip = context.tooltip;
+    var el = ensureChartTooltipEl();
+    var v = currentTooltipView;
+
+    if (tooltip.opacity === 0 || !v || !tooltip.dataPoints || !tooltip.dataPoints.length) {
+      hideChartTooltipEl();
+      return;
+    }
+
+    var idx = tooltip.dataPoints[0].dataIndex;
+    var day = v.byDay[idx];
+    if (!day) {
+      hideChartTooltipEl();
+      return;
+    }
+
+    var html = '<div class="chart-tooltip-external-title">' + escapeHtml(day.sessionDate) + '</div>';
+    html += '<div class="chart-tooltip-external-scroll">';
+
+    tooltip.dataPoints.forEach(function (dp) {
+      var ds = dp.dataset;
+      var dsi = dp.datasetIndex;
+      var color = ds.backgroundColor || ds.borderColor || '#888';
+      if (ds.type === 'line') {
+        var yv = dp.parsed.y;
+        html += '<div class="chart-tooltip-external-row"><span class="swatch" style="background:' + escapeHtml(color) + '"></span><span class="txt">' +
+          escapeHtml(ds.label) + ': ' + Number(yv).toLocaleString() + '</span></div>';
+      } else {
+        var cd = v.cohortLabels[dsi];
+        var m = v.cohortListingAsin || {};
+        var na = cd != null ? m[cd] : null;
+        var ns = na != null && na !== undefined ? Number(na).toLocaleString() : '—';
+        html += '<div class="chart-tooltip-external-row"><span class="swatch" style="background:' + escapeHtml(color) + '"></span><span class="txt">' +
+          escapeHtml(ds.label) + ': ' + ns + '（listing 行数）</span></div>';
+      }
+    });
+
+    html += '<div class="chart-tooltip-external-sep">────────</div><div class="chart-tooltip-external-footer">';
+    html += '<div>当日 sessions 合计: ' + day.totalSessions.toLocaleString() + '</div>';
+    html += '<div>当日上新 ASIN 数: ' + day.newAsinCount.toLocaleString() + '</div>';
+    if (day.cohortParts && day.cohortParts.length) {
+      html += '<div class="chart-tooltip-external-sub">各批次 sessions:</div>';
+      day.cohortParts.forEach(function (p) {
+        html += '<div class="chart-tooltip-external-sub">  · 批次 ' + escapeHtml(p.cohort) + ': ' +
+          Number(p.sessions).toLocaleString() + '</div>';
+      });
+    }
+    html += '</div></div>';
+
+    el.innerHTML = html;
+    el.style.opacity = '1';
+    el.style.visibility = 'visible';
+    el.style.pointerEvents = 'auto';
+    el.style.position = 'fixed';
+    positionChartTooltipEl(el, context);
+  }
+
+  function viewForKey(k) {
+    return P.views[k] || P.views.all;
+  }
+
+  function renderCohortTable(v) {
+    var tbl = document.getElementById('cohortTbl');
+    var nd = P.cohortTrackDays || 30;
+    if (!v.cohortTable || !v.cohortTable.length) {
+      tbl.innerHTML = '<tbody><tr><td class="muted" colspan="' + (2 + nd) +
+        '">暂无行：该店铺在 listing 区间内无上新记录，或 online 不可用时本地亦无对应 created_at。</td></tr></tbody>';
+      return;
+    }
+    var hr = '<tr><th>上新日</th><th>listing 当日行数</th>';
+    for (var i = 1; i <= nd; i++) {
+      hr += '<th title="该批 listing ASIN 在上新日起第 ' + i + ' 个日历日的 sessions 合计">第' + i + '天</th>';
+    }
+    hr += '</tr>';
+    var body = '';
+    v.cohortTable.forEach(function (row) {
+      body += '<tr><td>' + row.cohortDate + '</td><td>' + row.newAsin.toLocaleString() + '</td>';
+      for (var j = 0; j < nd; j++) {
+        var val = (row.daySessions && row.daySessions[j] !== undefined) ? row.daySessions[j] : 0;
+        body += '<td>' + Number(val).toLocaleString() + '</td>';
+      }
+      body += '</tr>';
+    });
+    tbl.innerHTML = '<thead>' + hr + '</thead><tbody>' + body + '</tbody>';
+  }
+
+    function applyView(k) {
+    const v = viewForKey(k);
+    currentTooltipView = v;
+    const noData = document.getElementById('noData');
+    const ctx = document.getElementById('ch');
+    const chartBox = document.querySelector('.chart-canvas-box');
+    kpiTotal.textContent = v.kpi.totalAsin.toLocaleString();
+    kpiActive.textContent = v.kpi.activeAsin.toLocaleString();
+    renderCohortTable(v);
+
+    if (!v.labels.length || !v.datasets.length) {
+      noData.style.display = 'block';
+      if (chartBox) chartBox.style.display = 'none';
+      ctx.style.display = 'none';
+      if (chart) {
+        hideChartTooltipEl();
+        chart.destroy();
+        chart = null;
+      }
+      return;
+    }
+    noData.style.display = 'none';
+    if (chartBox) chartBox.style.display = '';
+    ctx.style.display = 'block';
+
+    var lt = (v.lineTotal && v.lineTotal.length) ? v.lineTotal.map(Number) : v.byDay.map(function (d) { return d.totalSessions; });
+    var maxY = 0;
+    for (var i = 0; i < lt.length; i++) { if (lt[i] > maxY) maxY = lt[i]; }
+    maxY = maxY > 0 ? maxY : 1;
+    var yMax = maxY * 1.12;
+
+    var lineDs = {
+      type: 'line',
+      label: '当日 sessions 合计',
+      data: lt,
+      borderColor: '#111827',
+      backgroundColor: 'transparent',
+      borderWidth: 2.5,
+      pointRadius: 4,
+      pointBackgroundColor: '#111827',
+      tension: 0.2,
+      order: 100,
+      yAxisID: 'y1',
+    };
+
+    const cfg = {
+      type: 'bar',
+      data: {
+        labels: v.labels,
+        datasets: v.datasets.concat([lineDs]),
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        scales: {
+          x: {
+            stacked: true,
+            ticks: {
+              maxRotation: typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(max-width: 520px)').matches ? 65 : 45,
+              minRotation: 0,
+              font: { size: typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(max-width: 520px)').matches ? 9 : 11 },
+            },
+          },
+          y: {
+            stacked: true,
+            beginAtZero: true,
+            max: yMax,
+            title: { display: true, text: 'Sessions（堆叠）' },
+          },
+          y1: {
+            stacked: false,
+            beginAtZero: true,
+            max: yMax,
+            position: 'right',
+            grid: { drawOnChartArea: false },
+            title: { display: true, text: '合计（折线）' },
+          },
+        },
+        plugins: {
+          legend: {
+            position: 'top',
+            labels: {
+              boxWidth: 10,
+              font: { size: typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(max-width: 520px)').matches ? 8 : 10 },
+            },
+          },
+          tooltip: {
+            enabled: false,
+            external: renderExternalTooltip,
+          },
+        },
+      },
+    };
+
+    if (chart) {
+      hideChartTooltipEl();
+      chart.destroy();
+    }
+    chart = new Chart(ctx, cfg);
+  }
+
+  sel.addEventListener('change', function () {
+    applyView(sel.value);
+  });
+  applyView('all');
+
+  var _resizeTimer;
+  window.addEventListener('resize', function () {
+    clearTimeout(_resizeTimer);
+    _resizeTimer = setTimeout(function () {
+      if (chart) chart.resize();
+    }, 120);
+  });
+  </script>
+</div>
+</body>
+</html>
