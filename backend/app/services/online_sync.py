@@ -19,6 +19,21 @@ from app.online_engine import get_online_engine
 from app.models import AsinPerformance
 
 
+def _log_mysql_exception(context: str, exc: BaseException) -> None:
+    """把 pymysql / MySQL 的 errno、message 打全（docker logs 截断时便于对照）。"""
+    parts = [context, f"{type(exc).__name__}: {exc!s}"]
+    orig = getattr(exc, "orig", None)
+    if orig is not None:
+        parts.append(f"orig={orig!s}")
+        oa = getattr(orig, "args", None)
+        if oa:
+            parts.append(f"orig.args={oa!r}")
+    ea = getattr(exc, "args", None)
+    if ea:
+        parts.append(f"exc.args={ea!r}")
+    logger.error(" | ".join(parts), exc_info=True)
+
+
 def _is_retryable_db_error(exc: Exception) -> bool:
     """MySQL 死锁/锁等待超时判定：1213 deadlock, 1205 lock wait timeout。"""
     msg = str(exc).lower()
@@ -931,167 +946,177 @@ def _upsert_batch(local_db: Session, rows: list, table_name: str, progress_inter
     使用 order_id 判断是否已写入：同组内合并 order_id；更新时对指标类字段做补全。
     """
     log_prefix = f"[AsinUpsert:{table_name}]"
-    key_to_row = {_upsert_key(_row_to_dict(r)): r for r in rows}
-    original_count = len(rows)
-    rows = list(key_to_row.values())
-    if len(rows) < original_count:
-        logger.info(
-            "%s deduped: %s -> %s rows by (store_id, parent_asin, child_asin, week_no, search_query)",
-            log_prefix,
-            original_count,
-            len(rows),
-        )
 
-    # 本批中「有非空 search_query」的 (store_id, parent_asin, child_asin, week_no) 组
-    groups_with_incoming_search = set()
-    for r in rows:
-        d = _row_to_dict(r)
-        sq = d.get("search_query")
-        if sq is not None and isinstance(sq, str) and sq.strip():
-            groups_with_incoming_search.add((d.get("store_id"), d.get("parent_asin"), d.get("child_asin"), d.get("week_no")))
-
-    # 若库里该组无 search_query 数据（仅 NULL 占位），则删掉占位记录，后续按条插入；若库里已有 search_query 数据则不删，后续按条比对/更新
-    deleted_placeholders = 0
-    for gkey in groups_with_incoming_search:
-        sid, pa, ca, wn = gkey
-        existing_rows = (
-            local_db.query(AsinPerformance)
-            .filter(
-                AsinPerformance.store_id == sid,
-                AsinPerformance.parent_asin == pa,
-                AsinPerformance.child_asin == ca,
-                AsinPerformance.week_no == wn,
+    def _do():
+        key_to_row = {_upsert_key(_row_to_dict(r)): r for r in rows}
+        original_count = len(rows)
+        rows = list(key_to_row.values())
+        if len(rows) < original_count:
+            logger.info(
+                "%s deduped: %s -> %s rows by (store_id, parent_asin, child_asin, week_no, search_query)",
+                log_prefix,
+                original_count,
+                len(rows),
             )
-            .all()
-        )
-        if not existing_rows:
-            continue
-        if not _has_search_query_data(existing_rows):
-            n = (
+
+        # 本批中「有非空 search_query」的 (store_id, parent_asin, child_asin, week_no) 组
+        groups_with_incoming_search = set()
+        for r in rows:
+            d = _row_to_dict(r)
+            sq = d.get("search_query")
+            if sq is not None and isinstance(sq, str) and sq.strip():
+                groups_with_incoming_search.add((d.get("store_id"), d.get("parent_asin"), d.get("child_asin"), d.get("week_no")))
+
+        # 若库里该组无 search_query 数据（仅 NULL 占位），则删掉占位记录，后续按条插入；若库里已有 search_query 数据则不删，后续按条比对/更新
+        deleted_placeholders = 0
+        for gkey in groups_with_incoming_search:
+            sid, pa, ca, wn = gkey
+            existing_rows = (
                 local_db.query(AsinPerformance)
                 .filter(
                     AsinPerformance.store_id == sid,
                     AsinPerformance.parent_asin == pa,
                     AsinPerformance.child_asin == ca,
                     AsinPerformance.week_no == wn,
-                    or_(AsinPerformance.search_query.is_(None), AsinPerformance.search_query == ""),
                 )
-                .delete(synchronize_session=False)
+                .all()
             )
-            deleted_placeholders += n
-    if deleted_placeholders:
-        local_db.flush()
-        logger.info(
-            "%s deleted %s placeholder row(s) (empty search_query) for groups that now have search_query data from online",
-            log_prefix,
-            deleted_placeholders,
-        )
-
-    # 按 (store_id, parent_asin, child_asin, week_no) 预计算合并后的 order_id 与 order_num（与库中已有合并、仅新 id 累加）
-    group_key_to_order = {}
-    seen_groups = set()
-    for r in rows:
-        d = _row_to_dict(r)
-        incoming_ids_str = d.get("order_id")
-        incoming_num = d.get("order_num") or 0
-        key = (d.get("store_id"), d.get("parent_asin"), d.get("child_asin"), d.get("week_no"))
-        if key in seen_groups or (incoming_ids_str is None and incoming_num == 0):
-            continue
-        seen_groups.add(key)
-        existing_row = (
-            local_db.query(AsinPerformance.order_id, AsinPerformance.order_num)
-            .filter(
-                AsinPerformance.store_id == key[0],
-                AsinPerformance.parent_asin == key[1],
-                AsinPerformance.child_asin == key[2],
-                AsinPerformance.week_no == key[3],
-            )
-            .first()
-        )
-        existing_ids = _parse_order_ids(existing_row[0]) if existing_row and existing_row[0] else set()
-        existing_num = int(existing_row[1]) if existing_row and existing_row[1] is not None else 0
-        incoming_ids = _parse_order_ids(incoming_ids_str) if incoming_ids_str else set()
-        merged_ids = existing_ids | incoming_ids
-        new_count = len(merged_ids) - len(existing_ids)
-        group_order_num = existing_num + new_count
-        group_key_to_order[key] = (_format_order_ids(merged_ids), group_order_num)
-
-    rows_inserted = 0
-    rows_updated = 0
-    total = len(rows)
-    for i, row in enumerate(rows):
-        d = _row_to_dict(row)
-        gkey = (d.get("store_id"), d.get("parent_asin"), d.get("child_asin"), d.get("week_no"))
-        if gkey in group_key_to_order:
-            ord_str, ord_num = group_key_to_order[gkey]
-            d["order_id"] = ord_str
-            d["order_num"] = ord_num
-        incoming_order = d.get("order_num") or 0
-        # 按 (store_id, parent_asin, child_asin, week_no, search_query) 查找已有记录；search_query 将 NULL 与空串视为一致（避免 MySQL UNIQUE 允许多个 NULL 导致重复插入）
-        q = local_db.query(AsinPerformance).filter(
-            AsinPerformance.store_id == d.get("store_id"),
-            AsinPerformance.parent_asin == d.get("parent_asin"),
-            AsinPerformance.child_asin == d.get("child_asin"),
-            AsinPerformance.week_no == d.get("week_no"),
-        )
-        sq = d.get("search_query")
-        if sq is None or (isinstance(sq, str) and sq.strip() == ""):
-            q = q.filter(or_(AsinPerformance.search_query.is_(None), AsinPerformance.search_query == ""))
-        else:
-            q = q.filter(AsinPerformance.search_query == sq)
-        existing = q.first()
-        if existing:
-            # 若本行带非空 search_query：比对内容；相同则跳过，不同则按线上更新
-            if sq is not None and isinstance(sq, str) and sq.strip():
-                if _row_content_equal(d, existing):
-                    if progress_interval and ((i + 1) % progress_interval == 0 or (i + 1) == total):
-                        logger.info(
-                            "%s progress: %s / %s (inserted=%s, updated=%s)",
-                            log_prefix,
-                            i + 1,
-                            total,
-                            rows_inserted,
-                            rows_updated,
-                        )
-                    continue
-            if incoming_order > 0:
-                existing.order_num = d["order_num"]
-                existing.order_id = d.get("order_id")
-            for k, v in d.items():
-                if k in ("order_num", "order_id"):
-                    continue
-                if k in _METRIC_FIELDS_TO_MERGE and v is None:
-                    # 本次为空时保留表中已有值，实现补全逻辑（第二次/第三次同步用 online 有值覆盖表中原无数据）
-                    continue
-                setattr(existing, k, v)
-            rows_updated += 1
-        else:
-            if incoming_order == 0 and table_name == "step2":
-                d["order_id"] = None
-                d["order_num"] = None
-            # 插入时 search_query 空串统一为 None，与查找时 NULL/空串等价一致，避免日后重复插入
-            if isinstance(d.get("search_query"), str) and d["search_query"].strip() == "":
-                d["search_query"] = None
-            local_db.add(AsinPerformance(**d))
-            rows_inserted += 1
-        if progress_interval and ((i + 1) % progress_interval == 0 or (i + 1) == total):
+            if not existing_rows:
+                continue
+            if not _has_search_query_data(existing_rows):
+                n = (
+                    local_db.query(AsinPerformance)
+                    .filter(
+                        AsinPerformance.store_id == sid,
+                        AsinPerformance.parent_asin == pa,
+                        AsinPerformance.child_asin == ca,
+                        AsinPerformance.week_no == wn,
+                        or_(AsinPerformance.search_query.is_(None), AsinPerformance.search_query == ""),
+                    )
+                    .delete(synchronize_session=False)
+                )
+                deleted_placeholders += n
+        if deleted_placeholders:
+            local_db.flush()
             logger.info(
-                "%s progress: %s / %s (inserted=%s, updated=%s)",
+                "%s deleted %s placeholder row(s) (empty search_query) for groups that now have search_query data from online",
                 log_prefix,
-                i + 1,
-                total,
-                rows_inserted,
-                rows_updated,
+                deleted_placeholders,
             )
-    # 同组所有记录同步 order_id/order_num（含未在本批出现的 search_query 行）
-    for (sid, pa, ca, wn), (oid_str, onum) in group_key_to_order.items():
-        local_db.query(AsinPerformance).filter(
-            AsinPerformance.store_id == sid,
-            AsinPerformance.parent_asin == pa,
-            AsinPerformance.child_asin == ca,
-            AsinPerformance.week_no == wn,
-        ).update({"order_id": oid_str, "order_num": onum}, synchronize_session=False)
-    return rows_inserted, rows_updated
+
+        # 按 (store_id, parent_asin, child_asin, week_no) 预计算合并后的 order_id 与 order_num（与库中已有合并、仅新 id 累加）
+        group_key_to_order = {}
+        seen_groups = set()
+        for r in rows:
+            d = _row_to_dict(r)
+            incoming_ids_str = d.get("order_id")
+            incoming_num = d.get("order_num") or 0
+            key = (d.get("store_id"), d.get("parent_asin"), d.get("child_asin"), d.get("week_no"))
+            if key in seen_groups or (incoming_ids_str is None and incoming_num == 0):
+                continue
+            seen_groups.add(key)
+            existing_row = (
+                local_db.query(AsinPerformance.order_id, AsinPerformance.order_num)
+                .filter(
+                    AsinPerformance.store_id == key[0],
+                    AsinPerformance.parent_asin == key[1],
+                    AsinPerformance.child_asin == key[2],
+                    AsinPerformance.week_no == key[3],
+                )
+                .first()
+            )
+            existing_ids = _parse_order_ids(existing_row[0]) if existing_row and existing_row[0] else set()
+            existing_num = int(existing_row[1]) if existing_row and existing_row[1] is not None else 0
+            incoming_ids = _parse_order_ids(incoming_ids_str) if incoming_ids_str else set()
+            merged_ids = existing_ids | incoming_ids
+            new_count = len(merged_ids) - len(existing_ids)
+            group_order_num = existing_num + new_count
+            group_key_to_order[key] = (_format_order_ids(merged_ids), group_order_num)
+
+        rows_inserted = 0
+        rows_updated = 0
+        total = len(rows)
+        for i, row in enumerate(rows):
+            d = _row_to_dict(row)
+            gkey = (d.get("store_id"), d.get("parent_asin"), d.get("child_asin"), d.get("week_no"))
+            if gkey in group_key_to_order:
+                ord_str, ord_num = group_key_to_order[gkey]
+                d["order_id"] = ord_str
+                d["order_num"] = ord_num
+            incoming_order = d.get("order_num") or 0
+            # 按 (store_id, parent_asin, child_asin, week_no, search_query) 查找已有记录；search_query 将 NULL 与空串视为一致（避免 MySQL UNIQUE 允许多个 NULL 导致重复插入）
+            q = local_db.query(AsinPerformance).filter(
+                AsinPerformance.store_id == d.get("store_id"),
+                AsinPerformance.parent_asin == d.get("parent_asin"),
+                AsinPerformance.child_asin == d.get("child_asin"),
+                AsinPerformance.week_no == d.get("week_no"),
+            )
+            sq = d.get("search_query")
+            if sq is None or (isinstance(sq, str) and sq.strip() == ""):
+                q = q.filter(or_(AsinPerformance.search_query.is_(None), AsinPerformance.search_query == ""))
+            else:
+                q = q.filter(AsinPerformance.search_query == sq)
+            existing = q.first()
+            if existing:
+                # 若本行带非空 search_query：比对内容；相同则跳过，不同则按线上更新
+                if sq is not None and isinstance(sq, str) and sq.strip():
+                    if _row_content_equal(d, existing):
+                        if progress_interval and ((i + 1) % progress_interval == 0 or (i + 1) == total):
+                            logger.info(
+                                "%s progress: %s / %s (inserted=%s, updated=%s)",
+                                log_prefix,
+                                i + 1,
+                                total,
+                                rows_inserted,
+                                rows_updated,
+                            )
+                        continue
+                if incoming_order > 0:
+                    existing.order_num = d["order_num"]
+                    existing.order_id = d.get("order_id")
+                for k, v in d.items():
+                    if k in ("order_num", "order_id"):
+                        continue
+                    if k in _METRIC_FIELDS_TO_MERGE and v is None:
+                        # 本次为空时保留表中已有值，实现补全逻辑（第二次/第三次同步用 online 有值覆盖表中原无数据）
+                        continue
+                    setattr(existing, k, v)
+                rows_updated += 1
+            else:
+                if incoming_order == 0 and table_name == "step2":
+                    d["order_id"] = None
+                    d["order_num"] = None
+                # 插入时 search_query 空串统一为 None，与查找时 NULL/空串等价一致，避免日后重复插入
+                if isinstance(d.get("search_query"), str) and d["search_query"].strip() == "":
+                    d["search_query"] = None
+                local_db.add(AsinPerformance(**d))
+                rows_inserted += 1
+            if progress_interval and ((i + 1) % progress_interval == 0 or (i + 1) == total):
+                logger.info(
+                    "%s progress: %s / %s (inserted=%s, updated=%s)",
+                    log_prefix,
+                    i + 1,
+                    total,
+                    rows_inserted,
+                    rows_updated,
+                )
+        # 同组所有记录同步 order_id/order_num（含未在本批出现的 search_query 行）
+        for (sid, pa, ca, wn), (oid_str, onum) in group_key_to_order.items():
+            local_db.query(AsinPerformance).filter(
+                AsinPerformance.store_id == sid,
+                AsinPerformance.parent_asin == pa,
+                AsinPerformance.child_asin == ca,
+                AsinPerformance.week_no == wn,
+            ).update({"order_id": oid_str, "order_num": onum}, synchronize_session=False)
+        return rows_inserted, rows_updated
+    try:
+        return _do()
+    except Exception as e:
+        _log_mysql_exception(
+            f"{log_prefix} 本地 asin_performances 查询/更新失败（如 .first()、列缺失、连接中断）",
+            e,
+        )
+        raise
 
 
 def _recompute_parent_order_totals(local_db: Session) -> int:
