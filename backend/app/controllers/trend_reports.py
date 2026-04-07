@@ -304,8 +304,8 @@ def trend_new_listing_report(
         init_db()
         db = SessionLocal()
         try:
-            # JSON：KPI 仍可走本地（prefer_online=False）以减轻首屏；但 cohort 表「上新日 / 上新 ASIN 数」必须与线上 amazon_listing 一致。
-            prefer_online = response_format != "json"
+            # KPI / cohort 与 amazon_listing 均须来自 online_db_host；不因 format=json 回退本地 daily_upload KPI。
+            prefer_online = True
             prefer_listing_online = True
             payload = build_report_payload(
                 db,

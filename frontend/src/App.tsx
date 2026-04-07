@@ -2707,10 +2707,12 @@ function TrendNewListingEmbeddedPage() {
         首次进入若无缓存会自动请求一次；之后默认展示浏览器本地缓存，不自动打接口。地址栏加{' '}
         <code className="trend-new-listing-code">?refresh=1</code> 可强制重新拉取。
         {payload.kpiSource === 'amazon_listing'
-          ? ' 顶部 KPI：online amazon_listing，COUNT(*) 且 DATE(open_date) > listing_since；Active 另加 status = Active。'
-          : payload.kpiSource === 'amazon_listing_new_asin_local_kpi'
-            ? ' 上新日 / 各日上新 ASIN 数来自线上 amazon_listing；顶部 KPI 为本地表回退。'
-            : ''}
+          ? ' 顶部 KPI：online_db amazon_listing，COUNT(*) 且 DATE(open_date) > listing_since；Active 另加 status = Active。'
+          : payload.kpiSource === 'amazon_listing_unreachable'
+            ? ' 已配置 online_db 但当前无法连接，KPI 显示为 0（未用本地表代替）；请检查网络与账号权限。'
+            : payload.kpiSource === 'daily_upload_asin_dates_fallback'
+              ? ' 未配置 online_db：KPI 来自本地 daily_upload_asin_dates。'
+              : ''}
       </p>
       <div className="trend-new-listing-chart-wrap">
         {view.labels.length === 0 || barDatasets.length === 0 ? (

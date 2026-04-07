@@ -1187,8 +1187,8 @@ def sync_from_online_db() -> dict:
 
     init_db()
 
-    # date_start_str, date_end_str = _get_sync_date_range()
-    date_start_str, date_end_str = "2026-03-29", "2026-04-05"
+    date_start_str, date_end_str = _get_sync_date_range()
+    # date_start_str, date_end_str = "2026-03-29", "2026-04-05"
     logger.info("Sync date range: date_start=%s, date_end=%s", date_start_str, date_end_str)
 
     # week_no 以 date_end 减 1 天为参考日，保证 02-21～02-22 写入 202607（02-15～02-21 所在周）
