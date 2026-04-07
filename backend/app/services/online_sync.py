@@ -946,10 +946,12 @@ def _upsert_batch(local_db: Session, rows: list, table_name: str, progress_inter
     使用 order_id 判断是否已写入：同组内合并 order_id；更新时对指标类字段做补全。
     """
     log_prefix = f"[AsinUpsert:{table_name}]"
+    # _do() 内会对 rows 重新赋值；若直接读 rows 会与「局部 rows」冲突导致 UnboundLocalError
+    _incoming_rows = rows
 
     def _do():
-        key_to_row = {_upsert_key(_row_to_dict(r)): r for r in rows}
-        original_count = len(rows)
+        key_to_row = {_upsert_key(_row_to_dict(r)): r for r in _incoming_rows}
+        original_count = len(_incoming_rows)
         rows = list(key_to_row.values())
         if len(rows) < original_count:
             logger.info(
@@ -1185,8 +1187,8 @@ def sync_from_online_db() -> dict:
 
     init_db()
 
-    date_start_str, date_end_str = _get_sync_date_range()
-    # date_start_str, date_end_str = "2026-03-22", "2026-03-29"
+    # date_start_str, date_end_str = _get_sync_date_range()
+    date_start_str, date_end_str = "2026-03-29", "2026-04-05"
     logger.info("Sync date range: date_start=%s, date_end=%s", date_start_str, date_end_str)
 
     # week_no 以 date_end 减 1 天为参考日，保证 02-21～02-22 写入 202607（02-15～02-21 所在周）

@@ -4,8 +4,8 @@
 - 默认「全部店铺」聚合；可按 store_id 切换。
 - 堆叠柱 + 折线：折线为每日 sessions 合计（与柱顶一致），双 Y 轴同刻度对齐。
 - 悬停：各批次 sessions、当日合计、当日上新 ASIN 数（均可在 tooltip 查看）。
-- KPI「上新 ASIN 总数」等为线上 **amazon_listing** 按 **DATE(open_date)**（非 created_at）与堆叠批次一致；
-  条件含 asin 非空、open_date 非空。Online 不可用时回退本地表亦按 **open_date**。
+- KPI（Total / Active Asins）为线上 **amazon_listing**：`COUNT(*)`，`DATE(open_date) > listing_since`；Active 另加 `status = 'Active'`（与手写 SQL 对账）。
+  Online 不可用时回退本地表仍为近似口径（本地表按 session 行展开，非 listing 行数）。
 
 本地库表（仅 session 堆叠与回退）：daily_upload_asin_dates。
 图表下表格：第二列为 amazon_listing 的 COUNT(*), DATE(open_date)（条件 asin IS NOT NULL）；第 1～30 列为本地
@@ -236,52 +236,40 @@ def _try_online_conn() -> Connection | None:
 
 def _fetch_listing_kpi_online(conn: Connection, since: date, store_id: int | None) -> tuple[int, int]:
     """
-    amazon_listing：与堆叠图批次一致，按 **DATE(open_date) ≥ since**（open_date 非空、asin 非空）统计行数；
-    active 为其中至少一条 status=active 的 (店铺, asin) 去重数。
+    amazon_listing KPI（与线上一致对账 SQL）：
+    - Total：`COUNT(*)`，`DATE(open_date) > since`（严格大于 listing_since，不按 asin 过滤）
+    - Active：同上且 `status = 'Active'`
+    单店加 `store_id = :sid`；全店不加店铺条件。
     """
     if store_id is not None:
         total_sql = text(
             """
-            SELECT COUNT(*) FROM amazon_listing
-            WHERE asin IS NOT NULL AND TRIM(asin) <> ''
-              AND open_date IS NOT NULL
-              AND DATE(open_date) >= :since
-              AND store_id = :sid
+            SELECT COUNT(*) FROM amazon_listing al
+            WHERE DATE(al.open_date) > :since
+              AND al.store_id = :sid
             """
         )
         active_sql = text(
             """
-            SELECT COUNT(*) FROM (
-              SELECT store_id, asin FROM amazon_listing
-              WHERE asin IS NOT NULL AND TRIM(asin) <> ''
-                AND open_date IS NOT NULL
-                AND DATE(open_date) >= :since
-                AND store_id = :sid
-              GROUP BY store_id, asin
-              HAVING SUM(CASE WHEN LOWER(TRIM(COALESCE(status, ''))) = 'active' THEN 1 ELSE 0 END) > 0
-            ) t
+            SELECT COUNT(*) FROM amazon_listing al
+            WHERE DATE(al.open_date) > :since
+              AND al.store_id = :sid
+              AND al.status = 'Active'
             """
         )
         params = {"since": since, "sid": store_id}
     else:
         total_sql = text(
             """
-            SELECT COUNT(*) FROM amazon_listing
-            WHERE asin IS NOT NULL AND TRIM(asin) <> ''
-              AND open_date IS NOT NULL
-              AND DATE(open_date) >= :since
+            SELECT COUNT(*) FROM amazon_listing al
+            WHERE DATE(al.open_date) > :since
             """
         )
         active_sql = text(
             """
-            SELECT COUNT(*) FROM (
-              SELECT store_id, asin FROM amazon_listing
-              WHERE asin IS NOT NULL AND TRIM(asin) <> ''
-                AND open_date IS NOT NULL
-                AND DATE(open_date) >= :since
-              GROUP BY store_id, asin
-              HAVING SUM(CASE WHEN LOWER(TRIM(COALESCE(status, ''))) = 'active' THEN 1 ELSE 0 END) > 0
-            ) t
+            SELECT COUNT(*) FROM amazon_listing al
+            WHERE DATE(al.open_date) > :since
+              AND al.status = 'Active'
             """
         )
         params = {"since": since}
@@ -294,10 +282,8 @@ def _fetch_listing_new_asin_by_day_online(
     conn: Connection, store_id: int | None, d0: date, d1: date
 ) -> dict[date, int]:
     """
-    PST 报表：与 KPI / 对账 SQL 口径一致（同 _fetch_listing_kpi_online）：
-    - 以 DATE(open_date) 为「上新日」
-    - asin IS NOT NULL 且 TRIM(asin) <> ''；open_date 非空；按 DATE(open_date) BETWEEN d0..d1
-    - store_id 非 None 时仅统计该店铺（全店不传 store_id）
+    PST 报表：表格「按日上新行数」与 KPI 不同——此处仍按 asin 非空、DATE(open_date) BETWEEN d0..d1（与堆叠批次一致）。
+    KPI 全表行数见 _fetch_listing_kpi_online（open_date > listing_since、无 asin 条件）。
     """
     day_col = "DATE(al.open_date)"
     asin_ok = "al.asin IS NOT NULL AND TRIM(al.asin) <> ''"
@@ -1192,14 +1178,14 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
   <div class="kpi">
     <div class="kpi-card">
-      <span>自 <span id="sinceLbl"></span> 起上新 ASIN 总数</span>
+      <span>Total Asins</span>
       <strong id="kpiTotal">—</strong>
-      <div class="muted">amazon_listing 行数，不按 ASIN/店铺去重 · 详见下方说明</div>
+      <div class="muted">amazon_listing <code>COUNT(*)</code>，<code>DATE(open_date) &gt; listing_since</code>（全表行，含 asin 为空）</div>
     </div>
     <div class="kpi-card">
-      <span>其中 Active（listing status=active）</span>
+      <span>Active Asins</span>
       <strong id="kpiActive">—</strong>
-      <div class="muted">该 ASIN 在 listing 中至少一条为 active</div>
+      <div class="muted">同上且 <code>status = 'Active'</code></div>
     </div>
   </div>
   <p class="muted" id="kpiSourceHint" style="margin-bottom:16px"></p>
@@ -1252,9 +1238,9 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   })();
   var kpiHint = document.getElementById('kpiSourceHint');
   if (P.kpiSource === 'amazon_listing') {
-    kpiHint.textContent = '说明：堆叠图与 KPI 均以 open_date（PST）为批次日，不用 created_at。顶部卡片 = amazon_listing 中 asin 非空且 open_date 非空、DATE(open_date)≥listing_since 的行数；表格第二列为按日 COUNT(*)；第1～30天为本地按 open_date 批次的 session。若请求区间内无 session，图表会按本地 session_date 全局范围扩展。';
+    kpiHint.textContent = \"说明：顶部 KPI = online amazon_listing：Total 为 DATE(open_date) > listing_since 的 COUNT(*)；Active 另加 status = 'Active'。与下方表格第二列（按日、asin 非空）口径不同。堆叠图按 open_date 批次；第1～30天为本地 session。\";
   } else {
-    kpiHint.textContent = '说明：线上库未配置或不可用，KPI 回退为本地 daily_upload_asin_dates：open_date 非空且 open_date≥listing_since 的行数，与堆叠图批次口径一致。';
+    kpiHint.textContent = '说明：线上库未配置或不可用，KPI 回退为本地 daily_upload_asin_dates（口径与线上一致时请以 online 为准）。';
   }
   document.getElementById('cohortTableHint').textContent =
     '上新统计区间：' + P.listingSince + ' ～ ' + P.listingThrough + '（与图表 session 区间无关；listing_through 默认等于本次 session_end）。「listing 当日行数」= online amazon_listing 按店铺筛选后 COUNT(*)，条件 asin IS NOT NULL 且 open_date 非空，按 DATE(open_date) 分组（与 `SELECT DATE(open_date),COUNT(*),store_id … GROUP BY DATE(open_date),store_id` 对账时请用本 PST 报表，勿与按 created_at 的非 PST 报表混用）。「第 k 天」= 本地 daily_upload_asin_dates 中 DATE(open_date)=该上新日 且 DATE(session_date)=上新日+(k−1) 的 sessions 合计。图表折线按 session_date 把各批次堆叠相加，与表格某一行的「第几天」口径不同。Online 不可用时第二列由本地表按 open_date 日行数估算。';

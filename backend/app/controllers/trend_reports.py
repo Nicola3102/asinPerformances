@@ -98,7 +98,7 @@ def trend_session_impression_ads_html(
 ):
     """
     与 ``python -m app.services.weekly_upload_asin_date_add_impression_add_ads`` 相同数据逻辑；
-    周 impression 来自 ``amazon_search_data``：区间内涉及的 ``week_no`` 做**整表** ``SUM(impression_count)``，
+    周 impression 来自 ``amazon_search``：区间内涉及的 ``week_no`` 做**整表** ``SUM(impression_count)``，
     点落在该周周三（如 202609→2026-02-25）。
 
     **嵌入页**请先 ``?embed=1`` 取缓存，刷新浏览器后再 ``?rebuild=1`` 后台重算（由前端控制）。

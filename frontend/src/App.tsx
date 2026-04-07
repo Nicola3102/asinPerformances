@@ -83,8 +83,8 @@ interface TrendNewListingJsonPayload {
   kpiSource?: string
 }
 
-/** v3：cohort 上新数改与线上 amazon_listing（TRIM asin）一致，旧缓存丢弃 */
-const TREND_NEW_LISTING_CACHE_KEY = 'asinPerformances.v3.trendNewListingJson'
+/** v4：KPI 与线上 COUNT(*) open_date>since、status='Active' 对账 SQL 一致 */
+const TREND_NEW_LISTING_CACHE_KEY = 'asinPerformances.v4.trendNewListingJson'
 
 function readTrendNewListingCache(): TrendNewListingJsonPayload | null {
   try {
@@ -2681,7 +2681,7 @@ function TrendNewListingEmbeddedPage() {
           同步 listing 并重载
         </button>
         <span className="trend-new-listing-meta">
-          open_date ≥ {payload.listingSince} · 每批 {payload.cohortTrackDays ?? 30} 日 · 横轴{' '}
+          KPI：open_date &gt; {payload.listingSince}（amazon_listing 全表行）· 每批 {payload.cohortTrackDays ?? 30} 日 · 横轴{' '}
           {payload.sessionChartStart}～{payload.sessionChartEnd}
           {payload.chartRangeAutoExpanded ? '（已按本地数据扩展区间）' : ''}
           {fromCache ? (
@@ -2694,11 +2694,11 @@ function TrendNewListingEmbeddedPage() {
       </div>
       <div className="trend-new-listing-kpi">
         <div className="trend-new-listing-kpi-card">
-          <span className="trend-new-listing-kpi-title">Listing 行数（KPI）</span>
+          <span className="trend-new-listing-kpi-title">Total Asins</span>
           <strong>{Number(view.kpi?.totalAsin ?? 0).toLocaleString()}</strong>
         </div>
         <div className="trend-new-listing-kpi-card">
-          <span className="trend-new-listing-kpi-title">Active ASIN 数</span>
+          <span className="trend-new-listing-kpi-title">Active Asins</span>
           <strong>{Number(view.kpi?.activeAsin ?? 0).toLocaleString()}</strong>
         </div>
       </div>
@@ -2707,7 +2707,7 @@ function TrendNewListingEmbeddedPage() {
         首次进入若无缓存会自动请求一次；之后默认展示浏览器本地缓存，不自动打接口。地址栏加{' '}
         <code className="trend-new-listing-code">?refresh=1</code> 可强制重新拉取。
         {payload.kpiSource === 'amazon_listing'
-          ? ' KPI 与线上 amazon_listing 对账。'
+          ? ' 顶部 KPI：online amazon_listing，COUNT(*) 且 DATE(open_date) > listing_since；Active 另加 status = Active。'
           : payload.kpiSource === 'amazon_listing_new_asin_local_kpi'
             ? ' 上新日 / 各日上新 ASIN 数来自线上 amazon_listing；顶部 KPI 为本地表回退。'
             : ''}
@@ -2764,8 +2764,8 @@ function TrendNewListingEmbeddedPage() {
       <div className="trend-new-listing-table-wrap">
         <h3 className="trend-new-listing-table-title">批次明细（上新数 &amp; 上新后每日 sessions）</h3>
         <p className="trend-new-listing-table-caption">
-          前两列「上新日 / 上新 listing 行数」来自线上 <code className="trend-new-listing-code">amazon_listing</code>
-          （open_date ≥ {payload.listingSince}，asin 非空且去空格非空，与 KPI 同口径）；切换上方「店铺」按 store_id
+          前两列「上新日 / 上新 ASIN 数」来自线上 <code className="trend-new-listing-code">amazon_listing</code>
+          （open_date 在 [{payload.listingSince}, listing_through] 内按日、asin 非空且 TRIM 非空；与顶部 KPI 全表 COUNT(*) 口径不同）。切换「店铺」按 store_id
           切分。后列为本地 sessions 明细。
         </p>
         {!cohortTable.length ? (

@@ -318,7 +318,7 @@
                 if (ctx.dataset.yAxisID === 'y1') {
                   if (idxAdsImp >= 0 && ctx.datasetIndex === idxAdsImp)
                     return ' 广告 impressions（日）: ' + Number(v).toLocaleString();
-                  var line = ' 自然 impression（week_no）: ' + Number(v).toLocaleString();
+                  var line = ' total impressions（week_no）: ' + Number(v).toLocaleString();
                   if (idxImp >= 0 && ctx.datasetIndex === idxImp && ctx.dataset._impressionMeta) {
                     var m = ctx.dataset._impressionMeta[ctx.dataIndex];
                     if (m && m.weeks && m.weeks.length)
@@ -374,7 +374,7 @@
 
     if (impOn) {
       var dsImp = {
-        label: '自然 impression · week_no（右轴，点=周三）',
+        label: 'total impressions · week_no（右轴，点=周三）',
         data: impSeries.data,
         yAxisID: 'y1',
         borderColor: '#ffb347',
@@ -450,7 +450,7 @@
         { key: 'sess', idx: idxSessions, shortLabel: 'Sessions（左轴）', color: '#7dd3c0' },
       ];
       if (impOn && idxImp >= 0) {
-        specs.push({ key: 'imp', idx: idxImp, shortLabel: '自然 impression · week_no（右轴·周三）', color: '#ffb347' });
+        specs.push({ key: 'imp', idx: idxImp, shortLabel: 'total impressions · week_no（右轴·周三）', color: '#ffb347' });
       }
       if (adsOn && idxAdsClicks >= 0) {
         specs.push({ key: 'adclk', idx: idxAdsClicks, shortLabel: '广告 sessions（左轴）', color: '#e879f9' });

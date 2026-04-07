@@ -1,15 +1,15 @@
 """
 线上 amazon_sales_and_traffic_daily 按日总 sessions
-+ ``amazon_search_data`` 按 ``week_no`` 汇总**整周** ``SUM(impression_count)``
++ ``amazon_search`` 按 ``week_no`` 汇总**整周** ``SUM(impression_count)``
 + amazon_ads_ad_group_ad_report 按日全店汇总广告 clicks / impressions，多 Y 轴折线图 HTML。
 
 - Sessions：amazon_sales_and_traffic_daily，按 store_id、DATE(current_date) 汇总 SUM(sessions)；
   「全部店铺」为各店按日加总。
 - 广告：amazon_ads_ad_group_ad_report，SUM(clicks)、SUM(impressions)，store_id, DATE(current_date)；
   起止与命令行 / API 日期区间一致。
-- 自然周 impressions：**仅** ``amazon_search_data``：先用 ``DATE(start_date)`` 落在报表区间内的行确定涉及的 ``week_no``，
-  再对每个 ``week_no`` 汇总该表内**所有行**的 ``impression_count``（整周全量，不因区间截断而少算）。
-  横轴展示日为该周周三（周日为周首），例如 ``week_no=202609`` → ``2026-02-22``～``02-28`` → ``2026-02-25``。
+- 自然周 impressions：候选 ``week_no`` 由 ``amazon_search_data`` 中 ``DATE(start_date)`` 落在报表区间内的行去重得到（与线上一致）；
+  再对 ``amazon_search`` 同 ``week_no`` 做**整表** ``SUM(impression_count)``（整周全量）。
+  页面与 JSON 中的 ``week_no`` 为**数据表原样**；横轴周三由本模块 ``_week_no_to_week_range`` 按线上 ``week_no`` 编码解析（与 groupA 周定义不同）。
 
 用法（backend 目录）：
   python3.11 -m app.services.weekly_upload_asin_date_add_impression_add_ads \\
@@ -316,9 +316,9 @@ def fetch_impression_weekly(
     end_date: date,
 ) -> tuple[dict[int, list[dict]], list[dict]]:
     """
-    ``amazon_search_data``：区间内 ``DATE(start_date)`` 出现过的 ``week_no`` 作为候选，
-    再对每个 ``week_no`` 汇总**全表**该周 ``SUM(impression_count)``（整周总量）。
-    展示横坐标为 ``_week_no_to_week_range`` 的周三（如 202609 → 2026-02-25）。
+    候选 ``week_no``：``amazon_search_data`` 在报表区间内 ``DATE(start_date)`` 出现过的值（子查询，与线上一致）。
+    汇总：``amazon_search`` 上同 ``week_no`` **全表** ``SUM(impression_count)``。
+    返回的 ``week_no`` 字符串为查询结果原样（表内存储）；``d_min``/``mid``/``d_max`` 由 ``_week_no_to_week_range`` 解析该编码（非 groupA）。
 
     返回 (per_store_weeks, all_stores_weeks)。
     每项: week_no, impressions, d_min, d_max, mid (iso), store_id(单店时)。
@@ -331,24 +331,24 @@ def fetch_impression_weekly(
         "d1": end_date.strftime("%Y-%m-%d"),
     }
 
-    # 子查询：区间内至少有一行数据的 week_no；外层对该 week_no 不再按日期过滤，保证整周加总
     sql_by_store = text(
         """
-        SELECT asd.store_id,
-               asd.week_no,
-               SUM(COALESCE(asd.impression_count, 0)) AS total_impression
-        FROM amazon_search_data AS asd
-        WHERE asd.week_no IN (
+        SELECT s.store_id,
+               s.week_no,
+               SUM(COALESCE(s.impression_count, 0)) AS total_impression
+        FROM amazon_search AS s
+        WHERE s.week_no IN (
             SELECT DISTINCT asd2.week_no
             FROM amazon_search_data AS asd2
             WHERE asd2.week_no IS NOT NULL
               AND DATE(asd2.start_date) >= :d0 AND DATE(asd2.start_date) <= :d1
         )
-          AND asd.week_no IS NOT NULL
-        GROUP BY asd.store_id, asd.week_no
-        ORDER BY asd.week_no ASC, asd.store_id ASC
+          AND s.week_no IS NOT NULL
+        GROUP BY s.store_id, s.week_no
+        ORDER BY s.week_no ASC, s.store_id ASC
         """
     )
+
     per_store: dict[int, list[dict]] = {}
     all_weeks: list[dict] = []
     # 全店按周合计：由单次 GROUP BY store_id, week_no 的结果累加，避免对同一批 week_no 再扫全表
@@ -406,7 +406,7 @@ def fetch_impression_weekly(
         )
 
     logger.info(
-        "[ImpressionWeekly] source=amazon_search_data full_week_sum range=%s..%s store_groups=%s aggregate_weeks=%s",
+        "[ImpressionWeekly] source=amazon_search sum, week_filter=amazon_search_data.start_date range=%s..%s store_groups=%s aggregate_weeks=%s",
         params["d0"],
         params["d1"],
         len(per_store),
@@ -533,7 +533,7 @@ def render_html(payload: dict) -> str:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Sessions + amazon_search_data 周 Impression + 广告 Clicks / 日 Impressions</title>
+  <title>Sessions + amazon_search 周 Impression + 广告 Clicks / 日 Impressions</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
     :root {{
@@ -658,12 +658,12 @@ def render_html(payload: dict) -> str:
 </head>
 <body>
   <div class="wrap">
-    <h1>Traffic daily + amazon_search_data 周 impression + 广告 Clicks / 日 Impressions</h1>
+    <h1>Traffic daily + amazon_search 周 impression + 广告 Clicks / 日 Impressions</h1>
     <p class="query-cutoff" id="queryCutoffUtc8Line"></p>
     <p class="sub">
       <strong>左轴（0～500～1000…，步长 500）</strong>：<code>amazon_sales_and_traffic_daily</code> 按日 <code>SUM(sessions)</code>（绿）与 <code>amazon_ads_ad_group_ad_report</code> 按日 <code>SUM(clicks)</code>（紫）共用。<br />
-      <strong>右轴（0～1万～2万…，步长 1 万）</strong>：<code>amazon_search_data</code> 按 <code>week_no</code> 汇总<strong>整周</strong>
-      <code>SUM(impression_count)</code>（橙点，横坐标为周<strong>三</strong>，如 202609→2026-02-25）与 <code>广告日 impressions</code>（黄线）共用。<br />
+      <strong>右轴（0～1万～2万…，步长 1 万）</strong>：涉及周由 <code>amazon_search_data</code> 在报表区间内 <code>start_date</code> 出现过的 <code>week_no</code> 确定；<code>amazon_search</code> 按该 <code>week_no</code> 汇总<strong>整周</strong>
+      <code>SUM(impression_count)</code>（橙点；图上 <code>week_no</code> 为表内原值，横坐标为周三）与 <code>广告日 impressions</code>（黄线）共用。<br />
     </p>
     <div class="toolbar">
       <div>
@@ -681,7 +681,7 @@ def render_html(payload: dict) -> str:
       <h3>选中数据点</h3>
       <div id="pointValueBody"></div>
     </div>
-    <div id="detailPanel"><h3>amazon_search_data · week_no 整周 impression 汇总</h3><div id="detailBody"></div></div>
+    <div id="detailPanel"><h3>amazon_search 整周 impression（week_no 为表内原值）</h3><div id="detailBody"></div></div>
   </div>
   <script>
     var payload = {data_json};
@@ -848,7 +848,7 @@ def render_html(payload: dict) -> str:
                 if (ctx.dataset.yAxisID === 'y1') {{
                   if (idxAdsImp >= 0 && ctx.datasetIndex === idxAdsImp)
                     return ' 广告 impressions（日）: ' + Number(v).toLocaleString();
-                  var line = ' 自然 impression（week_no）: ' + Number(v).toLocaleString();
+                  var line = ' total impressions（week_no）: ' + Number(v).toLocaleString();
                   if (idxImp >= 0 && ctx.datasetIndex === idxImp && ctx.dataset._impressionMeta) {{
                     var m = ctx.dataset._impressionMeta[ctx.dataIndex];
                     if (m && m.weeks && m.weeks.length)
@@ -904,7 +904,7 @@ def render_html(payload: dict) -> str:
 
     if (impOn) {{
       var dsImp = {{
-        label: '自然 impression · week_no（右轴，点=周三）',
+        label: 'total impressions · week_no（右轴，点=周三）',
         data: impSeries.data,
         yAxisID: 'y1',
         borderColor: '#ffb347',
@@ -980,7 +980,7 @@ def render_html(payload: dict) -> str:
         {{ key: 'sess', idx: idxSessions, shortLabel: 'Sessions（左轴）', color: '#7dd3c0' }},
       ];
       if (impOn && idxImp >= 0) {{
-        specs.push({{ key: 'imp', idx: idxImp, shortLabel: '自然 impression · week_no（右轴·周三）', color: '#ffb347' }});
+        specs.push({{ key: 'imp', idx: idxImp, shortLabel: 'total impressions · week_no（右轴·周三）', color: '#ffb347' }});
       }}
       if (adsOn && idxAdsClicks >= 0) {{
         specs.push({{ key: 'adclk', idx: idxAdsClicks, shortLabel: '广告 sessions（左轴）', color: '#e879f9' }});
@@ -1154,13 +1154,13 @@ def main(argv: list[str]) -> int:
         "--start-date",
         type=str,
         default="",
-        help="traffic 的 current_date 下限（含）；与 --end-date 同时传时查 amazon_search_data 周 impression（整周汇总）",
+        help="traffic 的 current_date 下限（含）；与 --end-date 同时传时查 amazon_search 周 impression（整周汇总）",
     )
     p.add_argument(
         "--end-date",
         type=str,
         default="",
-        help="traffic / 广告 / 报表区间的日历上限（含）；自然 impression 用区间内 start_date 出现过的 week_no 再整表汇总",
+        help="traffic / 广告 / 报表区间的日历上限（含）；total impressions 用区间内 start_date 出现过的 week_no 再整表汇总",
     )
     args = p.parse_args(argv)
     start_d = _parse_ymd(args.start_date) if args.start_date.strip() else None
