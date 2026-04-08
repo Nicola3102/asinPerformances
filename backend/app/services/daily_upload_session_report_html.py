@@ -40,7 +40,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import SessionLocal, init_db
 from app.logging_config import setup_logging
-from app.online_engine import get_online_engine
+from app.online_engine import get_online_reporting_engine
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +143,7 @@ def _try_online_conn() -> Connection | None:
     if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
         return None
     try:
-        return get_online_engine().connect()
+        return get_online_reporting_engine().connect()
     except Exception as exc:
         logger.warning("Online DB 连接失败，KPI/当日上新将回退本地表: %s", exc)
         return None
@@ -163,7 +163,7 @@ def _fetch_listing_kpi_online(conn: Connection, since: date, store_id: int | Non
             """
             SELECT COUNT(*) FROM (
               SELECT store_id, asin FROM amazon_listing
-              WHERE asin IS NOT NULL AND TRIM(asin) <> ''
+              WHERE asin IS NOT NULL 
                 AND DATE(created_at) >= :since
                 AND store_id = :sid
               GROUP BY store_id, asin
@@ -183,7 +183,7 @@ def _fetch_listing_kpi_online(conn: Connection, since: date, store_id: int | Non
             """
             SELECT COUNT(*) FROM (
               SELECT store_id, asin FROM amazon_listing
-              WHERE asin IS NOT NULL AND TRIM(asin) <> ''
+              WHERE asin IS NOT NULL 
                 AND DATE(created_at) >= :since
               GROUP BY store_id, asin
               HAVING SUM(CASE WHEN LOWER(TRIM(COALESCE(status, ''))) = 'active' THEN 1 ELSE 0 END) > 0

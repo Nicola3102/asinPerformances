@@ -325,6 +325,40 @@ def _ensure_daily_upload_open_date_column():
             conn.commit()
 
 
+def _ensure_daily_upload_asin_dates_composite_indexes():
+    """New Listing / PST 矩阵聚合用组合索引（若不存在则创建）。"""
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        if engine.dialect.name != "mysql":
+            return
+        wanted = [
+            (
+                "ix_duad_session_open_store",
+                "CREATE INDEX ix_duad_session_open_store ON daily_upload_asin_dates (session_date, open_date, store_id)",
+            ),
+            (
+                "ix_duad_store_session",
+                "CREATE INDEX ix_duad_store_session ON daily_upload_asin_dates (store_id, session_date)",
+            ),
+            (
+                "ix_duad_store_open",
+                "CREATE INDEX ix_duad_store_open ON daily_upload_asin_dates (store_id, open_date)",
+            ),
+        ]
+        for idx_name, ddl in wanted:
+            exists = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.STATISTICS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'daily_upload_asin_dates' AND INDEX_NAME = :idx"
+                ),
+                {"idx": idx_name},
+            ).scalar()
+            if not exists:
+                conn.execute(text(ddl))
+                conn.commit()
+
+
 def init_db():
     """Create all tables. Called on startup. Retries if MySQL not ready (e.g. in Docker)."""
     from app.models import asin_performance, group_a, listing_tracking, daily_upload_asin_data  # noqa: F401
@@ -339,6 +373,7 @@ def init_db():
             _ensure_listing_tracking_schema()
             _ensure_listing_tracking_indexes()
             _ensure_daily_upload_open_date_column()
+            _ensure_daily_upload_asin_dates_composite_indexes()
             return
         except OperationalError as e:
             if attempt == max_attempts:

@@ -734,14 +734,14 @@ def _aggregate_metrics_for_keys(
                     online_engine,
                     lambda current_asin_chunk: (
                         text(
-                            "SELECT UPPER(TRIM(s.asin)) AS asin, CAST(s.week_no AS UNSIGNED) AS week_no, "
+                            "SELECT s.asin AS asin, s.week_no AS week_no, "
                             "       SUM(COALESCE(s.impression_count, 0)) AS total_impression, "
                             "       SUM(COALESCE(s.click_count, 0)) AS total_click "
                             "FROM amazon_search s "
                             "WHERE s.store_id = :sid "
-                            f"  AND UPPER(TRIM(s.asin)) IN ({_build_base_params(current_asin_chunk)[0]}) "
-                            "  AND CAST(s.week_no AS UNSIGNED) BETWEEN :start_week_no AND :end_week_no "
-                            "GROUP BY UPPER(TRIM(s.asin)), CAST(s.week_no AS UNSIGNED)"
+                            f"  AND s.asin IN ({_build_base_params(current_asin_chunk)[0]}) "
+                            "  AND s.week_no  BETWEEN :start_week_no AND :end_week_no "
+                            "GROUP BY s.asin, s.week_no"
                         ),
                         _build_base_params(current_asin_chunk)[1],
                     ),
@@ -773,13 +773,13 @@ def _aggregate_metrics_for_keys(
                     online_engine,
                     lambda current_asin_chunk: (
                         text(
-                            "SELECT UPPER(TRIM(t.asin)) AS asin, CAST(t.week_no AS UNSIGNED) AS week_no, "
+                            "SELECT t.asin AS asin, t.week_no  AS week_no, "
                             "       SUM(COALESCE(t.sessions, 0)) AS total_session "
                             "FROM amazon_sales_traffic t "
                             "WHERE t.store_id = :sid "
-                            f"  AND UPPER(TRIM(t.asin)) IN ({_build_base_params(current_asin_chunk)[0]}) "
-                            "  AND CAST(t.week_no AS UNSIGNED) BETWEEN :start_week_no AND :end_week_no "
-                            "GROUP BY UPPER(TRIM(t.asin)), CAST(t.week_no AS UNSIGNED)"
+                            f"  AND t.asin IN ({_build_base_params(current_asin_chunk)[0]}) "
+                            "  AND t.week_no  BETWEEN :start_week_no AND :end_week_no "
+                            "GROUP BY t.asin, t.week_no"
                         ),
                         _build_base_params(current_asin_chunk)[1],
                     ),
@@ -812,10 +812,10 @@ def _aggregate_metrics_for_keys(
                     online_engine,
                     lambda current_asin_chunk: (
                         text(
-                            "SELECT UPPER(TRIM(oi.asin)) AS asin, oi.order_id, oi.purchase_date "
+                            "SELECT oi.asin AS asin, oi.order_id, oi.purchase_date "
                             "FROM order_item oi "
                             "WHERE oi.store_id = :sid "
-                            f"  AND UPPER(TRIM(oi.asin)) IN ({_build_base_params(current_asin_chunk)[0]}) "
+                            f"  AND oi.asin IN ({_build_base_params(current_asin_chunk)[0]}) "
                             "  AND oi.purchase_date >= :min_created_date "
                             "  AND oi.purchase_date < :end_date"
                         ),

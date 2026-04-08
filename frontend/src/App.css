@@ -336,6 +336,8 @@
 .trend-new-listing-table-scroll {
   overflow: auto;
   max-width: 100%;
+  min-height: 360px;
+  max-height: min(70vh, 720px);
   border-radius: 10px;
   border: 1px solid rgba(125, 211, 192, 0.12);
 }

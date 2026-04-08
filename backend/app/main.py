@@ -9,9 +9,10 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
+from starlette.middleware.gzip import GZipMiddleware
 
 from app.config import settings
-from app.online_engine import dispose_online_engine
+from app.online_engine import dispose_all_online_engines
 from app.controllers import asin_router
 from app.controllers.asin_controller import get_trend_data
 from app.controllers.sync_controller import router as sync_router
@@ -28,7 +29,7 @@ from app.services.groupA_impression import (
 from app.services.auto_monitor import sync_auto_monitor
 from app.services.listing_tracking import sync_listing_tracking_recent_weeks_scheduled
 from app.services.daily_upload_asin_data import sync_with_default_date_range
-from app.services.daily_upload_asin_data_ds import sync_scheduled_listing_date_range_ds
+from app.services.daily_upload_asin_data_ds import run_daily_upload_ds_scheduled
 from app.services.daily_upload_session_report_html import (
     DEFAULT_LISTING_SINCE,
     build_report_payload,
@@ -44,6 +45,7 @@ from app.sync_run_record import (
     record_sync_run,
     should_run_listing_tracking_sync,
     record_listing_tracking_run,
+    should_run_daily_upload_ds_sync,
 )
 
 # 按日期将日志写入 app/log/YYYY-MM-DD.log
@@ -135,7 +137,6 @@ def _run_scheduled_group_a_sync():
 
 _listing_tracking_lock = threading.Lock()
 _daily_upload_sync_lock = threading.Lock()
-_daily_upload_ds_lock = threading.Lock()
 
 
 def _run_scheduled_daily_upload_and_report():
@@ -164,26 +165,10 @@ def _run_scheduled_daily_upload_and_report():
 
 def _run_scheduled_daily_upload_ds():
     """
-    东八区（SYNC_TIMEZONE）每 N 小时整点：按 daily_upload_asin_data_ds 同步 listing 日区间；
-    下界来自 .env daily_upload_ds_start_date（默认 2026-02-20），上界为当日日历日（含）。
+    定时：按 settings.daily_upload_ds_cron_hours()（.env：daily_upload_ds_first_run_hour / daily_times 等）在 SYNC_TIMEZONE 整点执行；
+    执行 daily_upload_asin_data_ds 增量同步（session 缺口 + 按调度档拉 updated_at）。
     """
-    if not _daily_upload_ds_lock.acquire(blocking=False):
-        logger.info("[DailyUploadDS] scheduled job skipped: previous run still in progress")
-        return
-    try:
-        logger.info(
-            "[DailyUploadDS] scheduled job starting (timezone=%s, start_date from daily_upload_ds_start_date)",
-            settings.SYNC_TIMEZONE,
-        )
-        out = sync_scheduled_listing_date_range_ds()
-        logger.info("[DailyUploadDS] scheduled job finished: %s", out)
-    except Exception as e:
-        logger.exception("[DailyUploadDS] scheduled job failed: %s", e)
-    finally:
-        try:
-            _daily_upload_ds_lock.release()
-        except Exception:
-            pass
+    run_daily_upload_ds_scheduled(force=False)
 
 
 def _run_scheduled_listing_tracking():
@@ -218,7 +203,7 @@ async def lifespan(app: FastAPI):
     if settings.ENABLE_SCHEDULED_SYNC:
         try:
             _scheduler = BackgroundScheduler(timezone=settings.SYNC_TIMEZONE)
-            sync_interval = max(1, int(settings.SYNC_INTERVAL_HOURS or 2))
+            sync_interval = max(1, int(settings.SYNC_INTERVAL_HOURS or 4))
             sync_hours = ",".join(str(h) for h in range(0, 24, sync_interval))
             # Online Sync：东八区每 N 小时整点执行一次
             _scheduler.add_job(
@@ -229,7 +214,7 @@ async def lifespan(app: FastAPI):
                 id="online_sync",
                 misfire_grace_time=300,
             )
-            monitor_interval = max(1, int(settings.MONITOR_SYNC_INTERVAL_HOURS or 6))
+            monitor_interval = max(1, int(settings.MONITOR_SYNC_INTERVAL_HOURS or 12))
             monitor_hours = ",".join(str(h) for h in range(0, 24, monitor_interval))
             # Monitor：东八区每 N 小时整点执行一次
             _scheduler.add_job(
@@ -240,7 +225,7 @@ async def lifespan(app: FastAPI):
                 id="monitor_daily_track",
                 misfire_grace_time=300,
             )
-            group_a_interval = max(1, int(settings.GROUP_A_SYNC_INTERVAL_HOURS or 4))
+            group_a_interval = max(1, int(settings.GROUP_A_SYNC_INTERVAL_HOURS or 8))
             group_a_hours = ",".join(str(h) for h in range(0, 24, group_a_interval))
             # Group A：东八区每 N 小时整点执行一次
             _scheduler.add_job(
@@ -275,26 +260,29 @@ async def lifespan(app: FastAPI):
                 id="listing_tracking_recent_weeks",
                 misfire_grace_time=300,
             )
-            daily_upload_hours = ",".join(str(h) for h in range(0, 24, 2))
-            _scheduler.add_job(
-                _run_scheduled_daily_upload_and_report,
-                "cron",
-                hour=daily_upload_hours,
-                minute=0,
-                id="daily_upload_asin_data_and_report",
-                misfire_grace_time=300,
-            )
-            ds_interval = max(1, int(settings.DAILY_UPLOAD_DS_INTERVAL_HOURS or 2))
+            daily_upload_next_run = None
+            if settings.ENABLE_DAILY_UPLOAD_SCHEDULE:
+                daily_upload_hours = ",".join(str(h) for h in range(0, 24, 2))
+                _scheduler.add_job(
+                    _run_scheduled_daily_upload_and_report,
+                    "cron",
+                    hour=daily_upload_hours,
+                    minute=0,
+                    id="daily_upload_asin_data_and_report",
+                    misfire_grace_time=300,
+                )
+            ds_hours_list, ds_schedule_desc = settings.daily_upload_ds_cron_hours()
             ds_next_run = None
             if settings.ENABLE_DAILY_UPLOAD_DS_SCHEDULE:
-                daily_upload_ds_hours = ",".join(str(h) for h in range(0, 24, ds_interval))
+                daily_upload_ds_hours = ",".join(str(h) for h in ds_hours_list)
                 _scheduler.add_job(
                     _run_scheduled_daily_upload_ds,
                     "cron",
                     hour=daily_upload_ds_hours,
                     minute=0,
                     id="daily_upload_asin_data_ds",
-                    misfire_grace_time=300,
+                    # 整点略有延迟或进程短暂卡住时仍补跑（小时点来自 .env first_run_hour / daily_times）
+                    misfire_grace_time=3600,
                 )
             _scheduler.start()
             job = _scheduler.get_job("online_sync")
@@ -305,8 +293,9 @@ async def lifespan(app: FastAPI):
             group_a_next_run = group_a_job.next_run_time if group_a_job else None
             listing_job = _scheduler.get_job("listing_tracking_recent_weeks")
             listing_next_run = listing_job.next_run_time if listing_job else None
-            daily_upload_job = _scheduler.get_job("daily_upload_asin_data_and_report")
-            daily_upload_next_run = daily_upload_job.next_run_time if daily_upload_job else None
+            if settings.ENABLE_DAILY_UPLOAD_SCHEDULE:
+                daily_upload_job = _scheduler.get_job("daily_upload_asin_data_and_report")
+                daily_upload_next_run = daily_upload_job.next_run_time if daily_upload_job else None
             if settings.ENABLE_DAILY_UPLOAD_DS_SCHEDULE:
                 ds_job = _scheduler.get_job("daily_upload_asin_data_ds")
                 ds_next_run = ds_job.next_run_time if ds_job else None
@@ -356,6 +345,21 @@ async def lifespan(app: FastAPI):
                     t.start()
                 except Exception as e:
                     logger.exception("[ListingTracking] Startup recent-weeks sync failed: %s", e)
+            if (
+                settings.ENABLE_DAILY_UPLOAD_DS_SCHEDULE
+                and now.hour in ds_hours_list
+                and should_run_daily_upload_ds_sync()
+            ):
+                logger.info(
+                    "[DailyUploadDS] Startup catch-up: current hour %s is a scheduled slot (Asia/Shanghai), "
+                    "no run yet this hour — running once in background.",
+                    now.hour,
+                )
+                try:
+                    t = threading.Thread(target=_run_scheduled_daily_upload_ds, daemon=True)
+                    t.start()
+                except Exception as e:
+                    logger.exception("[DailyUploadDS] Startup catch-up failed: %s", e)
             logger.info(
                 "Scheduled sync enabled: every %sh at :00 (Asia/Shanghai), next_run_time=%s",
                 sync_interval,
@@ -377,15 +381,19 @@ async def lifespan(app: FastAPI):
                 listing_hours_list,
                 listing_next_run,
             )
-            logger.info(
-                "[DailyUpload] Scheduled sync + report enabled: every 2h at :00 (Asia/Shanghai), next_run_time=%s",
-                daily_upload_next_run,
-            )
+            if settings.ENABLE_DAILY_UPLOAD_SCHEDULE:
+                logger.info(
+                    "[DailyUpload] Scheduled sync + report enabled: every 2h at :00 (Asia/Shanghai), next_run_time=%s",
+                    daily_upload_next_run,
+                )
+            else:
+                logger.info("[DailyUpload] Scheduled sync + report disabled (enable_daily_upload_schedule=false)")
             if settings.ENABLE_DAILY_UPLOAD_DS_SCHEDULE:
                 logger.info(
-                    "[DailyUploadDS] Scheduled sync enabled: every %sh at :00 (%s), next_run_time=%s",
-                    ds_interval,
+                    "[DailyUploadDS] Scheduled sync enabled: %s at :00 (%s), hours=%s, next_run_time=%s",
+                    ds_schedule_desc,
                     settings.SYNC_TIMEZONE,
+                    ds_hours_list,
                     ds_next_run,
                 )
             else:
@@ -403,7 +411,7 @@ async def lifespan(app: FastAPI):
             pass
         _scheduler = None
     try:
-        dispose_online_engine()
+        dispose_all_online_engines()
     except Exception:
         pass
     logger.info("Application shutdown")
@@ -432,6 +440,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# 压缩 JSON/HTML 等文本响应，减小 New Listing 等大 payload 传输体积
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.include_router(asin_router)
 app.include_router(sync_router)
 app.include_router(trend_reports_router, prefix="/api/trend")

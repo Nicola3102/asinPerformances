@@ -1,12 +1,31 @@
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 
+from app.services.daily_upload_asin_data_ds import run_daily_upload_ds_scheduled
 from app.services.online_sync import sync_from_online_db
 from app.sync_run_record import record_sync_run
 
 router = APIRouter(prefix="/api", tags=["sync"])
 logger = logging.getLogger(__name__)
+
+
+def _bg_daily_upload_ds() -> None:
+    run_daily_upload_ds_scheduled(force=True)
+
+
+@router.post("/daily-upload-ds")
+def trigger_daily_upload_ds(background_tasks: BackgroundTasks):
+    """
+    手动触发 DailyUploadDS 增量同步（调度整点由 .env 的 daily_upload_ds_first_run_hour / daily_upload_ds_daily_times 决定；错过整点可补跑）。
+    使用 force=True，不受「本小时已跑过」限制；与定时任务共用全局锁，若已在执行则本次跳过。
+    """
+    logger.info("DailyUploadDS run requested via API (background, force=True)")
+    background_tasks.add_task(_bg_daily_upload_ds)
+    return {
+        "status": "accepted",
+        "message": "DailyUploadDS 已在后台启动；若上一趟仍在运行则本请求会被跳过，请查看日志。",
+    }
 
 
 @router.post("/sync-from-online")

@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func, literal_column, or_, text, tuple_
 
-from app.online_engine import get_online_engine
+from app.online_engine import get_online_reporting_engine
 
 from app.config import settings
 from app.database import get_db
@@ -121,7 +121,7 @@ def _fetch_listing_meta_for_export(rows) -> dict:
     table_candidates = [
         ("ai_generated_amazon_listings", "search_terms"),
     ]
-    online_engine = get_online_engine()
+    online_engine = get_online_reporting_engine()
     for agal_table, search_col in table_candidates:
             meta_map = {}
             try:
@@ -990,7 +990,8 @@ def refresh_query_status(
             "checked_at": now.isoformat(),
             "message": "refresh already running, skip this request",
         }
-    online_engine = get_online_engine()
+    # 与后台同步主池分离，避免定时任务占满 QueuePool 后本接口排队 30s 超时
+    online_engine = get_online_reporting_engine()
     try:
         with online_engine.connect() as conn:
             for pa, sid, q_status, checked_at in groups:
@@ -1052,7 +1053,7 @@ def get_online_db_status():
     if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
         return {"error": "online_db 未配置", "threads_connected": None, "max_used_connections": None}
     try:
-        engine = get_online_engine()
+        engine = get_online_reporting_engine()
         with engine.connect() as conn:
             threads = conn.execute(text("SHOW GLOBAL STATUS LIKE 'Threads_connected'")).fetchone()
             max_used = conn.execute(text("SHOW GLOBAL STATUS LIKE 'Max_used_connections'")).fetchone()
@@ -1166,7 +1167,7 @@ def get_group_f_candidates(
         )
     logger.info("[Group F] 已占用槽位 request_id=%s，开始执行", request_id)
 
-    online_engine = get_online_engine()
+    online_engine = get_online_reporting_engine()
     try:
         if week_nos:
             scan_weeks_list = [int(w) for w in week_nos]
@@ -1509,7 +1510,7 @@ def _fetch_trend_batch_options(batch_ids: list[int]) -> list[TrendBatchOption]:
     title_map: dict[int, str] = {}
     if settings.ONLINE_DB_HOST and settings.ONLINE_DB_USER:
         try:
-            with get_online_engine().connect() as conn:
+            with get_online_reporting_engine().connect() as conn:
                 placeholders = ", ".join([f":b{i}" for i in range(len(batch_ids))])
                 params = {f"b{i}": int(batch_id) for i, batch_id in enumerate(batch_ids)}
                 rows = conn.execute(
@@ -1864,7 +1865,7 @@ def get_monitor_track(
     week_details = {}
     if weeks and settings.ONLINE_DB_HOST and settings.ONLINE_DB_USER:
         try:
-            engine = get_online_engine()
+            engine = get_online_reporting_engine()
             with engine.connect() as conn:
                 week_details = get_parent_week_status_details(conn, parent_asin, weeks)
         except Exception as e:

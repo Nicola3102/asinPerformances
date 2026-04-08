@@ -662,7 +662,7 @@ def render_html(payload: dict) -> str:
     <p class="query-cutoff" id="queryCutoffUtc8Line"></p>
     <p class="sub">
       <strong>左轴（0～500～1000…，步长 500）</strong>：<code>amazon_sales_and_traffic_daily</code> 按日 <code>SUM(sessions)</code>（绿）与 <code>amazon_ads_ad_group_ad_report</code> 按日 <code>SUM(clicks)</code>（紫）共用。<br />
-      <strong>右轴（0～1万～2万…，步长 1 万）</strong>：涉及周由 <code>amazon_search_data</code> 在报表区间内 <code>start_date</code> 出现过的 <code>week_no</code> 确定；<code>amazon_search</code> 按该 <code>week_no</code> 汇总<strong>整周</strong>
+      <strong>右轴（0～1万～2万…，步长 1 万）</strong>：<code>amazon_search</code> 按该 <code>week_no</code> 汇总<strong>整周</strong>
       <code>SUM(impression_count)</code>（橙点；图上 <code>week_no</code> 为表内原值，横坐标为周三）与 <code>广告日 impressions</code>（黄线）共用。<br />
     </p>
     <div class="toolbar">

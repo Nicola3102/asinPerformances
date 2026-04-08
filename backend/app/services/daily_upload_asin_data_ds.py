@@ -32,7 +32,7 @@
 
 用法（在 backend 目录下）：
   python3.11 -m app.services.daily_upload_asin_data_ds
-      # 省略起止日时：开始 = daily_upload_asin_dates.MAX(session_date) - 1 日，结束 = 今天 + 1 日；表空则开始=今天
+      # 省略起止日时：按东八区日期默认同步最近 35 天（start=今天-35 天，end=今天，含端点）
   python3.11 -m app.services.daily_upload_asin_data_ds --start-date 2026-02-20 --end-date 2026-03-31
   python3.11 -m app.services.daily_upload_asin_data_ds --date 2026-03-31
 """
@@ -43,6 +43,7 @@ import argparse
 import logging
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
@@ -55,7 +56,7 @@ from app.database import SessionLocal, init_db
 from app.logging_config import setup_logging
 from app.models.daily_upload_asin_data import DailyUploadAsinData
 from app.online_engine import get_online_engine
-from app.sync_run_record import now_asia
+from app.sync_run_record import now_asia, record_daily_upload_ds_run, should_run_daily_upload_ds_sync
 
 logger = logging.getLogger(__name__)
 
@@ -103,23 +104,14 @@ def _same_calendar_date(a, b) -> bool:
 def default_sync_listing_date_bounds(local_db) -> tuple[date, date]:
     """
     默认 listing 日区间（created_at 按日扫描）：
-    - 结束：当前日期 + 1 日（与命令行习惯一致，含「明天」边界）
-    - 开始：本地表 daily_upload_asin_dates 中 MAX(session_date) 的前一日；表无数据时为今天
-    - 若推算开始晚于结束，则钳制为结束日
+    - 若 CLI 未指定 --start-date/--end-date：按东八区日期默认同步最近 35 天
+      - start = today(Asia/Shanghai) - 35 天
+      - end   = today(Asia/Shanghai)（含端点）
     """
-    row = local_db.execute(text("SELECT MAX(session_date) AS m FROM daily_upload_asin_dates")).fetchone()
-    max_sd = row[0] if row else None
-    end_d = date.today() + timedelta(days=1)
-    if max_sd is None:
-        start_d = date.today()
-    else:
-        if isinstance(max_sd, datetime):
-            max_sd = max_sd.date()
-        elif not isinstance(max_sd, date):
-            max_sd = _parse_ymd(str(max_sd)[:10])
-        start_d = max_sd - timedelta(days=1)
-    if start_d > end_d:
-        start_d = end_d
+    # local_db 参数保留：方便未来按表状态动态调整；当前按需求固定为“最近 35 天”
+    _ = local_db
+    end_d = now_asia().date()
+    start_d = end_d - timedelta(days=35)
     return start_d, end_d
 
 
@@ -171,6 +163,37 @@ def sync_scheduled_listing_date_range_ds() -> dict:
         settings.SYNC_TIMEZONE,
     )
     return sync_range(start_d, end_d, session_dates=None)
+
+
+# 定时任务与手动触发共用锁，避免并发双跑
+_scheduled_ds_lock = threading.Lock()
+
+
+def run_daily_upload_ds_scheduled(*, force: bool = False) -> dict | None:
+    """
+    定时任务包装函数（供 app/main.py 与 /api/daily-upload-ds 调用）。
+
+    - force=False：若本小时（东八区）已成功跑过则跳过（用 app/sync_run_record.py 记录）。
+    - force=True：跳过「本小时已跑」检查（用于手动补跑）；仍受锁约束。
+    """
+    if not _scheduled_ds_lock.acquire(blocking=False):
+        logger.info("[DailyUploadDS] scheduled job skipped: previous run still in progress")
+        return None
+    try:
+        if not force and not should_run_daily_upload_ds_sync():
+            logger.info("[DailyUploadDS] scheduled job skipped: already run in this hour slot (Asia/Shanghai)")
+            return None
+        out = sync_scheduled_listing_date_range_ds()
+        record_daily_upload_ds_run()
+        return out
+    except Exception as e:
+        logger.exception("[DailyUploadDS] scheduled job failed: %s", e)
+        return None
+    finally:
+        try:
+            _scheduled_ds_lock.release()
+        except Exception:
+            pass
 
 
 def _iter_dates(start: date, end: date) -> list[date]:
@@ -944,7 +967,7 @@ def main(argv: list[str]) -> int:
     setup_logging(level=logging.INFO)
     p = argparse.ArgumentParser(description="同步每日上新 ASIN 到 daily_upload_asin_dates")
     p.add_argument("--date", type=str, default="", help="单日 YYYY-MM-DD（与 start/end 二选一）")
-    p.add_argument("--start-date", type=str, default="", help="开始日期 YYYY-MM-DD（可与 --end-date 同时省略则用表 MAX(session_date)-1～今天+1）")
+    p.add_argument("--start-date", type=str, default="", help="开始日期 YYYY-MM-DD（可与 --end-date 同时省略则默认东八区最近 35 天）")
     p.add_argument("--end-date", type=str, default="", help="结束日期 YYYY-MM-DD（含）")
     p.add_argument(
         "--session-date",
@@ -966,7 +989,7 @@ def main(argv: list[str]) -> int:
         has_start = bool(args.start_date.strip())
         has_end = bool(args.end_date.strip())
         if has_start ^ has_end:
-            p.error("请同时指定 --start-date 与 --end-date，或两者皆省略以使用默认范围（MAX(session_date)-1 ～ 今天+1）")
+            p.error("请同时指定 --start-date 与 --end-date，或两者皆省略以使用默认范围（东八区最近 35 天）")
         if not has_start and not has_end:
             init_db()
             ldb = SessionLocal()
@@ -1006,4 +1029,3 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
-

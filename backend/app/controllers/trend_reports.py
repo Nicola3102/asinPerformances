@@ -5,14 +5,18 @@ Trend 子栏目 HTML 报表（与 CLI 脚本等价的数据源）。
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import threading
+import time
+from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from app.config import settings
 from app.database import SessionLocal, init_db
 from app.services.daily_upload_asin_data_ds import sync_range, sync_with_default_date_range
 from app.services.daily_upload_session_report_html_pst import (
@@ -75,6 +79,72 @@ _SESSION_IMPRESSION_STUB_HTML = """<!DOCTYPE html>
 </body>
 </html>"""
 _new_listing_sync_report_lock = threading.Lock()
+
+# format=json 短 TTL 内存缓存（按日期参数 + 是否跳过同步）；本地表变化后最多滞后 TTL
+_new_listing_json_cache_lock = threading.Lock()
+_new_listing_json_cache: "OrderedDict[tuple, tuple[float, dict]]" = OrderedDict()
+
+
+def _new_listing_json_cache_get(key: tuple) -> dict | None:
+    with _new_listing_json_cache_lock:
+        item = _new_listing_json_cache.get(key)
+        if not item:
+            return None
+        exp_mono, payload = item
+        if exp_mono < time.monotonic():
+            try:
+                del _new_listing_json_cache[key]
+            except KeyError:
+                pass
+            return None
+        _new_listing_json_cache.move_to_end(key)
+        return payload
+
+
+def _new_listing_json_cache_set(key: tuple, payload: dict) -> None:
+    ttl = max(1, int(settings.NEW_LISTING_JSON_CACHE_TTL_SEC))
+    max_keys = max(1, int(settings.NEW_LISTING_JSON_CACHE_MAX_KEYS))
+    with _new_listing_json_cache_lock:
+        _new_listing_json_cache[key] = (time.monotonic() + ttl, payload)
+        _new_listing_json_cache.move_to_end(key)
+        while len(_new_listing_json_cache) > max_keys:
+            _new_listing_json_cache.popitem(last=False)
+
+
+def _new_listing_json_cache_stats_payload() -> dict:
+    """进程内 New Listing JSON 缓存：条数与按 UTF-8 JSON 序列化估算的体积（与 HTTP 响应体同口径）。"""
+    now = time.monotonic()
+    ttl_cfg = max(1, int(settings.NEW_LISTING_JSON_CACHE_TTL_SEC))
+    max_keys_cfg = max(1, int(settings.NEW_LISTING_JSON_CACHE_MAX_KEYS))
+    with _new_listing_json_cache_lock:
+        snap = list(_new_listing_json_cache.items())
+    total_bytes = 0
+    active: list[dict] = []
+    stale = 0
+    for key, (exp_mono, payload) in snap:
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        b = len(raw.encode("utf-8"))
+        total_bytes += b
+        is_active = exp_mono >= now
+        if not is_active:
+            stale += 1
+            continue
+        active.append(
+            {
+                "cache_key": list(key),
+                "ttl_remaining_sec": round(exp_mono - now, 3),
+                "approx_json_bytes_utf8": b,
+            }
+        )
+    return {
+        "configured": {"ttl_sec": ttl_cfg, "max_keys": max_keys_cfg},
+        "stored_slots": len(snap),
+        "active_entries": len(active),
+        "stale_entries_not_yet_purged": stale,
+        "total_approx_json_bytes_utf8": total_bytes,
+        "entries": active,
+    }
+
 
 router = APIRouter()
 
@@ -198,6 +268,12 @@ def trend_session_impression_ads_html(
         )
 
 
+@router.get("/new-listing/json-cache-stats")
+def trend_new_listing_json_cache_stats():
+    """查看 ``format=json`` 进程内短 TTL 缓存当前占用（条数、估算 JSON 字节数、各 key 剩余 TTL）。"""
+    return JSONResponse(content=_new_listing_json_cache_stats_payload())
+
+
 @router.get("/new-listing")
 def trend_new_listing_report(
     listing_since: date = Query(
@@ -222,6 +298,23 @@ def trend_new_listing_report(
         "html",
         alias="format",
         description="html：内嵌完整报表；json：堆叠图 + KPI 结构化数据（横轴仅含本地有 session 的日期）",
+    ),
+    nocache: bool = Query(
+        False,
+        description="format=json 时跳过服务端进程内短缓存（与前端 ?refresh=1 配合时可传 nocache=1）",
+    ),
+    profile: bool = Query(
+        False,
+        description="为 true 时在 JSON 中返回各阶段耗时 profileTimingsSec（用于排查卡顿）",
+    ),
+    json_views: Literal["all", "full", "store"] = Query(
+        "all",
+        description="JSON 专用：all=仅 views.all+元数据（首屏）；full=全部店铺视图（兼容旧行为）；store=仅单店（配合 store_id）",
+    ),
+    store_id: Optional[int] = Query(
+        None,
+        ge=1,
+        description="json_views=store 时指定店铺 id",
     ),
 ):
     """
@@ -255,6 +348,38 @@ def trend_new_listing_report(
     effective_skip_sync = (
         skip_sync if skip_sync is not None else (response_format == "json")
     )
+
+    json_views_mode = "full"
+    single_store: int | None = None
+    if response_format == "json":
+        if json_views == "all":
+            json_views_mode = "all_only"
+        elif json_views == "store":
+            if store_id is None:
+                return JSONResponse(
+                    content={"detail": "json_views=store 时必须传 store_id"},
+                    status_code=400,
+                )
+            json_views_mode = "store"
+            single_store = int(store_id)
+        else:
+            json_views_mode = "full"
+
+    if response_format == "json" and not nocache:
+        cache_key = (
+            listing_since.isoformat(),
+            start_d.isoformat(),
+            end_d.isoformat(),
+            effective_skip_sync,
+            json_views_mode,
+            single_store,
+        )
+        cached = _new_listing_json_cache_get(cache_key)
+        if cached is not None:
+            return JSONResponse(
+                content=cached,
+                headers={"X-New-Listing-Server-Cache": "hit"},
+            )
 
     try:
         # 原先整段包在锁里会把「只读 JSON」与耗时的 build_report_payload 串行化，多标签/多用户互相等待。
@@ -314,13 +439,33 @@ def trend_new_listing_report(
                 end_d,
                 prefer_online=prefer_online,
                 prefer_listing_online=prefer_listing_online,
+                profile=profile,
+                json_views_mode=json_views_mode
+                if response_format == "json"
+                else "full",
+                single_store_id=single_store if response_format == "json" else None,
             )
         finally:
             db.close()
         if response_format == "json":
-            headers = {}
+            headers: dict[str, str] = {}
             if not effective_skip_sync:
                 headers["X-New-Listing-Sync"] = "triggered-in-background"
+            if not nocache:
+                _new_listing_json_cache_set(
+                    (
+                        listing_since.isoformat(),
+                        start_d.isoformat(),
+                        end_d.isoformat(),
+                        effective_skip_sync,
+                        json_views_mode,
+                        single_store,
+                    ),
+                    payload,
+                )
+                headers["X-New-Listing-Server-Cache"] = "miss"
+            else:
+                headers["X-New-Listing-Server-Cache"] = "bypass"
             return JSONResponse(content=payload, headers=headers)
         return HTMLResponse(render_html(payload))
     except Exception as e:

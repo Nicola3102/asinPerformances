@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { NavLink, Navigate, Outlet, Route, Routes, useLocation } from 'react-router-dom'
 import {
   listSummaryConsolidatedByWeek,
@@ -49,6 +49,7 @@ import {
   Tooltip,
 } from 'chart.js'
 import { Chart } from 'react-chartjs-2'
+import NlJsonWorker from './nlJsonParse.worker?worker'
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, LineElement, PointElement, Legend, Tooltip)
 
@@ -81,10 +82,125 @@ interface TrendNewListingJsonPayload {
   chartRangeAutoExpanded?: boolean
   cohortTrackDays?: number
   kpiSource?: string
+  /** 后端 `profile=1` 时各阶段耗时（秒） */
+  profileTimingsSec?: Record<string, number>
+  /** 仅含 all 或单店片段时为 true */
+  viewsPartial?: boolean
+  jsonViewsMode?: string
+  requestedStoreId?: number
 }
 
 /** v4：KPI 与线上 COUNT(*) open_date>since、status='Active' 对账 SQL 一致 */
 const TREND_NEW_LISTING_CACHE_KEY = 'asinPerformances.v4.trendNewListingJson'
+/** 超过此大小的 JSON 在 Worker 中 parse，减轻主线程卡顿 */
+const TREND_NL_JSON_WORKER_MIN_LEN = 48_000
+
+async function parseTrendNewListingJsonText(text: string): Promise<TrendNewListingJsonPayload> {
+  if (text.length < TREND_NL_JSON_WORKER_MIN_LEN) {
+    return JSON.parse(text) as TrendNewListingJsonPayload
+  }
+  const Factory = NlJsonWorker as unknown as { new (): Worker }
+  return new Promise((resolve, reject) => {
+    const w = new Factory()
+    w.onmessage = (ev: MessageEvent<{ ok: boolean; data?: unknown; error?: string }>) => {
+      w.terminate()
+      if (ev.data.ok && ev.data.data != null) resolve(ev.data.data as TrendNewListingJsonPayload)
+      else reject(new Error(ev.data.error || 'JSON 解析失败'))
+    }
+    w.onerror = () => {
+      w.terminate()
+      reject(new Error('JSON Worker 错误'))
+    }
+    w.postMessage(text)
+  })
+}
+
+const NL_COHORT_ROW_HEIGHT_PX = 34
+
+type TrendNlCohortRow = NonNullable<TrendNewListingViewPayload['cohortTable']>[number]
+
+function TrendNewListingVirtualCohortTable({
+  cohortTable,
+  cohortTrackDays,
+}: {
+  cohortTable: TrendNlCohortRow[]
+  cohortTrackDays: number
+}) {
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const [scrollTop, setScrollTop] = useState(0)
+  const [viewH, setViewH] = useState(400)
+
+  useLayoutEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const upd = () => setViewH(Math.max(120, el.clientHeight))
+    upd()
+    const ro = new ResizeObserver(upd)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  const overscan = 6
+  const start = Math.max(0, Math.floor(scrollTop / NL_COHORT_ROW_HEIGHT_PX) - overscan)
+  const visibleCount = Math.max(1, Math.ceil(viewH / NL_COHORT_ROW_HEIGHT_PX) + overscan * 2)
+  const end = Math.min(cohortTable.length, start + visibleCount)
+  const topPad = start * NL_COHORT_ROW_HEIGHT_PX
+  const bottomPad = Math.max(0, cohortTable.length - end) * NL_COHORT_ROW_HEIGHT_PX
+
+  return (
+    <div
+      ref={scrollRef}
+      className="trend-new-listing-table-scroll"
+      onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+    >
+      <table className="trend-new-listing-table">
+        <thead>
+          <tr>
+            <th className="is-sticky-col is-sticky-col--1">上新日（PST）</th>
+            <th className="is-sticky-col is-sticky-col--2">上新 ASIN 数</th>
+            {Array.from({ length: cohortTrackDays }, (_, i) => (
+              <th key={`d${i + 1}`}>{`第${i + 1}天`}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {topPad > 0 ? (
+            <tr className="trend-nl-vpad" aria-hidden>
+              <td
+                colSpan={2 + cohortTrackDays}
+                style={{ height: topPad, padding: 0, border: 'none', background: 'transparent' }}
+              />
+            </tr>
+          ) : null}
+          {cohortTable.slice(start, end).map((row) => {
+            const cd = String(row?.cohortDate ?? '')
+            const newAsin = Number(row?.newAsin ?? 0)
+            const daySessions: number[] = Array.isArray(row?.daySessions)
+              ? row.daySessions.map((x) => Number(x ?? 0))
+              : []
+            return (
+              <tr key={cd || `r-${start}-${end}`}>
+                <td className="is-sticky-col is-sticky-col--1">{cd || '–'}</td>
+                <td className="is-sticky-col is-sticky-col--2">{newAsin.toLocaleString('zh-CN')}</td>
+                {Array.from({ length: cohortTrackDays }, (_, i) => (
+                  <td key={`${cd}-s-${i}`}>{Number(daySessions[i] ?? 0).toLocaleString('zh-CN')}</td>
+                ))}
+              </tr>
+            )
+          })}
+          {bottomPad > 0 ? (
+            <tr className="trend-nl-vpad" aria-hidden>
+              <td
+                colSpan={2 + cohortTrackDays}
+                style={{ height: bottomPad, padding: 0, border: 'none', background: 'transparent' }}
+              />
+            </tr>
+          ) : null}
+        </tbody>
+      </table>
+    </div>
+  )
+}
 
 function readTrendNewListingCache(): TrendNewListingJsonPayload | null {
   try {
@@ -120,6 +236,16 @@ function getTrendNewListingBoot(): { payload: TrendNewListingJsonPayload | null;
     /* ignore */
   }
   return { payload: null, useCacheOnly: false }
+}
+
+/** 地址栏 `?profile=1`：请求带 `profile=1` 并在控制台输出前后端分段耗时 */
+function trendNewListingProfileFromSearch(): boolean {
+  if (typeof window === 'undefined') return false
+  try {
+    return new URLSearchParams(window.location.search).get('profile') === '1'
+  } catch {
+    return false
+  }
 }
 
 function formatParentOrderTotal(v: string | number | null | undefined): string {
@@ -2531,17 +2657,97 @@ function TrendNewListingEmbeddedPage() {
   const [storeKey, setStoreKey] = useState<string>('all')
   const [err, setErr] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
+  const [storeViewLoading, setStoreViewLoading] = useState<string | null>(null)
+  const [chartMountReady, setChartMountReady] = useState(false)
+  const nlProfilePendingRef = useRef<{
+    t0: number
+    afterParse: number
+    fetchToHeadersMs: number
+    readBodyMs: number
+    parseMs: number
+    server?: Record<string, number>
+  } | null>(null)
+  const nlShellAbortRef = useRef<AbortController | null>(null)
+  const nlStoreAbortRef = useRef<AbortController | null>(null)
 
-  const fetchNewListingJson = useCallback(async (opts: { skipSync: boolean; writeCache: boolean }) => {
-    const url = `/api/trend/new-listing?format=json${opts.skipSync ? '&skip_sync=false' : ''}`
-    const res = await fetch(url)
-    const text = await res.text()
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`)
-    const data = JSON.parse(text) as TrendNewListingJsonPayload
-    if (opts.writeCache) writeTrendNewListingCache(data)
-    setPayload(data)
-    setFromCache(false)
-  }, [])
+  const fetchNewListingJson = useCallback(
+    async (opts: {
+      skipSync: boolean
+      writeCache: boolean
+      jsonViews: 'all' | 'full' | 'store'
+      storeId?: number
+      signal?: AbortSignal
+      mergeIntoExisting?: boolean
+    }) => {
+      let serverNocache = false
+      let wantProfile = false
+      try {
+        const sp = new URLSearchParams(window.location.search)
+        serverNocache = sp.get('refresh') === '1' || sp.get('nocache') === '1'
+        wantProfile = sp.get('profile') === '1'
+      } catch {
+        /* ignore */
+      }
+      let url = `/api/trend/new-listing?format=json&json_views=${opts.jsonViews}`
+      if (opts.jsonViews === 'store' && opts.storeId != null) url += `&store_id=${opts.storeId}`
+      if (opts.skipSync) url += '&skip_sync=false'
+      if (serverNocache) url += '&nocache=1'
+      if (wantProfile) url += '&profile=1'
+      nlProfilePendingRef.current = null
+      const t0 = typeof performance !== 'undefined' ? performance.now() : 0
+      const res = await fetch(url, { signal: opts.signal })
+      const t1 = typeof performance !== 'undefined' ? performance.now() : 0
+      const text = await res.text()
+      const t2 = typeof performance !== 'undefined' ? performance.now() : 0
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`)
+      const data = await parseTrendNewListingJsonText(text)
+      const t3 = typeof performance !== 'undefined' ? performance.now() : 0
+      if (wantProfile && typeof performance !== 'undefined') {
+        nlProfilePendingRef.current = {
+          t0,
+          afterParse: t3,
+          fetchToHeadersMs: t1 - t0,
+          readBodyMs: t2 - t1,
+          parseMs: t3 - t2,
+          server: data.profileTimingsSec,
+        }
+      }
+      if (opts.mergeIntoExisting) {
+        setPayload((prev) => {
+          const next: TrendNewListingJsonPayload = {
+            ...(prev ?? data),
+            ...data,
+            views: { ...(prev?.views ?? {}), ...data.views },
+            viewsPartial: true,
+          }
+          if (opts.writeCache) writeTrendNewListingCache(next)
+          return next
+        })
+      } else {
+        if (opts.writeCache) writeTrendNewListingCache(data)
+        setPayload(data)
+      }
+      setFromCache(false)
+    },
+    [],
+  )
+
+  useLayoutEffect(() => {
+    const p = nlProfilePendingRef.current
+    if (p == null || payload == null || typeof performance === 'undefined') return
+    const t4 = performance.now()
+    console.info('[New Listing] 加载分段耗时', {
+      客户端毫秒: {
+        到响应头: Math.round(p.fetchToHeadersMs),
+        读响应体: Math.round(p.readBodyMs),
+        JSON解析: Math.round(p.parseMs),
+        解析到提交布局: Math.round(t4 - p.afterParse),
+        自请求起合计: Math.round(t4 - p.t0),
+      },
+      服务端秒: p.server ?? '(未包含 profile 字段)',
+    })
+    nlProfilePendingRef.current = null
+  }, [payload])
 
   useEffect(() => {
     let cancelled = false
@@ -2551,20 +2757,78 @@ function TrendNewListingEmbeddedPage() {
         cancelled = true
       }
     }
-    const nav =
-      typeof performance !== 'undefined'
-        ? (performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined)
-        : undefined
-    const syncOnReload = nav?.type === 'reload'
-    fetchNewListingJson({ skipSync: syncOnReload, writeCache: true }).catch((e: unknown) => {
-      if (!cancelled) setErr(e instanceof Error ? e.message : '请求失败')
+    nlShellAbortRef.current?.abort()
+    const ac = new AbortController()
+    nlShellAbortRef.current = ac
+    fetchNewListingJson({
+      skipSync: false,
+      writeCache: true,
+      jsonViews: 'all',
+      signal: ac.signal,
+      mergeIntoExisting: false,
+    }).catch((e: unknown) => {
+      if (cancelled || (typeof e === 'object' && e !== null && (e as { name?: string }).name === 'AbortError'))
+        return
+      setErr(e instanceof Error ? e.message : '请求失败')
     })
     return () => {
       cancelled = true
+      ac.abort()
     }
   }, [boot.useCacheOnly, boot.payload, fetchNewListingJson])
 
-  const view = payload?.views?.[storeKey] ?? payload?.views?.all
+  useEffect(() => {
+    if (storeKey === 'all') {
+      setStoreViewLoading(null)
+      return
+    }
+    const sid = Number(storeKey)
+    if (!Number.isFinite(sid) || !payload?.views?.all) return
+    if (payload.views[storeKey]) {
+      setStoreViewLoading(null)
+      return
+    }
+    nlStoreAbortRef.current?.abort()
+    const ac = new AbortController()
+    nlStoreAbortRef.current = ac
+    setStoreViewLoading(storeKey)
+    fetchNewListingJson({
+      skipSync: false,
+      writeCache: true,
+      jsonViews: 'store',
+      storeId: sid,
+      signal: ac.signal,
+      mergeIntoExisting: true,
+    })
+      .catch((e: unknown) => {
+        if (typeof e === 'object' && e !== null && (e as { name?: string }).name === 'AbortError') return
+        setErr(e instanceof Error ? e.message : '店铺数据加载失败')
+      })
+      .finally(() => {
+        setStoreViewLoading((k) => (k === storeKey ? null : k))
+      })
+    return () => ac.abort()
+  }, [storeKey, payload?.views, fetchNewListingJson])
+
+  const view: TrendNewListingViewPayload | undefined =
+    storeKey === 'all' ? payload?.views?.all : payload?.views?.[storeKey]
+
+  useEffect(() => {
+    setChartMountReady(false)
+    if (!view?.labels?.length) return
+    let idle: number | ReturnType<typeof setTimeout>
+    let usedRic = false
+    if (typeof requestIdleCallback !== 'undefined') {
+      usedRic = true
+      idle = requestIdleCallback(() => setChartMountReady(true), { timeout: 800 })
+    } else {
+      idle = setTimeout(() => setChartMountReady(true), 0)
+    }
+    return () => {
+      if (usedRic && typeof cancelIdleCallback !== 'undefined') cancelIdleCallback(idle as number)
+      else clearTimeout(idle as ReturnType<typeof setTimeout>)
+    }
+  }, [view, storeKey])
 
   if (err) {
     return (
@@ -2574,7 +2838,47 @@ function TrendNewListingEmbeddedPage() {
       </div>
     )
   }
-  if (payload === null || !view) {
+  if (payload === null || !payload.views?.all) {
+    return (
+      <div className="trend-embed-page trend-embed-page--message">
+        <p className="trend-embed-loading">正在加载 New Listing 报表…</p>
+      </div>
+    )
+  }
+
+  const storeOptionsEarly = [
+    { value: 'all', label: '全部店铺' },
+    ...(payload.storeIds || []).map((id) => ({ value: String(id), label: `店铺 ${id}` })),
+  ]
+
+  if (storeKey !== 'all' && view == null) {
+    return (
+      <div className="trend-embed-page trend-new-listing-page">
+        <div className="trend-new-listing-toolbar">
+          <label className="trend-new-listing-label" htmlFor="trend-nl-store-w">
+            店铺
+          </label>
+          <select
+            id="trend-nl-store-w"
+            className="trend-new-listing-select"
+            value={storeKey}
+            onChange={(e) => setStoreKey(e.target.value)}
+          >
+            {storeOptionsEarly.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <p className="trend-embed-loading" style={{ marginTop: '1rem' }}>
+          {storeViewLoading ? `正在加载店铺 ${storeKey} 的图表与明细…` : `准备加载店铺 ${storeKey}…`}
+        </p>
+      </div>
+    )
+  }
+
+  if (view == null) {
     return (
       <div className="trend-embed-page trend-embed-page--message">
         <p className="trend-embed-loading">正在加载 New Listing 报表…</p>
@@ -2618,13 +2922,10 @@ function TrendNewListingEmbeddedPage() {
     ],
   }
 
-  const storeOptions = [
-    { value: 'all', label: '全部店铺' },
-    ...(payload.storeIds || []).map((id) => ({ value: String(id), label: `店铺 ${id}` })),
-  ]
+  const storeOptions = storeOptionsEarly
 
   const cohortTrackDays = Math.max(1, Number(payload.cohortTrackDays ?? 30))
-  const cohortTable = Array.isArray((view as any)?.cohortTable) ? ((view as any).cohortTable as any[]) : []
+  const cohortTable: TrendNlCohortRow[] = Array.isArray(view.cohortTable) ? view.cohortTable : []
 
   return (
     <div className="trend-embed-page trend-new-listing-page">
@@ -2636,6 +2937,7 @@ function TrendNewListingEmbeddedPage() {
           id="trend-nl-store"
           className="trend-new-listing-select"
           value={storeKey}
+          disabled={Boolean(storeViewLoading)}
           onChange={(e) => setStoreKey(e.target.value)}
         >
           {storeOptions.map((o) => (
@@ -2652,7 +2954,13 @@ function TrendNewListingEmbeddedPage() {
             setRefreshing(true)
             setErr(null)
             try {
-              await fetchNewListingJson({ skipSync: false, writeCache: true })
+              nlShellAbortRef.current?.abort()
+              await fetchNewListingJson({
+                skipSync: false,
+                writeCache: true,
+                jsonViews: 'all',
+                mergeIntoExisting: false,
+              })
             } catch (e: unknown) {
               setErr(e instanceof Error ? e.message : '请求失败')
             } finally {
@@ -2670,7 +2978,13 @@ function TrendNewListingEmbeddedPage() {
             setRefreshing(true)
             setErr(null)
             try {
-              await fetchNewListingJson({ skipSync: true, writeCache: true })
+              nlShellAbortRef.current?.abort()
+              await fetchNewListingJson({
+                skipSync: true,
+                writeCache: true,
+                jsonViews: 'all',
+                mergeIntoExisting: false,
+              })
             } catch (e: unknown) {
               setErr(e instanceof Error ? e.message : '请求失败')
             } finally {
@@ -2690,6 +3004,9 @@ function TrendNewListingEmbeddedPage() {
               · 默认展示本地缓存（生成 {payload.generatedAt ?? '—'}），不自动请求接口
             </>
           ) : null}
+          {trendNewListingProfileFromSearch() ? (
+            <> · 性能分析：打开开发者工具 Console 查看分段耗时</>
+          ) : null}
         </span>
       </div>
       <div className="trend-new-listing-kpi">
@@ -2705,7 +3022,8 @@ function TrendNewListingEmbeddedPage() {
       <p className="trend-new-listing-hint">
         柱形为各上新批次（open_date）贡献的 sessions 堆叠；黑色折线为每日合计。横坐标仅包含有 session 数据的日期。
         首次进入若无缓存会自动请求一次；之后默认展示浏览器本地缓存，不自动打接口。地址栏加{' '}
-        <code className="trend-new-listing-code">?refresh=1</code> 可强制重新拉取。
+        <code className="trend-new-listing-code">?refresh=1</code> 可强制重新拉取；加{' '}
+        <code className="trend-new-listing-code">?profile=1</code> 可在控制台查看各阶段耗时（含服务端 profileTimingsSec）。
         {payload.kpiSource === 'amazon_listing'
           ? ' 顶部 KPI：online_db amazon_listing，COUNT(*) 且 DATE(open_date) > listing_since；Active 另加 status = Active。'
           : payload.kpiSource === 'amazon_listing_unreachable'
@@ -2717,6 +3035,10 @@ function TrendNewListingEmbeddedPage() {
       <div className="trend-new-listing-chart-wrap">
         {view.labels.length === 0 || barDatasets.length === 0 ? (
           <p className="trend-new-listing-empty">暂无图表数据（请确认已同步 daily_upload_asin_dates 且 open_date 非空）。</p>
+        ) : !chartMountReady ? (
+          <p className="trend-new-listing-empty" style={{ minHeight: 320 }}>
+            正在准备图表…
+          </p>
         ) : (
           <Chart
             type="bar"
@@ -2767,11 +3089,13 @@ function TrendNewListingEmbeddedPage() {
         <h3 className="trend-new-listing-table-title">批次明细（上新数 &amp; 上新后每日 sessions）</h3>
         <p className="trend-new-listing-table-caption">
           前两列「上新日 / 上新 ASIN 数」来自线上 <code className="trend-new-listing-code">amazon_listing</code>
-          （open_date 在 [{payload.listingSince}, listing_through] 内按日、asin 非空且 TRIM 非空；与顶部 KPI 全表 COUNT(*) 口径不同）。切换「店铺」按 store_id
-          切分。后列为本地 sessions 明细。
+          （open_date 在 [{payload.listingSince}, {payload.listingThrough}] 内按日、asin 非空且 TRIM 非空；与顶部 KPI 全表 COUNT(*) 口径不同）。切换「店铺」按 store_id
+          切分；单店数据按需加载。后列为本地 sessions 明细。
         </p>
         {!cohortTable.length ? (
           <p className="trend-new-listing-table-empty">暂无表格数据（需要 open_date 批次与本地 sessions 明细）。</p>
+        ) : cohortTable.length > 80 ? (
+          <TrendNewListingVirtualCohortTable cohortTable={cohortTable} cohortTrackDays={cohortTrackDays} />
         ) : (
           <div className="trend-new-listing-table-scroll">
             <table className="trend-new-listing-table">
@@ -2792,7 +3116,7 @@ function TrendNewListingEmbeddedPage() {
                     ? row.daySessions.map((x: any) => Number(x ?? 0))
                     : []
                   return (
-                    <tr key={cd || Math.random()}>
+                    <tr key={cd || 'row'}>
                       <td className="is-sticky-col is-sticky-col--1">{cd || '–'}</td>
                       <td className="is-sticky-col is-sticky-col--2">{newAsin.toLocaleString('zh-CN')}</td>
                       {Array.from({ length: cohortTrackDays }, (_, i) => (
