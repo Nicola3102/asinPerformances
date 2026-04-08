@@ -2,7 +2,7 @@
 线上 amazon_sales_and_traffic_daily 按日总 sessions
 + ``amazon_search`` 按 ``week_no`` 汇总**整周** ``SUM(impression_count)``
 + amazon_ads_ad_group_ad_report 按日全店汇总广告 clicks / impressions，多 Y 轴折线图 HTML。
-+ 每天session数据去重3C业务的session值
+
 - Sessions：amazon_sales_and_traffic_daily，按 store_id、DATE(current_date) 汇总 SUM(sessions)；
   「全部店铺」为各店按日加总。
 - 广告：amazon_ads_ad_group_ad_report，SUM(clicks)、SUM(impressions)，store_id, DATE(current_date)；
@@ -159,13 +159,7 @@ def fetch_traffic_daily_by_store(
     if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
         raise ValueError("Online DB 未配置：需设置 online_db_host, online_db_user 等")
 
-    where_parts = [
-        # 排除黑名单 ASIN（按 asin + store_id 精确匹配），避免其 sessions 进入日汇总
-        "NOT EXISTS ("
-        "  SELECT 1 FROM black_asin b"
-        "  WHERE TRIM(b.asin) = TRIM(asatd.asin) AND b.store_id = asatd.store_id"
-        ")"
-    ]
+    where_parts = []
     params: dict = {}
     if start_date is not None:
         where_parts.append("DATE(asatd.`current_date`) >= :d0")

@@ -11,6 +11,7 @@ import threading
 import time
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Query
@@ -56,6 +57,38 @@ def _read_session_impression_memory(end_d: date) -> str | None:
         if _session_impression_latest_html:
             return _session_impression_latest_html
     return None
+
+
+def _session_impression_cache_path(end_d: date) -> Path:
+    """磁盘缓存路径（用于进程重启后的 embed 秒开）。"""
+    base = Path(__file__).resolve().parent.parent / "log"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"session-impression-{end_d.isoformat()}.html"
+
+
+def _read_session_impression_disk(end_d: date, *, max_age_sec: int = 86400) -> str | None:
+    p = _session_impression_cache_path(end_d)
+    if not p.exists():
+        return None
+    try:
+        st = p.stat()
+        if max_age_sec > 0 and (time.time() - float(st.st_mtime)) > float(max_age_sec):
+            return None
+        body = p.read_text(encoding="utf-8")
+        if not body or len(body) < 200:
+            return None
+        return body
+    except Exception:
+        return None
+
+
+def _write_session_impression_disk(end_d: date, html: str) -> None:
+    try:
+        p = _session_impression_cache_path(end_d)
+        p.write_text(html, encoding="utf-8")
+    except Exception:
+        # 磁盘不可写/只读等，不影响主流程
+        pass
 
 
 def _write_session_impression_memory(end_d: date, html: str) -> None:
@@ -181,6 +214,10 @@ def trend_session_impression_ads_html(
     # 嵌入首屏：仅内存，不访问线上库；支持 If-None-Match → 304
     if embed and not rebuild:
         body = _read_session_impression_memory(end_d)
+        if body is None:
+            body = _read_session_impression_disk(end_d, max_age_sec=86400)
+            if body is not None:
+                _write_session_impression_memory(end_d, body)
         if body is not None:
             logger.info("GET /api/trend/session-impression embed=1 cache=hit end_d=%s", end_d)
             return HTMLResponse(
@@ -210,6 +247,7 @@ def trend_session_impression_ads_html(
                 )
                 html = build_report_html_for_range(start_d, end_d)
                 _write_session_impression_memory(end_d, html)
+                _write_session_impression_disk(end_d, html)
             return HTMLResponse(
                 html,
                 headers={
@@ -256,6 +294,7 @@ def trend_session_impression_ads_html(
             )
             html = build_report_html_for_range(start_d, end_d)
             _write_session_impression_memory(end_d, html)
+            _write_session_impression_disk(end_d, html)
         return HTMLResponse(
             html,
             headers={**_si_cache_headers(html), "X-Session-Impression-Cache": "built"},
