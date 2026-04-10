@@ -10,6 +10,7 @@ import logging
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Optional
@@ -23,6 +24,7 @@ from app.services.daily_upload_asin_data_ds import sync_range, sync_with_default
 from app.services.daily_upload_session_report_html_pst import (
     DEFAULT_LISTING_SINCE,
     build_report_payload,
+    matrix_bulk_cache_wait_ready,
     render_html,
 )
 from app.services.weekly_upload_asin_date_add_impression_add_ads import (
@@ -487,6 +489,119 @@ def trend_new_listing_report(
         finally:
             db.close()
         if response_format == "json":
+            # 预热单店 views：当首屏只返回 all 视图（json_views=all）时，后台空闲并发构建各店 store payload 并写入进程内短缓存，
+            # 使后续切换店铺 json_views=store 更易命中缓存（前端也会在浏览器 idle 预取）。
+            if json_views_mode == "all_only":
+                store_ids = list(payload.get("storeIds") or [])
+                # 只在 store 数较多时才值得预热；并限制并发，避免抢占请求线程资源
+                if store_ids:
+                    cache_keys_to_warm: list[tuple[int, tuple]] = []
+                    for sid in store_ids:
+                        try:
+                            sid_i = int(sid)
+                        except Exception:
+                            continue
+                        key = (
+                            listing_since.isoformat(),
+                            start_d.isoformat(),
+                            end_d.isoformat(),
+                            effective_skip_sync,
+                            "store",
+                            sid_i,
+                        )
+                        if _new_listing_json_cache_get(key) is None:
+                            cache_keys_to_warm.append((sid_i, key))
+
+                    def _build_store_payload_for_cache(
+                        listing_since_d: date,
+                        start_d2: date,
+                        end_d2: date,
+                        sid_i: int,
+                        profile_flag: bool,
+                    ) -> dict | None:
+                        # 独立 session，避免与请求线程共享
+                        init_db()
+                        sdb = SessionLocal()
+                        try:
+                            return build_report_payload(
+                                sdb,
+                                listing_since_d,
+                                start_d2,
+                                end_d2,
+                                prefer_online=True,
+                                prefer_listing_online=True,
+                                profile=profile_flag,
+                                json_views_mode="store",
+                                single_store_id=sid_i,
+                            )
+                        finally:
+                            try:
+                                sdb.close()
+                            except Exception:
+                                pass
+
+                    def _bg_prewarm():
+                        if not cache_keys_to_warm:
+                            return
+                        t0w = time.perf_counter()
+                        # all_only 已在主线程做过 bulk GROUP BY；这里等 bulk cache 就绪再预热 store payload，
+                        # 使 store 构建路径可直接复用 bulk 的 by_store 切片，避免重复打本地 GROUP BY。
+                        matrix_bulk_cache_wait_ready(start_d, end_d, timeout_sec=2.0)
+                        # 依据 online reporting pool 容量限制并发；默认最多 3
+                        try:
+                            pool_cap = max(
+                                1,
+                                int(settings.ONLINE_REPORT_POOL_SIZE)
+                                + int(settings.ONLINE_REPORT_POOL_OVERFLOW)
+                                - 1,
+                            )
+                        except Exception:
+                            pool_cap = 2
+                        max_workers = max(1, min(3, pool_cap, len(cache_keys_to_warm)))
+                        warmed = 0
+                        failed = 0
+                        try:
+                            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                                futs = {}
+                                for sid_i, key in cache_keys_to_warm:
+                                    futs[
+                                        ex.submit(
+                                            _build_store_payload_for_cache,
+                                            listing_since,
+                                            start_d,
+                                            end_d,
+                                            sid_i,
+                                            profile,
+                                        )
+                                    ] = (sid_i, key)
+                                for fut in as_completed(futs):
+                                    sid_i, key = futs[fut]
+                                    try:
+                                        out = fut.result()
+                                        if out is not None:
+                                            _new_listing_json_cache_set(key, out)
+                                            warmed += 1
+                                    except Exception as exc:
+                                        failed += 1
+                                        logger.debug(
+                                            "New Listing store prewarm failed sid=%s: %s",
+                                            sid_i,
+                                            exc,
+                                        )
+                        finally:
+                            logger.info(
+                                "New Listing store prewarm done: warmed=%s failed=%s stores=%s elapsed_sec=%.2f",
+                                warmed,
+                                failed,
+                                len(cache_keys_to_warm),
+                                time.perf_counter() - t0w,
+                            )
+
+                    try:
+                        threading.Thread(target=_bg_prewarm, daemon=True).start()
+                    except Exception as exc:
+                        logger.debug("New Listing store prewarm thread start failed: %s", exc)
+
             headers: dict[str, str] = {}
             if not effective_skip_sync:
                 headers["X-New-Listing-Sync"] = "triggered-in-background"

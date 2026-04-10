@@ -98,6 +98,30 @@ class Settings(BaseSettings):
     DAILY_UPLOAD_DS_START_DATE: str = Field(
         default="2026-02-20",
         validation_alias="daily_upload_ds_start_date",
+        description="已不使用：DailyUploadDS 定时与无参 CLI 均为东八区当日往前 35 天起算，保留仅为兼容旧 .env",
+    )
+    # daily_ad_cost_sales 定时：在 SYNC_TIMEZONE 内从 first_run 起均匀分布 N 次（与 daily_upload_ds 类似，支持首跑分）
+    ENABLE_DAILY_AD_COST_SALES_SCHEDULE: bool = Field(
+        default=True,
+        validation_alias="enable_daily_ad_cost_sales_schedule",
+    )
+    DAILY_AD_COST_SALES_DAILY_TIMES: int = Field(
+        default=2,
+        ge=1,
+        le=24,
+        validation_alias="daily_ad_cost_sales_daily_times",
+    )
+    DAILY_AD_COST_SALES_FIRST_RUN_HOUR: int = Field(
+        default=8,
+        ge=0,
+        le=23,
+        validation_alias="daily_ad_cost_sales_first_run_hour",
+    )
+    DAILY_AD_COST_SALES_FIRST_RUN_MINUTE: int = Field(
+        default=0,
+        ge=0,
+        le=59,
+        validation_alias="daily_ad_cost_sales_first_run_minute",
     )
 
     def daily_upload_ds_cron_hours(self) -> tuple[list[int], str]:
@@ -126,6 +150,30 @@ class Settings(BaseSettings):
                 extra += 1
             hours_sorted = sorted(hours_sorted)[:n]
         return hours_sorted, f"daily_times={n} first_hour={first} hours={hours_sorted}"
+
+    def daily_ad_cost_sales_cron_slots(self) -> tuple[list[tuple[int, int]], str]:
+        """
+        APScheduler 在 SYNC_TIMEZONE 下的 (hour, minute) 触发点列表。
+        从 first_run_hour:first_run_minute 起在 24h 内均匀分布 daily_times 次；各次共用同一 minute。
+        """
+        n = max(1, min(24, int(self.DAILY_AD_COST_SALES_DAILY_TIMES or 1)))
+        first = max(0, min(23, int(self.DAILY_AD_COST_SALES_FIRST_RUN_HOUR)))
+        minute = max(0, min(59, int(self.DAILY_AD_COST_SALES_FIRST_RUN_MINUTE)))
+        if n == 1:
+            slots = [(first, minute)]
+            return slots, f"daily_times=1 first={first:02d}:{minute:02d} slots={slots}"
+        hours_set = {(first + int(round(i * 24 / n))) % 24 for i in range(n)}
+        hours_sorted = sorted(hours_set)
+        if len(hours_sorted) < n:
+            extra = first
+            while len(hours_sorted) < n and extra < first + 48:
+                cand = extra % 24
+                if cand not in hours_sorted:
+                    hours_sorted.append(cand)
+                extra += 1
+            hours_sorted = sorted(hours_sorted)[:n]
+        slots = [(h, minute) for h in hours_sorted]
+        return slots, f"daily_times={n} first={first:02d}:{minute:02d} hours={[h for h, _ in slots]}"
 
     @property
     def database_url(self) -> str:

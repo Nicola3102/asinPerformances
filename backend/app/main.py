@@ -13,7 +13,7 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from app.config import settings
 from app.online_engine import dispose_all_online_engines
-from app.controllers import asin_router
+from app.controllers import asin_router, ads_router
 from app.controllers.asin_controller import get_trend_data
 from app.controllers.sync_controller import router as sync_router
 from app.controllers.trend_reports import router as trend_reports_router
@@ -30,6 +30,7 @@ from app.services.auto_monitor import sync_auto_monitor
 from app.services.listing_tracking import sync_listing_tracking_recent_weeks_scheduled
 from app.services.daily_upload_asin_data import sync_with_default_date_range
 from app.services.daily_upload_asin_data_ds import run_daily_upload_ds_scheduled
+from app.services.daily_ad_cost_sales import run_daily_ad_cost_sales_scheduled
 from app.services.daily_upload_session_report_html import (
     DEFAULT_LISTING_SINCE,
     build_report_payload,
@@ -46,6 +47,7 @@ from app.sync_run_record import (
     should_run_listing_tracking_sync,
     record_listing_tracking_run,
     should_run_daily_upload_ds_sync,
+    should_run_daily_ad_cost_sales_sync,
 )
 
 # 按日期将日志写入 app/log/YYYY-MM-DD.log
@@ -166,9 +168,14 @@ def _run_scheduled_daily_upload_and_report():
 def _run_scheduled_daily_upload_ds():
     """
     定时：按 settings.daily_upload_ds_cron_hours()（.env：daily_upload_ds_first_run_hour / daily_times 等）在 SYNC_TIMEZONE 整点执行；
-    执行 daily_upload_asin_data_ds 增量同步（session 缺口 + 按调度档拉 updated_at）。
+    listing 区间为东八区「当日-35 天」至当日（与无参 CLI 一致），再执行 daily_upload_asin_data_ds 同步。
     """
     run_daily_upload_ds_scheduled(force=False)
+
+
+def _run_scheduled_daily_ad_cost_sales():
+    """按 .env：daily_ad_cost_sales_first_run_* / daily_times 在 SYNC_TIMEZONE 执行广告日花费/销售额 gap 同步。"""
+    run_daily_ad_cost_sales_scheduled(force=False)
 
 
 def _run_scheduled_listing_tracking():
@@ -284,6 +291,20 @@ async def lifespan(app: FastAPI):
                     # 整点略有延迟或进程短暂卡住时仍补跑（小时点来自 .env first_run_hour / daily_times）
                     misfire_grace_time=3600,
                 )
+            ad_slots: list[tuple[int, int]] = []
+            ad_schedule_desc = ""
+            ad_next_run = None
+            if settings.ENABLE_DAILY_AD_COST_SALES_SCHEDULE:
+                ad_slots, ad_schedule_desc = settings.daily_ad_cost_sales_cron_slots()
+                for idx, (ad_h, ad_m) in enumerate(ad_slots):
+                    _scheduler.add_job(
+                        _run_scheduled_daily_ad_cost_sales,
+                        "cron",
+                        hour=ad_h,
+                        minute=ad_m,
+                        id=f"daily_ad_cost_sales_slot_{idx}",
+                        misfire_grace_time=3600,
+                    )
             _scheduler.start()
             job = _scheduler.get_job("online_sync")
             next_run = job.next_run_time if job else None
@@ -299,6 +320,9 @@ async def lifespan(app: FastAPI):
             if settings.ENABLE_DAILY_UPLOAD_DS_SCHEDULE:
                 ds_job = _scheduler.get_job("daily_upload_asin_data_ds")
                 ds_next_run = ds_job.next_run_time if ds_job else None
+            if settings.ENABLE_DAILY_AD_COST_SALES_SCHEDULE and ad_slots:
+                ad0 = _scheduler.get_job("daily_ad_cost_sales_slot_0")
+                ad_next_run = ad0.next_run_time if ad0 else None
             # 若当前为东八区命中 online sync 的小时窗口且本小时内未执行过，启动时补跑一次
             now = now_asia()
             if is_n_hour_slot(now, sync_interval) and should_run_scheduled_sync():
@@ -360,6 +384,24 @@ async def lifespan(app: FastAPI):
                     t.start()
                 except Exception as e:
                     logger.exception("[DailyUploadDS] Startup catch-up failed: %s", e)
+            if (
+                settings.ENABLE_DAILY_AD_COST_SALES_SCHEDULE
+                and ad_slots
+                and (now.hour, now.minute) in ad_slots
+                and should_run_daily_ad_cost_sales_sync()
+            ):
+                logger.info(
+                    "[DailyAdCostSales] Startup catch-up: current time matches slot %02d:%02d (%s), "
+                    "no run yet this minute — running once in background.",
+                    now.hour,
+                    now.minute,
+                    settings.SYNC_TIMEZONE,
+                )
+                try:
+                    t = threading.Thread(target=_run_scheduled_daily_ad_cost_sales, daemon=True)
+                    t.start()
+                except Exception as e:
+                    logger.exception("[DailyAdCostSales] Startup catch-up failed: %s", e)
             logger.info(
                 "Scheduled sync enabled: every %sh at :00 (Asia/Shanghai), next_run_time=%s",
                 sync_interval,
@@ -398,6 +440,18 @@ async def lifespan(app: FastAPI):
                 )
             else:
                 logger.info("[DailyUploadDS] Scheduled sync disabled (enable_daily_upload_ds_schedule=false)")
+            if settings.ENABLE_DAILY_AD_COST_SALES_SCHEDULE and ad_slots:
+                logger.info(
+                    "[DailyAdCostSales] Scheduled sync enabled: %s (%s), slots=%s, next_run_time=%s",
+                    ad_schedule_desc,
+                    settings.SYNC_TIMEZONE,
+                    ad_slots,
+                    ad_next_run,
+                )
+            else:
+                logger.info(
+                    "[DailyAdCostSales] Scheduled sync disabled (enable_daily_ad_cost_sales_schedule=false)"
+                )
         except Exception as e:
             logger.warning("Scheduled sync not started: %s", e)
             _scheduler = None
@@ -443,6 +497,7 @@ app.add_middleware(
 # 压缩 JSON/HTML 等文本响应，减小 New Listing 等大 payload 传输体积
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.include_router(asin_router)
+app.include_router(ads_router)
 app.include_router(sync_router)
 app.include_router(trend_reports_router, prefix="/api/trend")
 app.add_api_route(

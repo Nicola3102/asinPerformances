@@ -10,6 +10,7 @@ SYNC_FILENAME = ".last_sync_run"
 MONITOR_FILENAME = ".last_monitor_run"
 LISTING_TRACKING_FILENAME = ".last_listing_tracking_run"
 DAILY_UPLOAD_DS_FILENAME = ".last_daily_upload_ds_run"
+DAILY_AD_COST_SALES_FILENAME = ".last_daily_ad_cost_sales_run"
 
 
 def _get_record_path(filename: str) -> Path:
@@ -149,6 +150,38 @@ def should_run_daily_upload_ds_sync() -> bool:
     if last is None:
         return True
     if (last.date(), last.hour) == (now.date(), now.hour):
+        return False
+    return True
+
+
+def record_daily_ad_cost_sales_run() -> None:
+    """记录 daily_ad_cost_sales 最近一次定时执行时间（UTC）。"""
+    path = _get_record_path(DAILY_AD_COST_SALES_FILENAME)
+    path.write_text(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"), encoding="utf-8")
+
+
+def get_last_daily_ad_cost_sales_run_asia() -> datetime | None:
+    path = _get_record_path(DAILY_AD_COST_SALES_FILENAME)
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+        utc = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return utc.astimezone(TZ_ASIA_SHANGHAI)
+    except Exception:
+        return None
+
+
+def should_run_daily_ad_cost_sales_sync() -> bool:
+    """
+    当前（东八区）是否应执行 daily_ad_cost_sales 定时同步：
+    同一自然日同一小时同一分钟内已执行过则跳过（与多 slot 整点/定分触发一致）。
+    """
+    now = now_asia()
+    last = get_last_daily_ad_cost_sales_run_asia()
+    if last is None:
+        return True
+    if (last.date(), last.hour, last.minute) == (now.date(), now.hour, now.minute):
         return False
     return True
 

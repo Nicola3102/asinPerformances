@@ -410,6 +410,73 @@ export interface SyncCheck {
   message?: string | null;
 }
 
+export type AdSalesRow = {
+  id: number;
+  ad_asin: string | null;
+  store_id: number | null;
+  purchase_date: string | null;
+  ad_cost: number | null;
+  ad_sales_1d: number | null;
+  ad_sales_7d: number | null;
+  ad_sales_14d: number | null;
+  ad_sales_30d: number | null;
+  tad_sales: number | null;
+  tad_sales_7d: number | null;
+  tad_sales_14d: number | null;
+  tad_sales_30d: number | null;
+}
+
+export type AdSalesListResponse = {
+  items: AdSalesRow[];
+  page: number;
+  page_size: number;
+  total: number;
+}
+
+export async function listAdSales(params: {
+  store_id?: number | null;
+  start_date?: string | null;
+  end_date?: string | null;
+  sort?: string | null;
+  page?: number;
+  page_size?: number;
+}): Promise<AdSalesListResponse> {
+  const qs = new URLSearchParams()
+  if (params.store_id != null && !Number.isNaN(Number(params.store_id))) qs.set('store_id', String(params.store_id))
+  if (params.start_date) qs.set('start_date', params.start_date)
+  if (params.end_date) qs.set('end_date', params.end_date)
+  if (params.sort) qs.set('sort', params.sort)
+  if (params.page != null) qs.set('page', String(params.page))
+  if (params.page_size != null) qs.set('page_size', String(params.page_size))
+  const res = await fetch(`${API_BASE}/ads/ad-sales?${qs.toString()}`)
+  if (!res.ok) {
+    const text = await res.text()
+    throw buildApiError(text, res.status, 'Failed to fetch ad-sales')
+  }
+  return res.json()
+}
+
+export async function downloadAdSales(ids: number[]): Promise<void> {
+  const qs = new URLSearchParams()
+  for (const id of ids) {
+    if (Number.isFinite(id) && id > 0) qs.append('ids', String(id))
+  }
+  const res = await fetch(`${API_BASE}/ads/ad-sales/export?${qs.toString()}`)
+  if (!res.ok) {
+    const text = await res.text()
+    throw buildApiError(text, res.status, 'Failed to export ad-sales')
+  }
+  const blob = await res.blob()
+  const url = window.URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `ad_sales_selected.csv`
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  window.URL.revokeObjectURL(url)
+}
+
 export async function syncFromOnline(): Promise<{
   status: string;
   rows_synced: number;

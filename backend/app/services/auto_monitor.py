@@ -45,14 +45,20 @@ def _week_no_to_week_start(week_no: int | str | None) -> date | None:
     return first_sunday + timedelta(weeks=week_num - 1)
 
 
-def _fetch_parent_listing(online_conn, parent_asin: str) -> tuple[int | None, datetime | None, list[tuple[int, str]]]:
+def _fetch_parent_listing(
+    online_conn,
+    parent_asin: str,
+    *,
+    emit_load_log: bool = True,
+) -> tuple[int | None, datetime | None, list[tuple[int, str]]]:
     t0 = time.time()
     parent = online_conn.execute(
         text("SELECT id, created_at FROM amazon_variation WHERE asin = :pa LIMIT 1"),
         {"pa": parent_asin},
     ).fetchone()
     if not parent or not parent[0]:
-        logger.info("[AutoMonitor] parent listing lookup: parent_asin=%s not found in amazon_variation", parent_asin)
+        log = logger.info if emit_load_log else logger.debug
+        log("[AutoMonitor] parent listing lookup: parent_asin=%s not found in amazon_variation", parent_asin)
         return None, None, []
     parent_id = int(parent[0])
     parent_created_at = parent[1] if len(parent) > 1 else None
@@ -71,18 +77,36 @@ def _fetch_parent_listing(online_conn, parent_asin: str) -> tuple[int | None, da
         if sid is None or not asin:
             continue
         listing.append((sid, asin))
-    logger.info(
-        "[AutoMonitor] parent listing loaded: parent_asin=%s parent_id=%s children=%s stores=%s elapsed=%.2fs",
-        parent_asin,
-        parent_id,
-        len(listing),
-        len({sid for sid, _ in listing}),
-        time.time() - t0,
-    )
+    elapsed = time.time() - t0
+    if emit_load_log:
+        logger.info(
+            "[AutoMonitor] parent listing loaded: parent_asin=%s parent_id=%s children=%s stores=%s elapsed=%.2fs",
+            parent_asin,
+            parent_id,
+            len(listing),
+            len({sid for sid, _ in listing}),
+            elapsed,
+        )
+    else:
+        logger.debug(
+            "[AutoMonitor] parent listing loaded: parent_asin=%s parent_id=%s children=%s stores=%s elapsed=%.2fs",
+            parent_asin,
+            parent_id,
+            len(listing),
+            len({sid for sid, _ in listing}),
+            elapsed,
+        )
     return parent_id, parent_created_at, listing
 
 
-def _fetch_search_status_map(online_conn, store_id: int, week_no: int, child_asins: list[str]) -> dict[str, int | None]:
+def _fetch_search_status_map(
+    online_conn,
+    store_id: int,
+    week_no: int,
+    child_asins: list[str],
+    *,
+    emit_load_log: bool = True,
+) -> dict[str, int | None]:
     if not child_asins:
         return {}
     t0 = time.time()
@@ -110,34 +134,51 @@ def _fetch_search_status_map(online_conn, store_id: int, week_no: int, child_asi
                 status_map[asin] = int(row[1]) if row[1] is not None else None
             except (TypeError, ValueError):
                 status_map[asin] = None
-    logger.info(
-        "[AutoMonitor] status map loaded: store_id=%s week_no=%s child_asins=%s hits=%s elapsed=%.2fs",
-        store_id,
-        week_no,
-        len(child_asins),
-        len(status_map),
-        time.time() - t0,
-    )
+    elapsed = time.time() - t0
+    if emit_load_log:
+        logger.info(
+            "[AutoMonitor] status map loaded: store_id=%s week_no=%s child_asins=%s hits=%s elapsed=%.2fs",
+            store_id,
+            week_no,
+            len(child_asins),
+            len(status_map),
+            elapsed,
+        )
+    else:
+        logger.debug(
+            "[AutoMonitor] status map loaded: store_id=%s week_no=%s child_asins=%s hits=%s elapsed=%.2fs",
+            store_id,
+            week_no,
+            len(child_asins),
+            len(status_map),
+            elapsed,
+        )
     return status_map
 
 
 def check_parent_store_week_completed(online_conn, parent_asin: str, store_id: int, week_no: int) -> tuple[bool, int]:
-    _, _, listing = _fetch_parent_listing(online_conn, parent_asin)
+    """
+    供 Monitor / query-status 刷新接口按组调用；默认不在 INFO 打明细，避免与前端轮询叠加刷屏。
+    明细见 logger DEBUG。
+    """
+    _, _, listing = _fetch_parent_listing(online_conn, parent_asin, emit_load_log=False)
     child_asins = sorted({asin for sid, asin in listing if sid == int(store_id)})
     if not child_asins:
-        logger.info(
+        logger.debug(
             "[AutoMonitor] completion check skipped: parent_asin=%s store_id=%s week_no=%s reason=no_children",
             parent_asin,
             store_id,
             week_no,
         )
         return False, 0
-    status_map = _fetch_search_status_map(online_conn, int(store_id), int(week_no), child_asins)
+    status_map = _fetch_search_status_map(
+        online_conn, int(store_id), int(week_no), child_asins, emit_load_log=False
+    )
     has_any_rows = len(status_map) > 0
     done = has_any_rows and all((asin not in status_map) or (status_map.get(asin) == 3) for asin in child_asins)
     missing_count = sum(1 for asin in child_asins if asin not in status_map)
     non_completed_count = sum(1 for asin in child_asins if asin in status_map and status_map.get(asin) != 3)
-    logger.info(
+    logger.debug(
         "[AutoMonitor] completion checked: parent_asin=%s store_id=%s week_no=%s child_count=%s started=%s missing_in_amazon_search=%s non_completed_status=%s completed=%s",
         parent_asin,
         store_id,

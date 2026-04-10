@@ -957,7 +957,7 @@ def refresh_query_status(
         raise HTTPException(status_code=400, detail="online_db 配置缺失，无法刷新查询状态")
 
     now = datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None)
-    threshold = now - timedelta(minutes=8)
+    threshold = now - timedelta(minutes=30)
 
     groups = (
         db.query(
@@ -1034,6 +1034,15 @@ def refresh_query_status(
         if lock_acquired:
             _query_refresh_lock.release()
 
+    logger.info(
+        "[QueryStatusRefresh] week_no=%s checked_groups=%s completed_groups=%s skipped_completed=%s skipped_by_interval=%s groups_total=%s",
+        week_no,
+        checked_groups,
+        completed_groups,
+        skipped_completed,
+        skipped_by_interval,
+        len(groups),
+    )
     return {
         "week_no": week_no,
         "checked_groups": checked_groups,

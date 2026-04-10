@@ -297,6 +297,14 @@
   box-sizing: border-box;
 }
 
+/* Chart.js 默认 HTML tooltip：仍可能较长时允许滚动（批次过滤后一般已足够短） */
+#chartjs-tooltip,
+.chartjs-tooltip {
+  max-height: min(65vh, 440px);
+  overflow-y: auto;
+  box-sizing: border-box;
+}
+
 .trend-new-listing-empty {
   margin: 0;
   padding: 2rem;

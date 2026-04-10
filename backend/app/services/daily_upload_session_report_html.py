@@ -956,6 +956,25 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
       .replace(/"/g, '&quot;');
   }
 
+  var NL_TOOLTIP_COHORT_LOOKBACK_DAYS = 35;
+  function nlMinCohortYmdForSession(sessionYmd, daysBack) {
+    var p = String(sessionYmd || '').slice(0, 10).split('-');
+    if (p.length !== 3) return null;
+    var d = new Date(Date.UTC(parseInt(p[0], 10), parseInt(p[1], 10) - 1, parseInt(p[2], 10)));
+    d.setUTCDate(d.getUTCDate() - daysBack);
+    var yy = d.getUTCFullYear();
+    var mm = ('0' + (d.getUTCMonth() + 1)).slice(-2);
+    var dd = ('0' + d.getUTCDate()).slice(-2);
+    return yy + '-' + mm + '-' + dd;
+  }
+  function nlCohortVisibleInTooltip(sessionYmd, cohortYmd) {
+    var minY = nlMinCohortYmdForSession(sessionYmd, NL_TOOLTIP_COHORT_LOOKBACK_DAYS);
+    if (!minY) return true;
+    var c = String(cohortYmd || '').slice(0, 10);
+    var s = String(sessionYmd || '').slice(0, 10);
+    return c >= minY && c <= s;
+  }
+
   function hideChartTooltipEl() {
     var el = document.getElementById('daily-report-chart-tooltip');
     if (el) {
@@ -1029,6 +1048,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
           escapeHtml(ds.label) + ': ' + Number(yv).toLocaleString() + '</span></div>';
       } else {
         var cd = v.cohortLabels[dsi];
+        if (!nlCohortVisibleInTooltip(day.sessionDate, cd)) return;
         var m = v.cohortListingAsin || {};
         var na = cd != null ? m[cd] : null;
         var ns = na != null && na !== undefined ? Number(na).toLocaleString() : '—';
@@ -1041,8 +1061,9 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     html += '<div>当日 sessions 合计: ' + day.totalSessions.toLocaleString() + '</div>';
     html += '<div>当日上新 ASIN 数: ' + day.newAsinCount.toLocaleString() + '</div>';
     if (day.cohortParts && day.cohortParts.length) {
-      html += '<div class="chart-tooltip-external-sub">各批次 sessions:</div>';
+      html += '<div class="chart-tooltip-external-sub">各批次 sessions（仅横轴日前 ' + NL_TOOLTIP_COHORT_LOOKBACK_DAYS + ' 天内）:</div>';
       day.cohortParts.forEach(function (p) {
+        if (!nlCohortVisibleInTooltip(day.sessionDate, p.cohort)) return;
         html += '<div class="chart-tooltip-external-sub">  · 批次 ' + escapeHtml(p.cohort) + ': ' +
           Number(p.sessions).toLocaleString() + '</div>';
       });

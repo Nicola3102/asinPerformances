@@ -26,9 +26,8 @@
 如已存在则仅当 sessions 变化时更新。
 
 定时任务（后端 ENABLE_SCHEDULED_SYNC=true 且 enable_daily_upload_ds_schedule=true）：
-  - 每 ``daily_upload_ds_interval_hours`` 小时（默认 2）在 ``sync_timezone``（默认 Asia/Shanghai）整点执行；
-  - ``--start-date`` 等价配置：``.env`` 中 ``daily_upload_ds_start_date``（默认 2026-02-20）；
-  - 结束日为东八区（与 ``SYNC_TIMEZONE`` 一致）当前日历日（含）。
+  - 按 ``daily_upload_ds_cron_hours()``（``.env``：``daily_upload_ds_first_run_hour`` / ``daily_times`` 等）在 ``SYNC_TIMEZONE`` 整点执行；
+  - listing 扫描区间与无参 CLI 一致：``start = 东八区当日 - 35 天``，``end = 东八区当日``（均含端点）。
 
 用法（在 backend 目录下）：
   python3.11 -m app.services.daily_upload_asin_data_ds
@@ -59,9 +58,6 @@ from app.online_engine import get_online_engine
 from app.sync_run_record import now_asia, record_daily_upload_ds_run, should_run_daily_upload_ds_sync
 
 logger = logging.getLogger(__name__)
-
-# 定时任务 listing 下界默认值（与 Settings.daily_upload_ds_start_date 一致）
-_DEFAULT_SCHEDULED_LISTING_START = date(2026, 2, 20)
 
 # 相对「上新日历日」拉取 amazon_sales_and_traffic_daily.current_date 的区间（含端点）
 _DEFAULT_SESSION_OFFSET_START = -1
@@ -126,38 +122,19 @@ def sync_with_default_date_range(session_dates: list[date] | None = None) -> dic
     return sync_range(start_d, end_d, session_dates=session_dates)
 
 
-def _parse_scheduled_start_date_from_env() -> date:
-    raw = (settings.DAILY_UPLOAD_DS_START_DATE or "").strip()
-    if not raw:
-        return _DEFAULT_SCHEDULED_LISTING_START
-    try:
-        return _parse_ymd(raw)
-    except ValueError:
-        logger.warning(
-            "[DailyUploadDS] invalid daily_upload_ds_start_date=%r, using default %s",
-            raw,
-            _DEFAULT_SCHEDULED_LISTING_START.isoformat(),
-        )
-        return _DEFAULT_SCHEDULED_LISTING_START
-
-
 def sync_scheduled_listing_date_range_ds() -> dict:
     """
-    APScheduler 调用：listing 扫描 [start, end]，start 来自 .env，end 为 SYNC_TIMEZONE 当前日历日（含）。
+    APScheduler 调用：listing 扫描区间与 ``default_sync_listing_date_bounds`` 一致
+   （东八区当日往前 35 天 → 当日，含端点），不再使用 ``daily_upload_ds_start_date`` 固定下界。
     """
-    start_d = _parse_scheduled_start_date_from_env()
-    end_d = now_asia().date()
-    if start_d > end_d:
-        logger.warning(
-            "[DailyUploadDS] scheduled range invalid: start=%s > end=%s (%s today), clamping start=end",
-            start_d.isoformat(),
-            end_d.isoformat(),
-            settings.SYNC_TIMEZONE,
-        )
-        start_d = end_d
+    init_db()
+    local_db = SessionLocal()
+    try:
+        start_d, end_d = default_sync_listing_date_bounds(local_db)
+    finally:
+        local_db.close()
     logger.info(
-        "[DailyUploadDS] scheduled sync: start_date=%s (daily_upload_ds_start_date / default), "
-        "end_date=%s (%s calendar day, inclusive)",
+        "[DailyUploadDS] scheduled sync: start_date=%s end_date=%s (%s; listing window = today-35d..today inclusive)",
         start_d.isoformat(),
         end_d.isoformat(),
         settings.SYNC_TIMEZONE,

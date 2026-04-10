@@ -325,6 +325,115 @@ def _ensure_daily_upload_open_date_column():
             conn.commit()
 
 
+def _ensure_daily_ad_cost_sales_schema():
+    """daily_ad_cost_sales：补充 variation_id；唯一键 (ad_asin, store_id, pid, purchase_date)，并淘汰旧三列唯一索引。"""
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        if engine.dialect.name != "mysql":
+            return
+        table_exists = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'daily_ad_cost_sales'"
+            )
+        ).scalar()
+        if not table_exists:
+            return
+
+        vid_exists = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'daily_ad_cost_sales' AND COLUMN_NAME = 'variation_id'"
+            )
+        ).scalar()
+        if not vid_exists:
+            conn.execute(text("ALTER TABLE daily_ad_cost_sales ADD COLUMN variation_id BIGINT NULL"))
+            conn.execute(text("CREATE INDEX ix_daily_ad_cost_sales_variation_id ON daily_ad_cost_sales (variation_id)"))
+            conn.commit()
+
+        new_uq = "uq_daily_ad_cost_sales_asin_store_pid_date"
+        old_uq = "uq_daily_ad_cost_sales_asin_store_date"
+        new_uq_exists = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM information_schema.STATISTICS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'daily_ad_cost_sales' "
+                "AND INDEX_NAME = :name"
+            ),
+            {"name": new_uq},
+        ).scalar()
+        if not new_uq_exists:
+            old_exists = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.STATISTICS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'daily_ad_cost_sales' "
+                    "AND INDEX_NAME = :name"
+                ),
+                {"name": old_uq},
+            ).scalar()
+            if old_exists:
+                try:
+                    conn.execute(text(f"ALTER TABLE daily_ad_cost_sales DROP INDEX `{old_uq}`"))
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+            try:
+                conn.execute(
+                    text(
+                        "ALTER TABLE daily_ad_cost_sales "
+                        f"ADD UNIQUE INDEX `{new_uq}` (ad_asin, store_id, pid, purchase_date)"
+                    )
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+
+        for col_name in (
+            "ad_sales_1d",
+            "ad_sales_7d",
+            "ad_sales_14d",
+            "ad_sales_30d",
+            "tad_sales",
+            "tad_sales_7d",
+            "tad_sales_14d",
+            "tad_sales_30d",
+        ):
+            col_exists = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'daily_ad_cost_sales' AND COLUMN_NAME = :c"
+                ),
+                {"c": col_name},
+            ).scalar()
+            if not col_exists:
+                try:
+                    conn.execute(
+                        text(f"ALTER TABLE daily_ad_cost_sales ADD COLUMN `{col_name}` DOUBLE NULL")
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+
+        for col_name in ("tsales", "tsales_7d", "tsales_14d", "tsales_30d"):
+            col_exists = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'daily_ad_cost_sales' AND COLUMN_NAME = :c"
+                ),
+                {"c": col_name},
+            ).scalar()
+            if not col_exists:
+                try:
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE daily_ad_cost_sales ADD COLUMN `{col_name}` DECIMAL(20,2) NULL"
+                        )
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+
+
 def _ensure_daily_upload_asin_dates_composite_indexes():
     """New Listing / PST 矩阵聚合用组合索引（若不存在则创建）。"""
     from sqlalchemy import text
@@ -361,7 +470,13 @@ def _ensure_daily_upload_asin_dates_composite_indexes():
 
 def init_db():
     """Create all tables. Called on startup. Retries if MySQL not ready (e.g. in Docker)."""
-    from app.models import asin_performance, group_a, listing_tracking, daily_upload_asin_data  # noqa: F401
+    from app.models import (  # noqa: F401
+        asin_performance,
+        daily_ad_cost_sales,
+        daily_upload_asin_data,
+        group_a,
+        listing_tracking,
+    )
 
     max_attempts = 10
     for attempt in range(1, max_attempts + 1):
@@ -374,6 +489,7 @@ def init_db():
             _ensure_listing_tracking_indexes()
             _ensure_daily_upload_open_date_column()
             _ensure_daily_upload_asin_dates_composite_indexes()
+            _ensure_daily_ad_cost_sales_schema()
             return
         except OperationalError as e:
             if attempt == max_attempts:

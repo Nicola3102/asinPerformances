@@ -21,6 +21,8 @@ import {
   getMonitorParents,
   getMonitorTrack,
   getTrendData,
+  listAdSales,
+  downloadAdSales,
   type SummaryRowConsolidated,
   type DetailResponse,
   type DetailChildRow,
@@ -34,6 +36,7 @@ import {
   type GroupADetailChildRow,
   type MonitorParentItem,
   type MonitorTrackResponse,
+  type AdSalesRow,
   type TrendResponse,
   type TrendWeekPoint,
 } from './api/client'
@@ -113,6 +116,34 @@ async function parseTrendNewListingJsonText(text: string): Promise<TrendNewListi
     }
     w.postMessage(text)
   })
+}
+
+/** 与 DailyUploadDS 默认 listing 窗口一致：堆叠图 tooltip 只展示相对横轴日最近 35 个日历日内的批次 */
+const NL_STACK_TOOLTIP_COHORT_LOOKBACK_DAYS = 35
+
+function nlStackTooltipYmdAddDays(ymd: string, deltaDays: number): string | null {
+  const head = String(ymd || '').slice(0, 10)
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(head)) return null
+  const [y, m, d] = head.split('-').map(Number)
+  const t = Date.UTC(y, m - 1, d) + deltaDays * 86400000
+  const u = new Date(t)
+  const yy = u.getUTCFullYear()
+  const mm = String(u.getUTCMonth() + 1).padStart(2, '0')
+  const dd = String(u.getUTCDate()).padStart(2, '0')
+  return `${yy}-${mm}-${dd}`
+}
+
+function nlStackTooltipParseBatchYmd(label: string): string | null {
+  const m = /批次\s+(\d{4}-\d{2}-\d{2})/.exec(String(label || ''))
+  return m ? m[1] : null
+}
+
+function nlStackTooltipCohortInWindow(sessionYmd: string, cohortYmd: string): boolean {
+  const s = String(sessionYmd || '').slice(0, 10)
+  const minY = nlStackTooltipYmdAddDays(s, -NL_STACK_TOOLTIP_COHORT_LOOKBACK_DAYS)
+  const c = String(cohortYmd || '').slice(0, 10)
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || !/^\d{4}-\d{2}-\d{2}$/.test(c) || !minY) return true
+  return c >= minY && c <= s
 }
 
 const NL_COHORT_ROW_HEIGHT_PX = 34
@@ -824,7 +855,7 @@ function AsinHomePage() {
     void triggerRefreshQueryStatus(selectedWeek)
     const timer = setInterval(() => {
       void triggerRefreshQueryStatus(selectedWeek)
-    }, 120000)
+    }, 30 * 60 * 1000) // 30 分钟
     return () => clearInterval(timer)
   }, [selectedWeek])
 
@@ -2669,6 +2700,16 @@ function TrendNewListingEmbeddedPage() {
   } | null>(null)
   const nlShellAbortRef = useRef<AbortController | null>(null)
   const nlStoreAbortRef = useRef<AbortController | null>(null)
+  /** 与 payload 同步，供空闲预取回调读取最新 views */
+  const nlPayloadRef = useRef<TrendNewListingJsonPayload | null>(payload)
+  /** 单店 JSON 正在请求中（用户切换或预取），避免重复打接口 */
+  const nlStoreInFlightRef = useRef<Set<number>>(new Set())
+  /** 取消上一轮预取链（idle 回调 + 当前预取请求） */
+  const nlPrefetchGenRef = useRef(0)
+  const nlPrefetchRicRef = useRef<number | null>(null)
+  const nlPrefetchRicIsNativeRef = useRef(false)
+
+  nlPayloadRef.current = payload
 
   const fetchNewListingJson = useCallback(
     async (opts: {
@@ -2683,7 +2724,8 @@ function TrendNewListingEmbeddedPage() {
       let wantProfile = false
       try {
         const sp = new URLSearchParams(window.location.search)
-        serverNocache = sp.get('refresh') === '1' || sp.get('nocache') === '1'
+        // ?refresh=1 用于首屏强制重新拉取 all 视图；单店切换/预取若也强制 nocache，会导致每次都绕过服务端缓存而变慢
+        serverNocache = (opts.jsonViews === 'all') && (sp.get('refresh') === '1' || sp.get('nocache') === '1')
         wantProfile = sp.get('profile') === '1'
       } catch {
         /* ignore */
@@ -2724,6 +2766,7 @@ function TrendNewListingEmbeddedPage() {
           return next
         })
       } else {
+        nlStoreInFlightRef.current.clear()
         if (opts.writeCache) writeTrendNewListingCache(data)
         setPayload(data)
       }
@@ -2777,6 +2820,105 @@ function TrendNewListingEmbeddedPage() {
     }
   }, [boot.useCacheOnly, boot.payload, fetchNewListingJson])
 
+  /** views.all 就绪后空闲预取各店 json_views=store，合并进 payload / 本地缓存；切换店铺时直接命中 views[id] */
+  useEffect(() => {
+    if (boot.useCacheOnly && boot.payload) return
+    if (!payload?.views?.all) return
+    const ids = payload.storeIds || []
+    if (!ids.length) return
+
+    const gen = ++nlPrefetchGenRef.current
+    let cancelled = false
+    let prefetchAc: AbortController | null = null
+
+    const cancelPrefetchSchedule = () => {
+      const h = nlPrefetchRicRef.current
+      nlPrefetchRicRef.current = null
+      if (h == null) return
+      if (nlPrefetchRicIsNativeRef.current && typeof cancelIdleCallback !== 'undefined') {
+        cancelIdleCallback(h)
+      } else {
+        clearTimeout(h)
+      }
+      nlPrefetchRicIsNativeRef.current = false
+    }
+
+    const runOneStore = () => {
+      if (cancelled || gen !== nlPrefetchGenRef.current) return
+      const p = nlPayloadRef.current
+      if (!p?.views?.all) return
+      const sid = ids.find(
+        (id) => !p.views[String(id)] && !nlStoreInFlightRef.current.has(id),
+      )
+      if (sid == null) return
+
+      nlStoreInFlightRef.current.add(sid)
+      prefetchAc?.abort()
+      prefetchAc = new AbortController()
+
+      fetchNewListingJson({
+        skipSync: false,
+        writeCache: true,
+        jsonViews: 'store',
+        storeId: sid,
+        signal: prefetchAc.signal,
+        mergeIntoExisting: true,
+      })
+        .catch((e: unknown) => {
+          if (typeof e === 'object' && e !== null && (e as { name?: string }).name === 'AbortError') return
+          /* 预取失败不弹窗，避免打扰；用户点开该店时会再请求 */
+        })
+        .finally(() => {
+          nlStoreInFlightRef.current.delete(sid)
+          if (gen !== nlPrefetchGenRef.current) return
+          if (!cancelled) scheduleIdle()
+        })
+    }
+
+    const scheduleIdle = () => {
+      if (cancelled || gen !== nlPrefetchGenRef.current) return
+      cancelPrefetchSchedule()
+      const p = nlPayloadRef.current
+      const hasMore = ids.some(
+        (id) => !p?.views?.[String(id)] && !nlStoreInFlightRef.current.has(id),
+      )
+      if (!hasMore) return
+
+      if (typeof requestIdleCallback !== 'undefined') {
+        nlPrefetchRicIsNativeRef.current = true
+        nlPrefetchRicRef.current = requestIdleCallback(
+          () => {
+            nlPrefetchRicRef.current = null
+            nlPrefetchRicIsNativeRef.current = false
+            runOneStore()
+          },
+          { timeout: 2500 },
+        )
+      } else {
+        nlPrefetchRicIsNativeRef.current = false
+        nlPrefetchRicRef.current = window.setTimeout(() => {
+          nlPrefetchRicRef.current = null
+          runOneStore()
+        }, 48) as unknown as number
+      }
+    }
+
+    scheduleIdle()
+    return () => {
+      cancelled = true
+      cancelPrefetchSchedule()
+      prefetchAc?.abort()
+    }
+  }, [
+    boot.useCacheOnly,
+    boot.payload,
+    payload?.views?.all,
+    payload?.sessionChartStart,
+    payload?.sessionChartEnd,
+    (payload?.storeIds || []).join(','),
+    fetchNewListingJson,
+  ])
+
   useEffect(() => {
     if (storeKey === 'all') {
       setStoreViewLoading(null)
@@ -2788,9 +2930,14 @@ function TrendNewListingEmbeddedPage() {
       setStoreViewLoading(null)
       return
     }
+    if (nlStoreInFlightRef.current.has(sid)) {
+      setStoreViewLoading(storeKey)
+      return
+    }
     nlStoreAbortRef.current?.abort()
     const ac = new AbortController()
     nlStoreAbortRef.current = ac
+    nlStoreInFlightRef.current.add(sid)
     setStoreViewLoading(storeKey)
     fetchNewListingJson({
       skipSync: false,
@@ -2805,10 +2952,17 @@ function TrendNewListingEmbeddedPage() {
         setErr(e instanceof Error ? e.message : '店铺数据加载失败')
       })
       .finally(() => {
+        nlStoreInFlightRef.current.delete(sid)
         setStoreViewLoading((k) => (k === storeKey ? null : k))
       })
     return () => ac.abort()
   }, [storeKey, payload?.views, fetchNewListingJson])
+
+  useEffect(() => {
+    if (storeKey !== 'all' && payload?.views?.[storeKey]) {
+      setStoreViewLoading(null)
+    }
+  }, [storeKey, payload?.views])
 
   const view: TrendNewListingViewPayload | undefined =
     storeKey === 'all' ? payload?.views?.all : payload?.views?.[storeKey]
@@ -2818,7 +2972,10 @@ function TrendNewListingEmbeddedPage() {
     if (!view?.labels?.length) return
     let idle: number | ReturnType<typeof setTimeout>
     let usedRic = false
-    if (typeof requestIdleCallback !== 'undefined') {
+    // 单店视图按需请求、payload 相对小；再用 rIC+800ms 会叠加大半秒空白，改为下一帧即挂载。
+    if (storeKey !== 'all') {
+      idle = setTimeout(() => setChartMountReady(true), 0)
+    } else if (typeof requestIdleCallback !== 'undefined') {
       usedRic = true
       idle = requestIdleCallback(() => setChartMountReady(true), { timeout: 800 })
     } else {
@@ -3021,6 +3178,9 @@ function TrendNewListingEmbeddedPage() {
       </div>
       <p className="trend-new-listing-hint">
         柱形为各上新批次（open_date）贡献的 sessions 堆叠；黑色折线为每日合计。横坐标仅包含有 session 数据的日期。
+        悬停提示中各批次仅显示相对该横轴日最近 {NL_STACK_TOOLTIP_COHORT_LOOKBACK_DAYS} 个日历日内的 open_date（与 listing 同步默认窗口一致），避免列表过长。
+        全店数据就绪后会在浏览器空闲时用 <code className="trend-new-listing-code">json_views=store</code> 预取各店并写入本地缓存，切换店铺时优先直接用已合并的{' '}
+        <code className="trend-new-listing-code">views[store_id]</code>。
         首次进入若无缓存会自动请求一次；之后默认展示浏览器本地缓存，不自动打接口。地址栏加{' '}
         <code className="trend-new-listing-code">?refresh=1</code> 可强制重新拉取；加{' '}
         <code className="trend-new-listing-code">?profile=1</code> 可在控制台查看各阶段耗时（含服务端 profileTimingsSec）。
@@ -3050,6 +3210,21 @@ function TrendNewListingEmbeddedPage() {
               plugins: {
                 legend: { position: 'top' },
                 tooltip: {
+                  maxWidth: 320,
+                  filter: (tooltipItem) => {
+                    const chart = tooltipItem.chart
+                    const ds = chart.data.datasets[tooltipItem.datasetIndex] as {
+                      type?: string
+                      label?: string
+                    }
+                    if (ds.type === 'line' || String(ds.label ?? '') === '当日 sessions 合计') {
+                      return true
+                    }
+                    const sessionYmd = view.labels[tooltipItem.dataIndex]
+                    const cohortYmd = nlStackTooltipParseBatchYmd(String(ds.label ?? ''))
+                    if (!cohortYmd) return true
+                    return nlStackTooltipCohortInWindow(sessionYmd, cohortYmd)
+                  },
                   callbacks: {
                     footer: (items) => {
                       if (!items.length) return ''
@@ -3648,12 +3823,253 @@ function PagePlaceholder({ title }: { title: string }) {
   )
 }
 
+function AdSalesPage() {
+  const [storeId, setStoreId] = useState<string>('')
+  const [startDate, setStartDate] = useState<string>('')
+  const [endDate, setEndDate] = useState<string>('')
+  const [page, setPage] = useState<number>(1)
+  const pageSize = 30
+
+  const [items, setItems] = useState<AdSalesRow[]>([])
+  const [total, setTotal] = useState<number>(0)
+  const [loading, setLoading] = useState<boolean>(false)
+  const [error, setError] = useState<string | null>(null)
+  const [selected, setSelected] = useState<Set<number>>(new Set())
+  const [sorts, setSorts] = useState<Array<{ field: string; dir: 'asc' | 'desc' }>>([])
+
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+
+  const sortQuery = useMemo(() => {
+    if (!sorts.length) return null
+    return sorts.map((s) => `${s.field}:${s.dir}`).join(',')
+  }, [sorts])
+
+  const load = useCallback(async (nextPage: number) => {
+    setLoading(true)
+    setError(null)
+    try {
+      const sid = storeId.trim() ? Number(storeId.trim()) : null
+      const res = await listAdSales({
+        store_id: Number.isFinite(sid as number) ? (sid as number) : null,
+        start_date: startDate.trim() || null,
+        end_date: endDate.trim() || null,
+        sort: sortQuery,
+        page: nextPage,
+        page_size: pageSize,
+      })
+      setItems(res.items || [])
+      setTotal(res.total || 0)
+      setPage(res.page || nextPage)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '加载失败')
+    } finally {
+      setLoading(false)
+    }
+  }, [storeId, startDate, endDate, sortQuery])
+
+  useEffect(() => {
+    void load(1)
+  }, [])
+
+  // 排序变化后立即重新拉取（回到第 1 页）
+  useEffect(() => {
+    void load(1)
+  }, [sortQuery])
+
+  const toggleSelected = (id: number) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const toggleAllOnPage = () => {
+    setSelected((prev) => {
+      const ids = items.map((x) => x.id).filter((x) => typeof x === 'number')
+      const allChecked = ids.length > 0 && ids.every((id) => prev.has(id))
+      const next = new Set(prev)
+      if (allChecked) ids.forEach((id) => next.delete(id))
+      else ids.forEach((id) => next.add(id))
+      return next
+    })
+  }
+
+  const handleSearch = async () => {
+    // 新查询条件：清空旧勾选，避免跨条件混淆
+    setSelected(new Set())
+    await load(1)
+  }
+
+  const toggleSort = (field: string, multi: boolean) => {
+    setSorts((prev) => {
+      const idx = prev.findIndex((x) => x.field === field)
+      const next = multi ? [...prev] : []
+      if (idx < 0) {
+        next.push({ field, dir: 'desc' })
+        return next
+      }
+      const cur = prev[idx]
+      const flipped = cur.dir === 'desc' ? 'asc' : 'desc'
+      const base = multi ? prev.filter((x) => x.field !== field) : []
+      base.push({ field, dir: flipped })
+      return base
+    })
+  }
+
+  const sortMark = (field: string) => {
+    const idx = sorts.findIndex((x) => x.field === field)
+    if (idx < 0) return ''
+    const s = sorts[idx]
+    const arrow = s.dir === 'asc' ? '↑' : '↓'
+    return ` ${arrow}${sorts.length > 1 ? String(idx + 1) : ''}`
+  }
+
+  const sortableThProps = (field: string) => ({
+    role: 'button' as const,
+    tabIndex: 0,
+    style: { cursor: 'pointer', userSelect: 'none' as const },
+    title: 'Click 排序；Shift+Click 多列排序',
+    onClick: (e: React.MouseEvent) => toggleSort(field, e.shiftKey),
+    onKeyDown: (e: React.KeyboardEvent) => {
+      if (e.key === 'Enter' || e.key === ' ') toggleSort(field, (e as unknown as { shiftKey: boolean }).shiftKey)
+    },
+  })
+
+  const handlePrev = async () => {
+    const next = Math.max(1, page - 1)
+    await load(next)
+  }
+
+  const handleNext = async () => {
+    const next = Math.min(totalPages, page + 1)
+    await load(next)
+  }
+
+  const handleDownloadSelected = async () => {
+    const ids = Array.from(selected.values())
+    if (!ids.length) return
+    try {
+      await downloadAdSales(ids)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '下载失败')
+    }
+  }
+
+  return (
+    <div className="app">
+      <h1>Ad-Sales</h1>
+      <p className="monitor-desc">从本地 <code>daily_ad_cost_sales</code> 查询，支持按店铺与 purchase_date 筛选、分页、勾选下载。</p>
+
+      <div className="monitor-controls" style={{ alignItems: 'flex-end' }}>
+        <label>
+          <span>store_id</span>
+          <input
+            className="monitor-select"
+            value={storeId}
+            onChange={(e) => setStoreId(e.target.value)}
+            placeholder="例如 1"
+          />
+        </label>
+        <label>
+          <span>start</span>
+          <input
+            className="monitor-select"
+            type="date"
+            value={startDate}
+            onChange={(e) => setStartDate(e.target.value)}
+          />
+        </label>
+        <label>
+          <span>end</span>
+          <input
+            className="monitor-select"
+            type="date"
+            value={endDate}
+            onChange={(e) => setEndDate(e.target.value)}
+          />
+        </label>
+        <button className="btn" onClick={handleSearch} disabled={loading}>Search</button>
+        <button className="btn" onClick={handleDownloadSelected} disabled={loading || selected.size === 0}>
+          Download selected ({selected.size})
+        </button>
+      </div>
+
+      <div style={{ marginTop: 10, display: 'flex', gap: 8, alignItems: 'center' }}>
+        <button className="btn" onClick={handlePrev} disabled={loading || page <= 1}>Prev</button>
+        <span className="muted">page {page} / {totalPages} · total {total}</span>
+        <button className="btn" onClick={handleNext} disabled={loading || page >= totalPages}>Next</button>
+      </div>
+
+      {error && <div className="error" style={{ marginTop: 10 }}>{error}</div>}
+      {loading && <div className="empty-hint" style={{ marginTop: 10 }}>Loading…</div>}
+
+      <div className="monitor-tables" style={{ marginTop: 10 }}>
+        <table className="data-table monitor-track-table">
+          <thead>
+            <tr>
+              <th>
+                <input
+                  type="checkbox"
+                  checked={items.length > 0 && items.every((x) => selected.has(x.id))}
+                  onChange={toggleAllOnPage}
+                />
+              </th>
+              <th>ad_asin</th>
+              <th>store_id</th>
+              <th>purchase_date</th>
+              <th {...sortableThProps('ad_cost')}>ad_cost{sortMark('ad_cost')}</th>
+              <th {...sortableThProps('ad_sales_1d')}>ad_sales_1d{sortMark('ad_sales_1d')}</th>
+              <th {...sortableThProps('ad_sales_7d')}>ad_sales_7d{sortMark('ad_sales_7d')}</th>
+              <th {...sortableThProps('ad_sales_14d')}>ad_sales_14d{sortMark('ad_sales_14d')}</th>
+              <th {...sortableThProps('ad_sales_30d')}>ad_sales_30d{sortMark('ad_sales_30d')}</th>
+              <th {...sortableThProps('tad_sales')}>Tad_sales{sortMark('tad_sales')}</th>
+              <th {...sortableThProps('tad_sales_7d')}>Tad_sales_7d{sortMark('tad_sales_7d')}</th>
+              <th {...sortableThProps('tad_sales_14d')}>Tad_sales_14d{sortMark('tad_sales_14d')}</th>
+              <th {...sortableThProps('tad_sales_30d')}>Tad_sales_30d{sortMark('tad_sales_30d')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((r) => (
+              <tr key={r.id}>
+                <td>
+                  <input type="checkbox" checked={selected.has(r.id)} onChange={() => toggleSelected(r.id)} />
+                </td>
+                <td>{r.ad_asin ?? '–'}</td>
+                <td>{r.store_id ?? '–'}</td>
+                <td>{r.purchase_date ?? '–'}</td>
+                <td>{r.ad_cost ?? '–'}</td>
+                <td>{r.ad_sales_1d ?? '–'}</td>
+                <td>{r.ad_sales_7d ?? '–'}</td>
+                <td>{r.ad_sales_14d ?? '–'}</td>
+                <td>{r.ad_sales_30d ?? '–'}</td>
+                <td>{r.tad_sales ?? '–'}</td>
+                <td>{r.tad_sales_7d ?? '–'}</td>
+                <td>{r.tad_sales_14d ?? '–'}</td>
+                <td>{r.tad_sales_30d ?? '–'}</td>
+              </tr>
+            ))}
+            {!loading && items.length === 0 && (
+              <tr>
+                <td colSpan={13} className="empty-hint">No data.</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
 function AppLayout() {
   const location = useLocation()
   const [groupOpen, setGroupOpen] = useState(false)
   const [trendOpen, setTrendOpen] = useState(false)
+  const [adsOpen, setAdsOpen] = useState(false)
   const groupRef = useRef<HTMLDivElement | null>(null)
   const trendRef = useRef<HTMLDivElement | null>(null)
+  const adsRef = useRef<HTMLDivElement | null>(null)
 
   const trendingSubPaths =
     location.pathname === '/trend' ||
@@ -3661,6 +4077,9 @@ function AppLayout() {
     location.pathname === '/trend/session&impression' ||
     location.pathname === '/trend/New Listing'
   const trendingNavActive = trendingSubPaths || trendOpen
+
+  const adsSubPaths = location.pathname.startsWith('/ads/')
+  const adsNavActive = adsSubPaths || adsOpen
 
   useEffect(() => {
     const onDocMouseDown = (e: MouseEvent) => {
@@ -3670,6 +4089,9 @@ function AppLayout() {
       }
       if (trendRef.current && !trendRef.current.contains(t)) {
         setTrendOpen(false)
+      }
+      if (adsRef.current && !adsRef.current.contains(t)) {
+        setAdsOpen(false)
       }
     }
     document.addEventListener('mousedown', onDocMouseDown)
@@ -3700,6 +4122,26 @@ function AppLayout() {
         <NavLink to="/monitor" className={({ isActive }) => `top-nav-link ${isActive ? 'is-active' : ''}`}>
           Monitor
         </NavLink>
+        <div className="top-nav-group" ref={adsRef}>
+          <button
+            type="button"
+            className={`top-nav-link top-nav-group-toggle ${adsNavActive ? 'is-active' : ''}`}
+            onClick={() => setAdsOpen((v) => !v)}
+            aria-expanded={adsOpen}
+            aria-haspopup="menu"
+          >
+            Ads
+          </button>
+          <div className={`top-nav-menu ${adsOpen ? 'is-open' : ''}`}>
+            <NavLink
+              to="/ads/ad-sales"
+              className="top-nav-menu-link"
+              onClick={() => setAdsOpen(false)}
+            >
+              Ad-Sales
+            </NavLink>
+          </div>
+        </div>
         <div className="top-nav-group" ref={trendRef}>
           <button
             type="button"
@@ -3753,6 +4195,7 @@ export default function App() {
         <Route path="/grpup/A" element={<Navigate to="/group/A" replace />} />
         <Route path="/tasks" element={<PagePlaceholder title="Tasks" />} />
         <Route path="/monitor" element={<MonitorPage />} />
+        <Route path="/ads/ad-sales" element={<AdSalesPage />} />
         <Route path="/trend" element={<TrendPage />} />
         <Route path="/trend/session-impression" element={<TrendSessionImpressionEmbeddedPage />} />
         <Route path="/trend/session&impression" element={<Navigate to="/trend/session-impression" replace />} />
