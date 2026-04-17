@@ -17,9 +17,11 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, Query
 from fastapi.responses import HTMLResponse, JSONResponse
+from sqlalchemy import func
 
 from app.config import settings
 from app.database import SessionLocal, init_db
+from app.models import DailyUploadAsinData
 from app.services.daily_upload_asin_data_ds import sync_range, sync_with_default_date_range
 from app.services.daily_upload_session_report_html_pst import (
     DEFAULT_LISTING_SINCE,
@@ -66,6 +68,21 @@ def _session_impression_cache_path(end_d: date) -> Path:
     base = Path(__file__).resolve().parent.parent / "log"
     base.mkdir(parents=True, exist_ok=True)
     return base / f"session-impression-{end_d.isoformat()}.html"
+
+
+def _resolve_new_listing_default_session_end() -> date:
+    """未显式传 session_end 时，默认使用本地最新 session_date；无数据再回退今天。"""
+    init_db()
+    db = SessionLocal()
+    try:
+        latest = db.query(func.max(DailyUploadAsinData.session_date)).scalar()
+        if latest is None:
+            return date.today()
+        if isinstance(latest, datetime):
+            return latest.date()
+        return latest
+    finally:
+        db.close()
 
 
 def _read_session_impression_disk(end_d: date, *, max_age_sec: int = 86400) -> str | None:
@@ -325,7 +342,10 @@ def trend_new_listing_report(
         None,
         description="图表横轴 session_date 起始；默认与 listing_since 相同",
     ),
-    session_end: Optional[date] = Query(None, description="图表横轴 session_date 结束；默认今天"),
+    session_end: Optional[date] = Query(
+        None,
+        description="图表横轴 session_date 结束；默认本地最新 session_date（无数据时回退今天）",
+    ),
     sync_start: Optional[date] = Query(
         None,
         description="同步 listing 扫描下界（DATE(created_at)）；与 sync_end 同时传则 sync_range，否则默认增量",
@@ -363,7 +383,7 @@ def trend_new_listing_report(
     2) 展示：与 ``daily_upload_session_report_html_pst`` 相同——按 ``open_date`` 分批次、每批 30 日内 ``session_date``
        聚合 sessions 堆叠柱 + 合计折线；横轴为区间内**实际有 session 数据**的日期。``format=json`` 返回同构 JSON。
     """
-    end_d = session_end or date.today()
+    end_d = session_end or _resolve_new_listing_default_session_end()
     # cohort / 上新统计不早于 PST 报表默认起点 2026-02-20
     listing_since = max(listing_since, DEFAULT_LISTING_SINCE)
     start_d = session_start or listing_since

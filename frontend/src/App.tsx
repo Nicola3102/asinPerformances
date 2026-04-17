@@ -23,6 +23,7 @@ import {
   getTrendData,
   listAdSales,
   downloadAdSales,
+  getAdsProfit,
   type SummaryRowConsolidated,
   type DetailResponse,
   type DetailChildRow,
@@ -39,6 +40,9 @@ import {
   type AdSalesDailyPoint,
   type AdSalesRow,
   type AdSalesSummary,
+  type AdsProfitResponse,
+  type AdsProfitSummary,
+  type AdsProfitWeeklyPoint,
   type TrendResponse,
   type TrendWeekPoint,
 } from './api/client'
@@ -122,8 +126,8 @@ async function parseTrendNewListingJsonText(text: string): Promise<TrendNewListi
   })
 }
 
-/** 与 DailyUploadDS 默认 listing 窗口一致：堆叠图 tooltip 只展示相对横轴日最近 35 个日历日内的批次 */
-const NL_STACK_TOOLTIP_COHORT_LOOKBACK_DAYS = 32
+/** 堆叠图 tooltip 仅展示相对悬停 session_date 往前 30 天内的批次 */
+const NL_STACK_TOOLTIP_COHORT_LOOKBACK_DAYS = 30
 const NL_ZERO_SESSION_HIGHLIGHT_EXCLUDE_RECENT_DAYS = 2
 const NL_COHORT_COLLAPSE_NEW_ASIN_THRESHOLD = 500
 
@@ -251,10 +255,10 @@ function nlShouldHighlightZeroSessionCell(
   cohortYmd: string,
   dayIndex: number,
   sessionValue: number,
-  todayPstYmd: string,
+  latestSessionYmd: string,
 ): boolean {
   if (Number(sessionValue ?? 0) !== 0) return false
-  const cutoffYmd = nlStackTooltipYmdAddDays(todayPstYmd, -NL_ZERO_SESSION_HIGHLIGHT_EXCLUDE_RECENT_DAYS)
+  const cutoffYmd = nlStackTooltipYmdAddDays(latestSessionYmd, -NL_ZERO_SESSION_HIGHLIGHT_EXCLUDE_RECENT_DAYS)
   if (!cutoffYmd) return false
   const cohortHead = String(cohortYmd || '').slice(0, 10)
   if (!/^\d{4}-\d{2}-\d{2}$/.test(cohortHead) || cohortHead > cutoffYmd) return false
@@ -270,14 +274,15 @@ type TrendNlCohortRow = NonNullable<TrendNewListingViewPayload['cohortTable']>[n
 function TrendNewListingVirtualCohortTable({
   cohortTable,
   cohortTrackDays,
+  latestSessionYmd,
 }: {
   cohortTable: TrendNlCohortRow[]
   cohortTrackDays: number
+  latestSessionYmd: string
 }) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const [scrollTop, setScrollTop] = useState(0)
   const [viewH, setViewH] = useState(400)
-  const todayPstYmd = useMemo(() => nlCurrentPstYmd(), [])
 
   useLayoutEffect(() => {
     const el = scrollRef.current
@@ -333,7 +338,7 @@ function TrendNewListingVirtualCohortTable({
                 <td className="is-sticky-col is-sticky-col--2">{newAsin.toLocaleString('zh-CN')}</td>
                 {Array.from({ length: cohortTrackDays }, (_, i) => {
                   const value = Number(daySessions[i] ?? 0)
-                  const highlight = nlShouldHighlightZeroSessionCell(cd, i, value, todayPstYmd)
+                  const highlight = nlShouldHighlightZeroSessionCell(cd, i, value, latestSessionYmd)
                   return (
                     <td key={`${cd}-s-${i}`} className={highlight ? 'trend-new-listing-zero-alert' : undefined}>
                       {value.toLocaleString('zh-CN')}
@@ -3207,7 +3212,10 @@ function TrendNewListingEmbeddedPage() {
 
   const cohortTrackDays = Math.max(1, Number(payload.cohortTrackDays ?? 30))
   const cohortTable: TrendNlCohortRow[] = Array.isArray(view.cohortTable) ? view.cohortTable : []
-  const todayPstYmd = useMemo(() => nlCurrentPstYmd(), [])
+  const latestSessionYmd = useMemo(
+    () => String(view.labels[view.labels.length - 1] ?? payload.sessionChartEnd ?? nlCurrentPstYmd()),
+    [payload.sessionChartEnd, view.labels],
+  )
   const [hideSmallCohorts, setHideSmallCohorts] = useState(false)
   const filteredCohortTable = useMemo(
     () =>
@@ -3391,7 +3399,7 @@ function TrendNewListingEmbeddedPage() {
         <p className="trend-new-listing-table-caption">
           前两列「上新日 / 上新 ASIN 数」来自线上 <code className="trend-new-listing-code">amazon_listing</code>
           （open_date 在 [{payload.listingSince}, {payload.listingThrough}] 内按日、asin 非空且 TRIM 非空；与顶部 KPI 全表 COUNT(*) 口径不同）。切换「店铺」按 store_id
-          切分；单店数据按需加载。后列为本地 sessions 明细。红色 0 表示按 PST 当前日期往前推 {NL_ZERO_SESSION_HIGHLIGHT_EXCLUDE_RECENT_DAYS}
+          切分；单店数据按需加载。后列为本地 sessions 明细。红色 0 表示按当前视图最新 session_date 往前推 {NL_ZERO_SESSION_HIGHLIGHT_EXCLUDE_RECENT_DAYS}
           天后的截止日来判断，该批次截至该截止日理论上已走到的天数里，sessions 仍为 0。
         </p>
         <div className="trend-new-listing-table-controls">
@@ -3414,7 +3422,11 @@ function TrendNewListingEmbeddedPage() {
             当前筛选后暂无批次数据。请取消折叠，或检查是否存在上新 ASIN 数不小于 {NL_COHORT_COLLAPSE_NEW_ASIN_THRESHOLD} 的批次。
           </p>
         ) : filteredCohortTable.length > 80 ? (
-          <TrendNewListingVirtualCohortTable cohortTable={filteredCohortTable} cohortTrackDays={cohortTrackDays} />
+          <TrendNewListingVirtualCohortTable
+            cohortTable={filteredCohortTable}
+            cohortTrackDays={cohortTrackDays}
+            latestSessionYmd={latestSessionYmd}
+          />
         ) : (
           <div className="trend-new-listing-table-scroll">
             <table className="trend-new-listing-table">
@@ -3440,7 +3452,7 @@ function TrendNewListingEmbeddedPage() {
                       <td className="is-sticky-col is-sticky-col--2">{newAsin.toLocaleString('zh-CN')}</td>
                       {Array.from({ length: cohortTrackDays }, (_, i) => {
                         const value = Number(daySessions[i] ?? 0)
-                        const highlight = nlShouldHighlightZeroSessionCell(cd, i, value, todayPstYmd)
+                        const highlight = nlShouldHighlightZeroSessionCell(cd, i, value, latestSessionYmd)
                         return (
                           <td key={`${cd}-s-${i}`} className={highlight ? 'trend-new-listing-zero-alert' : undefined}>
                             {value.toLocaleString('zh-CN')}
@@ -4504,6 +4516,288 @@ function AdSalesPage() {
   )
 }
 
+function AdsProfitPage() {
+  const emptySummary: AdsProfitSummary = {
+    start_date: '2026-02-23',
+    end_date: '',
+    store_id: null,
+    order_count: 0,
+    returned_order_count: 0,
+    return_row_count: 0,
+    sales_amount: 0,
+    refund_amount: 0,
+    gross_profit: 0,
+    gross_profit_after_return: 0,
+    gross_margin_rate: 0,
+    gross_margin_after_return_rate: 0,
+    return_rate: 0,
+  }
+  const [storeId, setStoreId] = useState<string>('all')
+  const [storeIds, setStoreIds] = useState<number[]>([])
+  const [startDate, setStartDate] = useState<string>('2026-02-23')
+  const [endDate, setEndDate] = useState<string>('')
+  const [latestInvoiceDate, setLatestInvoiceDate] = useState<string>('')
+  const [loading, setLoading] = useState<boolean>(false)
+  const [error, setError] = useState<string | null>(null)
+  const [summary, setSummary] = useState<AdsProfitSummary>(emptySummary)
+  const [weeklySeries, setWeeklySeries] = useState<AdsProfitWeeklyPoint[]>([])
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const sid = storeId === 'all' ? null : Number(storeId)
+      const res: AdsProfitResponse = await getAdsProfit({
+        store_id: Number.isFinite(sid as number) ? (sid as number) : null,
+        start_date: startDate || null,
+        end_date: endDate || null,
+      })
+      setStoreIds(Array.isArray(res.store_ids) ? res.store_ids : [])
+      setSummary(res.summary || emptySummary)
+      setWeeklySeries(Array.isArray(res.weekly_series) ? res.weekly_series : [])
+      setLatestInvoiceDate(res.latest_invoice_date || '')
+      if (!endDate && res.end_date) setEndDate(res.end_date)
+      if (!startDate && res.start_date) setStartDate(res.start_date)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '加载失败')
+    } finally {
+      setLoading(false)
+    }
+  }, [endDate, startDate, storeId])
+
+  useEffect(() => {
+    void load()
+  }, [])
+
+  const profitChartData = useMemo(() => {
+    const labels = weeklySeries.map((row) => row.week_start || '–')
+    return {
+      labels,
+      datasets: [
+        {
+          type: 'bar' as const,
+          label: '销售额',
+          data: weeklySeries.map((row) => row.sales_amount),
+          backgroundColor: '#60a5fa',
+          stack: 'money',
+          yAxisID: 'yMoney',
+          order: 1,
+        },
+        {
+          type: 'bar' as const,
+          label: '退货金额',
+          data: weeklySeries.map((row) => row.refund_amount),
+          backgroundColor: '#fde047',
+          stack: 'money',
+          yAxisID: 'yMoney',
+          order: 2,
+        },
+        {
+          type: 'line' as const,
+          label: '毛利率（不含退货）',
+          data: weeklySeries.map((row) => row.gross_margin_rate),
+          borderColor: '#4ade80',
+          backgroundColor: 'rgba(74, 222, 128, 0.12)',
+          yAxisID: 'yRate',
+          tension: 0.25,
+          pointRadius: 3,
+          order: 0,
+        },
+        {
+          type: 'line' as const,
+          label: '毛利率（含退货）',
+          data: weeklySeries.map((row) => row.gross_margin_after_return_rate),
+          borderColor: '#f87171',
+          backgroundColor: 'rgba(248, 113, 113, 0.12)',
+          yAxisID: 'yRate',
+          tension: 0.25,
+          pointRadius: 3,
+          order: 0,
+        },
+      ],
+    } as any
+  }, [weeklySeries])
+
+  const moneyMax = useMemo(() => {
+    const vals = weeklySeries.map((row) => row.sales_amount + row.refund_amount).filter((v) => Number.isFinite(v))
+    const max = vals.length ? Math.max(...vals) : 0
+    return Math.max(1000, Math.ceil(max / 50000) * 50000)
+  }, [weeklySeries])
+
+  const rateMinMax = useMemo(() => {
+    const vals = weeklySeries.flatMap((row) => [row.gross_margin_rate, row.gross_margin_after_return_rate]).filter((v) => Number.isFinite(v))
+    if (!vals.length) return { min: -10, max: 20 }
+    const min = Math.min(...vals, 0)
+    const max = Math.max(...vals, 0)
+    return {
+      min: Math.floor(min / 5) * 5,
+      max: Math.max(5, Math.ceil(max / 5) * 5),
+    }
+  }, [weeklySeries])
+
+  const profitChartOptions = useMemo<ChartOptions<'bar'>>(() => ({
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: { mode: 'index' as const, intersect: false },
+    plugins: {
+      legend: { position: 'top' as const },
+      tooltip: {
+        callbacks: {
+          label: (ctx: TooltipItem<'bar'>) => {
+            const label = ctx.dataset.label || ''
+            const value = Number(ctx.parsed.y ?? 0)
+            if (label.includes('毛利率')) return `${label}: ${value.toFixed(2)}%`
+            return `${label}: ${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+          },
+          afterBody: (items) => {
+            const idx = Number(items?.[0]?.dataIndex ?? -1)
+            const row = idx >= 0 ? weeklySeries[idx] : null
+            if (!row) return []
+            return [
+              `订单数: ${row.order_count.toLocaleString()}`,
+              `退货订单数: ${row.returned_order_count.toLocaleString()}`,
+              `退货率: ${row.return_rate.toFixed(2)}%`,
+            ]
+          },
+        },
+      },
+    },
+    scales: {
+      x: {
+        stacked: true,
+        ticks: { maxRotation: 45, minRotation: 0 },
+      },
+      yMoney: {
+        type: 'linear' as const,
+        position: 'left',
+        stacked: true,
+        beginAtZero: true,
+        max: moneyMax,
+        title: { display: true, text: '销售额 / 退货金额' },
+      },
+      yRate: {
+        type: 'linear' as const,
+        position: 'right',
+        min: rateMinMax.min,
+        max: rateMinMax.max,
+        grid: { drawOnChartArea: false },
+        title: { display: true, text: '毛利率 (%)' },
+        ticks: {
+          callback: (value) => `${value}%`,
+        },
+      },
+    },
+  }), [moneyMax, rateMinMax.max, rateMinMax.min, weeklySeries])
+
+  const metricCards = [
+    {
+      label: '销售额',
+      value: summary.sales_amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+      accent: 'blue',
+    },
+    {
+      label: '退货金额',
+      value: summary.refund_amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+      accent: 'orange',
+    },
+    { label: '毛利', value: summary.gross_profit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }), accent: 'green' },
+    { label: '毛利率（不含退货）', value: `${summary.gross_margin_rate.toFixed(2)}%`, accent: 'teal' },
+    { label: '毛利率（含退货）', value: `${summary.gross_margin_after_return_rate.toFixed(2)}%`, accent: 'red' },
+    { label: '退货率', value: `${summary.return_rate.toFixed(2)}%`, accent: 'purple' },
+  ]
+
+  return (
+    <div className="app">
+      <h1>Ads Profit</h1>
+      <p className="monitor-desc">
+        按 <code>order_profit.invoice_date</code> 从 2026-02-23 起按周聚合销售额、退货金额与毛利率；默认展示全部店铺，可按 <code>store_id</code> 切换。
+        当前最新 invoice_date：<code>{latestInvoiceDate || '–'}</code>
+      </p>
+
+      <div className="monitor-controls" style={{ alignItems: 'flex-end' }}>
+        <label>
+          <span>store_id</span>
+          <select className="monitor-select" value={storeId} onChange={(e) => setStoreId(e.target.value)}>
+            <option value="all">全部店铺</option>
+            {storeIds.map((id) => (
+              <option key={id} value={String(id)}>{id}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>start</span>
+          <input className="monitor-select" type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+        </label>
+        <label>
+          <span>end</span>
+          <input className="monitor-select" type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
+        </label>
+        <button className="btn" onClick={() => void load()} disabled={loading}>Search</button>
+      </div>
+
+      {error && <div className="error" style={{ marginTop: 10 }}>{error}</div>}
+      {loading && <div className="empty-hint" style={{ marginTop: 10 }}>Loading…</div>}
+
+      <div className="ads-kpi-grid" style={{ marginTop: 14 }}>
+        {metricCards.map((card) => (
+          <div key={card.label} className={`ads-kpi-card ads-kpi-card--${card.accent}`}>
+            <div className="ads-kpi-label">{card.label}</div>
+            <div className="ads-kpi-value">{card.value}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="trend-chart-card" style={{ marginTop: 14 }}>
+        <div className="trend-chart-header">
+          <div>
+            <h3>周利润趋势</h3>
+            <p className="trend-chart-hint">柱状图为销售额 + 退货金额堆叠，折线为不含退货 / 含退货毛利率</p>
+          </div>
+        </div>
+        <div className="ads-line-chart-wrap">
+          <Chart type="bar" data={profitChartData} options={profitChartOptions} />
+        </div>
+      </div>
+
+      <div className="monitor-tables" style={{ marginTop: 10 }}>
+        <table className="data-table monitor-track-table">
+          <thead>
+            <tr>
+              <th>week_start</th>
+              <th>week_end</th>
+              <th>sales_amount</th>
+              <th>refund_amount</th>
+              <th>gross_profit</th>
+              <th>gross_margin_rate</th>
+              <th>gross_margin_after_return_rate</th>
+              <th>return_rate</th>
+            </tr>
+          </thead>
+          <tbody>
+            {weeklySeries.map((row, idx) => (
+              <tr key={row.week_start || `week-${idx}`}>
+                <td>{row.week_start ?? '–'}</td>
+                <td>{row.week_end ?? '–'}</td>
+                <td>{row.sales_amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                <td>{row.refund_amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                <td>{row.gross_profit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                <td>{row.gross_margin_rate.toFixed(2)}%</td>
+                <td>{row.gross_margin_after_return_rate.toFixed(2)}%</td>
+                <td>{row.return_rate.toFixed(2)}%</td>
+              </tr>
+            ))}
+            {!loading && weeklySeries.length === 0 && (
+              <tr>
+                <td colSpan={8} className="empty-hint">No data.</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
 function AppLayout() {
   const location = useLocation()
   const [groupOpen, setGroupOpen] = useState(false)
@@ -4582,6 +4876,13 @@ function AppLayout() {
             >
               Ad-Sales
             </NavLink>
+            <NavLink
+              to="/ads/profit"
+              className="top-nav-menu-link"
+              onClick={() => setAdsOpen(false)}
+            >
+              Ads Profit
+            </NavLink>
           </div>
         </div>
         <div className="top-nav-group" ref={trendRef}>
@@ -4638,6 +4939,7 @@ export default function App() {
         <Route path="/tasks" element={<PagePlaceholder title="Tasks" />} />
         <Route path="/monitor" element={<MonitorPage />} />
         <Route path="/ads/ad-sales" element={<AdSalesPage />} />
+        <Route path="/ads/profit" element={<AdsProfitPage />} />
         <Route path="/trend" element={<TrendPage />} />
         <Route path="/trend/session-impression" element={<TrendSessionImpressionEmbeddedPage />} />
         <Route path="/trend/session&impression" element={<Navigate to="/trend/session-impression" replace />} />

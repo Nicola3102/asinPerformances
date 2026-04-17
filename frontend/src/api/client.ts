@@ -463,6 +463,47 @@ export type AdSalesListResponse = {
   daily_series: AdSalesDailyPoint[];
 }
 
+export type AdsProfitSummary = {
+  start_date: string
+  end_date: string
+  store_id: number | null
+  order_count: number
+  returned_order_count: number
+  return_row_count: number
+  sales_amount: number
+  refund_amount: number
+  gross_profit: number
+  gross_profit_after_return: number
+  gross_margin_rate: number
+  gross_margin_after_return_rate: number
+  return_rate: number
+}
+
+export type AdsProfitWeeklyPoint = {
+  week_start: string | null
+  week_end: string | null
+  order_count: number
+  returned_order_count: number
+  return_row_count: number
+  sales_amount: number
+  refund_amount: number
+  gross_profit: number
+  gross_profit_after_return: number
+  gross_margin_rate: number
+  gross_margin_after_return_rate: number
+  return_rate: number
+}
+
+export type AdsProfitResponse = {
+  start_date: string
+  end_date: string
+  latest_invoice_date: string
+  store_id: number | null
+  store_ids: number[]
+  summary: AdsProfitSummary
+  weekly_series: AdsProfitWeeklyPoint[]
+}
+
 export async function listAdSales(params: {
   store_id?: number | null;
   start_date?: string | null;
@@ -505,6 +546,23 @@ export async function downloadAdSales(ids: number[]): Promise<void> {
   a.click()
   a.remove()
   window.URL.revokeObjectURL(url)
+}
+
+export async function getAdsProfit(params: {
+  store_id?: number | null
+  start_date?: string | null
+  end_date?: string | null
+}): Promise<AdsProfitResponse> {
+  const qs = new URLSearchParams()
+  if (params.store_id != null && !Number.isNaN(Number(params.store_id))) qs.set('store_id', String(params.store_id))
+  if (params.start_date) qs.set('start_date', params.start_date)
+  if (params.end_date) qs.set('end_date', params.end_date)
+  const res = await fetch(`${API_BASE}/ads/profit?${qs.toString()}`)
+  if (!res.ok) {
+    const text = await res.text()
+    throw buildApiError(text, res.status, 'Failed to fetch ads profit')
+  }
+  return res.json()
 }
 
 export async function syncFromOnline(): Promise<{

@@ -15,6 +15,11 @@ from app.config import settings
 from app.database import get_db
 from app.models import DailyAdCostSales
 from app.online_engine import get_online_reporting_engine
+from app.services.weekly_profit import (
+    DEFAULT_PROFIT_START,
+    fetch_profit_latest_invoice_date,
+    fetch_profit_report,
+)
 
 router = APIRouter(prefix="/api/ads", tags=["ads"])
 
@@ -380,4 +385,17 @@ def export_ad_sales(
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.get("/profit")
+def get_ads_profit(
+    store_id: Optional[int] = Query(None, description="按 order_profit.store_id 过滤"),
+    start_date: Optional[str] = Query(None, description="invoice_date 起始 YYYY-MM-DD（含），默认 2026-02-23"),
+    end_date: Optional[str] = Query(None, description="invoice_date 结束 YYYY-MM-DD（含），默认最新 invoice_date"),
+):
+    sd = _parse_ymd_or_400(start_date, "start_date") or DEFAULT_PROFIT_START
+    ed = _parse_ymd_or_400(end_date, "end_date") or fetch_profit_latest_invoice_date()
+    if sd > ed:
+        raise HTTPException(status_code=400, detail="start_date 不能晚于 end_date")
+    return fetch_profit_report(sd, ed, store_id)
 
