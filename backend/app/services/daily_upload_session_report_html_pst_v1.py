@@ -51,7 +51,7 @@ from app.online_engine import get_online_reporting_engine
 logger = logging.getLogger(__name__)
 
 TABLE = "daily_upload_asin_dates"
-DEFAULT_LISTING_SINCE = date(2025, 5, 10)
+DEFAULT_LISTING_SINCE = date(2025, 10, 2)
 COHORT_TRACK_DAYS = 30
 
 # ----------------------------

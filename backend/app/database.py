@@ -352,6 +352,23 @@ def _ensure_daily_ad_cost_sales_schema():
             conn.execute(text("CREATE INDEX ix_daily_ad_cost_sales_variation_id ON daily_ad_cost_sales (variation_id)"))
             conn.commit()
 
+        for col_name in ("clicks", "impressions", "purchases"):
+            col_exists = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'daily_ad_cost_sales' AND COLUMN_NAME = :c"
+                ),
+                {"c": col_name},
+            ).scalar()
+            if not col_exists:
+                try:
+                    conn.execute(
+                        text(f"ALTER TABLE daily_ad_cost_sales ADD COLUMN `{col_name}` BIGINT NULL")
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+
         new_uq = "uq_daily_ad_cost_sales_asin_store_pid_date"
         old_uq = "uq_daily_ad_cost_sales_asin_store_date"
         new_uq_exists = conn.execute(
@@ -388,16 +405,7 @@ def _ensure_daily_ad_cost_sales_schema():
             except Exception:
                 conn.rollback()
 
-        for col_name in (
-            "ad_sales_1d",
-            "ad_sales_7d",
-            "ad_sales_14d",
-            "ad_sales_30d",
-            "tad_sales",
-            "tad_sales_7d",
-            "tad_sales_14d",
-            "tad_sales_30d",
-        ):
+        for col_name in ("ad_sales_1d", "tad_sales"):
             col_exists = conn.execute(
                 text(
                     "SELECT COUNT(*) FROM information_schema.COLUMNS "
@@ -414,7 +422,7 @@ def _ensure_daily_ad_cost_sales_schema():
                 except Exception:
                     conn.rollback()
 
-        for col_name in ("tsales", "tsales_7d", "tsales_14d", "tsales_30d"):
+        for col_name in ("tsales",):
             col_exists = conn.execute(
                 text(
                     "SELECT COUNT(*) FROM information_schema.COLUMNS "
@@ -428,6 +436,36 @@ def _ensure_daily_ad_cost_sales_schema():
                         text(
                             f"ALTER TABLE daily_ad_cost_sales ADD COLUMN `{col_name}` DECIMAL(20,2) NULL"
                         )
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+
+        for col_name in (
+            "sales_7d",
+            "sales_14d",
+            "sales_30d",
+            "ad_sales_7d",
+            "ad_sales_14d",
+            "ad_sales_30d",
+            "tad_sales_7d",
+            "tad_sales_14d",
+            "tad_sales_30d",
+            "tsales_7d",
+            "tsales_14d",
+            "tsales_30d",
+        ):
+            col_exists = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'daily_ad_cost_sales' AND COLUMN_NAME = :c"
+                ),
+                {"c": col_name},
+            ).scalar()
+            if col_exists:
+                try:
+                    conn.execute(
+                        text(f"ALTER TABLE daily_ad_cost_sales DROP COLUMN `{col_name}`")
                     )
                     conn.commit()
                 except Exception:

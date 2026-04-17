@@ -297,12 +297,75 @@
   box-sizing: border-box;
 }
 
-/* Chart.js 默认 HTML tooltip：仍可能较长时允许滚动（批次过滤后一般已足够短） */
-#chartjs-tooltip,
-.chartjs-tooltip {
-  max-height: min(65vh, 440px);
-  overflow-y: auto;
+.trend-new-listing-chart-tooltip {
+  position: fixed;
+  z-index: 1000;
+  min-width: 240px;
+  max-width: min(340px, calc(100vw - 24px));
+  max-height: min(78vh, 760px);
+  padding: 0.65rem 0.75rem;
+  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  background: rgba(2, 6, 23, 0.96);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+  color: #f8fafc;
+  opacity: 0;
+  transform: translateY(-50%);
   box-sizing: border-box;
+  overflow: hidden;
+}
+
+.trend-new-listing-chart-tooltip-title {
+  font-size: 0.95rem;
+  font-weight: 700;
+  margin-bottom: 0.35rem;
+}
+
+.trend-new-listing-chart-tooltip-total {
+  font-size: 0.83rem;
+  color: #bfdbfe;
+  margin-bottom: 0.45rem;
+}
+
+.trend-new-listing-chart-tooltip-list {
+  max-height: min(68vh, 680px);
+  overflow-y: auto;
+}
+
+.trend-new-listing-chart-tooltip-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.12rem 0;
+  font-size: 0.82rem;
+  line-height: 1.25;
+}
+
+.trend-new-listing-chart-tooltip-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+  color: #e2e8f0;
+}
+
+.trend-new-listing-chart-tooltip-swatch {
+  width: 0.8rem;
+  height: 0.8rem;
+  flex: 0 0 0.8rem;
+  border: 1px solid rgba(255, 255, 255, 0.5);
+}
+
+.trend-new-listing-chart-tooltip-value {
+  flex: 0 0 auto;
+  color: #f8fafc;
+  font-variant-numeric: tabular-nums;
+}
+
+.trend-new-listing-chart-tooltip-empty {
+  font-size: 0.82rem;
+  color: #94a3b8;
 }
 
 .trend-new-listing-empty {
@@ -332,6 +395,34 @@
   font-size: 0.78rem;
   color: #8b9cb3;
   line-height: 1.45;
+}
+
+.trend-new-listing-table-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem 1rem;
+  margin: 0 0 0.8rem;
+}
+
+.trend-new-listing-table-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.84rem;
+  color: #d7e3f4;
+  cursor: pointer;
+}
+
+.trend-new-listing-table-toggle input {
+  margin: 0;
+  accent-color: #60a5fa;
+}
+
+.trend-new-listing-table-stats {
+  font-size: 0.78rem;
+  color: #8b9cb3;
 }
 
 .trend-new-listing-table-empty {
@@ -399,6 +490,16 @@
 
 .trend-new-listing-table tbody tr:hover td {
   background: rgba(61, 157, 255, 0.08);
+}
+
+.trend-new-listing-table td.trend-new-listing-zero-alert {
+  color: #fecaca;
+  background: rgba(220, 38, 38, 0.22);
+  font-weight: 700;
+}
+
+.trend-new-listing-table tbody tr:hover td.trend-new-listing-zero-alert {
+  background: rgba(220, 38, 38, 0.28);
 }
 
 .top-nav-menu-link {
@@ -1316,6 +1417,80 @@
   overflow: visible;
 }
 
+.ads-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 0.6rem;
+}
+
+.ads-kpi-card {
+  border: 1px solid #e5e7eb;
+  border-left-width: 3px;
+  border-radius: 10px;
+  background: #fff;
+  padding: 0.7rem 0.8rem;
+  box-shadow: 0 1px 6px rgba(15, 23, 42, 0.04);
+}
+
+.ads-kpi-card--blue {
+  border-left-color: #3b82f6;
+  background: #f8fbff;
+}
+
+.ads-kpi-card--purple {
+  border-left-color: #a855f7;
+  background: #fcfaff;
+}
+
+.ads-kpi-card--teal {
+  border-left-color: #0f766e;
+  background: #f4fffd;
+}
+
+.ads-kpi-card--orange {
+  border-left-color: #f97316;
+  background: #fffaf6;
+}
+
+.ads-kpi-card--green {
+  border-left-color: #22c55e;
+  background: #f7fcf7;
+}
+
+.ads-kpi-card--red {
+  border-left-color: #ef4444;
+  background: #fff8f8;
+}
+
+.ads-kpi-card--black {
+  border-left-color: #111827;
+  background: #f8fafc;
+}
+
+.ads-kpi-card--sky {
+  border-left-color: #0ea5e9;
+  background: #f5fbff;
+}
+
+.ads-kpi-label {
+  font-size: 0.72rem;
+  color: #64748b;
+  line-height: 1.2;
+}
+
+.ads-kpi-value {
+  margin-top: 0.2rem;
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: #0f172a;
+  line-height: 1.15;
+}
+
+.ads-line-chart-wrap {
+  position: relative;
+  height: 340px;
+}
+
 .trend-grid-line {
   stroke: #e5e7eb;
   stroke-width: 1;
@@ -1370,6 +1545,10 @@
 }
 
 @media (max-width: 1100px) {
+  .ads-kpi-grid {
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  }
+
   .trend-chart-grid {
     grid-template-columns: 1fr;
   }

@@ -1,5 +1,5 @@
 """
-从线上 amazon_ads_ad_group_ad_report 同步广告花费与多窗口销售额到本地 daily_ad_cost_sales，
+从线上 amazon_ads_ad_group_ad_report 同步广告花费与当日广告销售额到本地 daily_ad_cost_sales，
 报表中的 ASIN 列（按表结构自动识别：advertise_asin / ad_asin / asin 等）写入本地 **ad_asin**，
 并通过 amazon_listing（asin + store_id）补齐 pid、variation_id。
 
@@ -39,9 +39,6 @@ logger = logging.getLogger(__name__)
 
 # 本地尚无数据时，只从线上最近 N 个自然日拉取，避免首次全表扫过多年
 _DEFAULT_FIRST_SYNC_SPAN_DAYS = 35
-
-# order_item 按日聚合时，需多取 purchase_date 之前若干天，才能算 30 日滚动窗口合计
-_ORDER_ITEM_LOOKBACK_DAYS = 29
 
 # 线上报表 ASIN 列名因库而异，按顺序探测；取值经 TRIM 后写入本地 ad_asin
 _REPORT_ASIN_COLUMN_CANDIDATES = (
@@ -112,23 +109,6 @@ def _tad_over_order_sum(ad_cost: Decimal | None, order_sum: Decimal) -> float:
     if order_sum <= 0:
         return 0.0
     return float(ad_cost / order_sum)
-
-
-def _sum_order_amount_window(
-    order_by_day_store_asin: dict[tuple[date, int, str], Decimal],
-    pday: date,
-    store_id: int,
-    asin: str,
-    n_calendar_days: int,
-) -> Decimal:
-    """
-    同店同 ASIN：DATE(purchase_utc_date) 落在 [pday-(n-1), pday]（含端点、共 n 个日历日）的 order_item total_amount 之和。
-    """
-    total = Decimal(0)
-    for i in range(max(1, n_calendar_days)):
-        d = pday - timedelta(days=i)
-        total += order_by_day_store_asin.get((d, store_id, asin), Decimal(0))
-    return total
 
 
 def _fetch_order_totals_by_day_store_asin(
@@ -218,6 +198,32 @@ def _resolve_report_asin_trim_expr(online_conn) -> str:
         "amazon_ads_ad_group_ad_report 未找到 ASIN 相关列，已尝试: "
         + ", ".join(_REPORT_ASIN_COLUMN_CANDIDATES)
     )
+
+
+def _resolve_report_purchase_expr(online_conn) -> str:
+    """
+    返回广告订单字段表达式。优先使用 ``purchases_1d``；
+    若线上表暂不存在，再尝试旧名 ``purchase_1d``，否则回退为常量 0，避免同步失败。
+    """
+    schema = online_conn.execute(text("SELECT DATABASE()")).scalar()
+    schema = (schema or settings.ONLINE_DB_NAME or "").strip()
+    if not schema:
+        return "0"
+    for col in ("purchases_1d", "purchase_1d"):
+        n = online_conn.execute(
+            text(
+                "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = :schema AND TABLE_NAME = 'amazon_ads_ad_group_ad_report' AND COLUMN_NAME = :col"
+            ),
+            {"schema": schema, "col": col},
+        ).scalar()
+        if int(n or 0) > 0:
+            logger.info(
+                "[DailyAdCostSales] 线上报表 purchases 源列=%s → 写入本地 daily_ad_cost_sales.purchases",
+                col,
+            )
+            return f"COALESCE(r.`{col}`, 0)"
+    return "0"
 
 
 def _online_min_max_day(online_conn, day_sql: str) -> tuple[date | None, date | None]:
@@ -313,6 +319,7 @@ def _fetch_aggregated_for_day_filter(
     online_conn,
     day_sql: str,
     asin_trim_sql: str,
+    purchase_expr_sql: str,
     *,
     start: date | None = None,
     end: date | None = None,
@@ -335,11 +342,11 @@ def _fetch_aggregated_for_day_filter(
         SELECT {asin_trim_sql} AS ad_asin,
                r.store_id,
                {day_sql} AS purchase_day,
+               SUM(COALESCE(r.clicks, 0)) AS clicks,
+               SUM(COALESCE(r.impressions, 0)) AS impressions,
+               SUM({purchase_expr_sql}) AS purchases,
                SUM(COALESCE(r.cost, 0)) AS ad_cost,
-               SUM(COALESCE(r.sales_1d, 0)) AS sales_1d,
-               SUM(COALESCE(r.sales_7d, 0)) AS sales_7d,
-               SUM(COALESCE(r.sales_14d, 0)) AS sales_14d,
-               SUM(COALESCE(r.sales_30d, 0)) AS sales_30d
+               SUM(COALESCE(r.sales_1d, 0)) AS sales_1d
         FROM amazon_ads_ad_group_ad_report r
         WHERE {asin_trim_sql} IS NOT NULL AND {asin_trim_sql} <> ''
           AND {where}
@@ -434,23 +441,14 @@ def _upsert_rows(local_db, rows: list[dict]) -> dict:
     stmt = mysql_insert(DailyAdCostSales).values(rows)
     stmt = stmt.on_duplicate_key_update(
         variation_id=stmt.inserted.variation_id,
+        clicks=stmt.inserted.clicks,
+        impressions=stmt.inserted.impressions,
+        purchases=stmt.inserted.purchases,
         ad_cost=stmt.inserted.ad_cost,
         sales_1d=stmt.inserted.sales_1d,
-        sales_7d=stmt.inserted.sales_7d,
-        sales_14d=stmt.inserted.sales_14d,
-        sales_30d=stmt.inserted.sales_30d,
         ad_sales_1d=stmt.inserted.ad_sales_1d,
-        ad_sales_7d=stmt.inserted.ad_sales_7d,
-        ad_sales_14d=stmt.inserted.ad_sales_14d,
-        ad_sales_30d=stmt.inserted.ad_sales_30d,
         tad_sales=stmt.inserted.tad_sales,
-        tad_sales_7d=stmt.inserted.tad_sales_7d,
-        tad_sales_14d=stmt.inserted.tad_sales_14d,
-        tad_sales_30d=stmt.inserted.tad_sales_30d,
         tsales=stmt.inserted.tsales,
-        tsales_7d=stmt.inserted.tsales_7d,
-        tsales_14d=stmt.inserted.tsales_14d,
-        tsales_30d=stmt.inserted.tsales_30d,
     )
     res = local_db.execute(stmt)
     rc = int(getattr(res, "rowcount", 0) or 0)
@@ -473,12 +471,14 @@ def sync_ad_cost_sales(
     local_db = SessionLocal()
     day_sql_used = "DATE(r.`current_date`)"
     asin_trim_used = "r.`asin`"
+    purchase_expr_used = "0"
     try:
         online_engine = get_online_engine()
         with online_engine.connect() as online_conn:
             day_sql_used = _resolve_report_day_sql(online_conn)
             day_sql = day_sql_used
             asin_trim_used = _resolve_report_asin_trim_expr(online_conn)
+            purchase_expr_used = _resolve_report_purchase_expr(online_conn)
 
             if gap_days is not None:
                 days_to_process = sorted(set(gap_days))
@@ -520,20 +520,19 @@ def sync_ad_cost_sales(
             for low, high, dlist in iter_chunks:
                 if dlist is not None:
                     raw = _fetch_aggregated_for_day_filter(
-                        online_conn, day_sql, asin_trim_used, days=dlist
+                        online_conn, day_sql, asin_trim_used, purchase_expr_used, days=dlist
                     )
                     chunk_low = min(dlist)
                     chunk_high = max(dlist)
                 else:
                     raw = _fetch_aggregated_for_day_filter(
-                        online_conn, day_sql, asin_trim_used, start=low, end=high
+                        online_conn, day_sql, asin_trim_used, purchase_expr_used, start=low, end=high
                     )
                     chunk_low, chunk_high = low, high
                 if not raw:
                     continue
-                order_low = chunk_low - timedelta(days=_ORDER_ITEM_LOOKBACK_DAYS)
                 order_by_day_store_asin = _fetch_order_totals_by_day_store_asin(
-                    online_conn, order_low, chunk_high
+                    online_conn, chunk_low, chunk_high
                 )
                 pairs: list[tuple[str, int | None]] = []
                 for r in raw:
@@ -550,19 +549,16 @@ def sync_ad_cost_sales(
                     if not asin or pday is None:
                         continue
                     meta = lmap.get((asin, sid), {})
-                    ad_cost = _dec(r[3])
-                    s1 = _dec(r[4])
-                    s7 = _dec(r[5])
-                    s14 = _dec(r[6])
-                    s30 = _dec(r[7])
+                    clicks = int(r[3] or 0)
+                    impressions = int(r[4] or 0)
+                    purchases = int(r[5] or 0)
+                    ad_cost = _dec(r[6])
+                    s1 = _dec(r[7])
                     if sid is not None:
                         sid_i = int(sid)
                         order_day = order_by_day_store_asin.get((pday, sid_i, asin), Decimal(0))
-                        order_7 = _sum_order_amount_window(order_by_day_store_asin, pday, sid_i, asin, 7)
-                        order_14 = _sum_order_amount_window(order_by_day_store_asin, pday, sid_i, asin, 14)
-                        order_30 = _sum_order_amount_window(order_by_day_store_asin, pday, sid_i, asin, 30)
                     else:
-                        order_day = order_7 = order_14 = order_30 = Decimal(0)
+                        order_day = Decimal(0)
                     payloads.append(
                         {
                             "ad_asin": asin[:32],
@@ -570,23 +566,14 @@ def sync_ad_cost_sales(
                             "purchase_date": pday,
                             "pid": meta.get("pid"),
                             "variation_id": meta.get("variation_id"),
+                            "clicks": clicks,
+                            "impressions": impressions,
+                            "purchases": purchases,
                             "ad_cost": ad_cost,
                             "sales_1d": s1,
-                            "sales_7d": s7,
-                            "sales_14d": s14,
-                            "sales_30d": s30,
                             "ad_sales_1d": _ratio_float(ad_cost, s1),
-                            "ad_sales_7d": _ratio_float(ad_cost, s7),
-                            "ad_sales_14d": _ratio_float(ad_cost, s14),
-                            "ad_sales_30d": _ratio_float(ad_cost, s30),
                             "tad_sales": _tad_over_order_sum(ad_cost, order_day),
-                            "tad_sales_7d": _tad_over_order_sum(ad_cost, order_7),
-                            "tad_sales_14d": _tad_over_order_sum(ad_cost, order_14),
-                            "tad_sales_30d": _tad_over_order_sum(ad_cost, order_30),
                             "tsales": order_day,
-                            "tsales_7d": order_7,
-                            "tsales_14d": order_14,
-                            "tsales_30d": order_30,
                         }
                     )
                 if payloads:
@@ -605,6 +592,7 @@ def sync_ad_cost_sales(
             "mode": mode,
             "report_day_sql": day_sql_used,
             "report_asin_trim_sql": asin_trim_used,
+            "report_purchase_expr_sql": purchase_expr_used,
             "ranges": ranges_desc,
             "rows_upsert": total_rows,
         }

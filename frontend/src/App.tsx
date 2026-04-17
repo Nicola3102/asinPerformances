@@ -36,7 +36,9 @@ import {
   type GroupADetailChildRow,
   type MonitorParentItem,
   type MonitorTrackResponse,
+  type AdSalesDailyPoint,
   type AdSalesRow,
+  type AdSalesSummary,
   type TrendResponse,
   type TrendWeekPoint,
 } from './api/client'
@@ -50,6 +52,8 @@ import {
   PointElement,
   Legend,
   Tooltip,
+  type ChartOptions,
+  type TooltipItem,
 } from 'chart.js'
 import { Chart } from 'react-chartjs-2'
 import NlJsonWorker from './nlJsonParse.worker?worker'
@@ -119,7 +123,9 @@ async function parseTrendNewListingJsonText(text: string): Promise<TrendNewListi
 }
 
 /** 与 DailyUploadDS 默认 listing 窗口一致：堆叠图 tooltip 只展示相对横轴日最近 35 个日历日内的批次 */
-const NL_STACK_TOOLTIP_COHORT_LOOKBACK_DAYS = 35
+const NL_STACK_TOOLTIP_COHORT_LOOKBACK_DAYS = 32
+const NL_ZERO_SESSION_HIGHLIGHT_EXCLUDE_RECENT_DAYS = 2
+const NL_COHORT_COLLAPSE_NEW_ASIN_THRESHOLD = 500
 
 function nlStackTooltipYmdAddDays(ymd: string, deltaDays: number): string | null {
   const head = String(ymd || '').slice(0, 10)
@@ -146,6 +152,117 @@ function nlStackTooltipCohortInWindow(sessionYmd: string, cohortYmd: string): bo
   return c >= minY && c <= s
 }
 
+function nlGetOrCreateExternalTooltipEl(): HTMLDivElement | null {
+  if (typeof document === 'undefined') return null
+  let el = document.getElementById('trend-new-listing-chart-tooltip') as HTMLDivElement | null
+  if (el) return el
+  el = document.createElement('div')
+  el.id = 'trend-new-listing-chart-tooltip'
+  el.className = 'trend-new-listing-chart-tooltip'
+  document.body.appendChild(el)
+  return el
+}
+
+function nlRenderExternalTooltip(
+  context: any,
+  labels: string[],
+  lineTotals: number[],
+) {
+  const tooltip = context?.tooltip
+  const tooltipEl = nlGetOrCreateExternalTooltipEl()
+  if (!tooltip || !tooltipEl) return
+
+  if (tooltip.opacity === 0) {
+    tooltipEl.style.opacity = '0'
+    tooltipEl.style.pointerEvents = 'none'
+    return
+  }
+
+  const dataIndex = Number(tooltip.dataPoints?.[0]?.dataIndex ?? -1)
+  const title = String(tooltip.title?.[0] ?? labels[dataIndex] ?? '')
+  const total = dataIndex >= 0 ? Number(lineTotals[dataIndex] ?? 0) : 0
+  const bodyItems = Array.isArray(tooltip.dataPoints)
+    ? tooltip.dataPoints
+        .map((point: any, idx: number) => ({ point, idx }))
+        .filter((entry: { point: any; idx: number }) => String(entry.point?.dataset?.label ?? '') !== '当日 sessions 合计')
+    : []
+
+  const rowsHtml = bodyItems
+    .map(({ point, idx }: any) => {
+      const label = String(point?.dataset?.label ?? '')
+      const value = Number(point?.raw ?? point?.parsed?.y ?? 0).toLocaleString('zh-CN')
+      const color = String(tooltip.labelColors?.[idx]?.backgroundColor ?? point?.dataset?.backgroundColor ?? '#94a3b8')
+      return `
+        <div class="trend-new-listing-chart-tooltip-row">
+          <span class="trend-new-listing-chart-tooltip-label">
+            <span class="trend-new-listing-chart-tooltip-swatch" style="background:${color}"></span>
+            ${label}
+          </span>
+          <span class="trend-new-listing-chart-tooltip-value">${value}</span>
+        </div>
+      `
+    })
+    .join('')
+
+  tooltipEl.innerHTML = `
+    <div class="trend-new-listing-chart-tooltip-title">${title}</div>
+    <div class="trend-new-listing-chart-tooltip-total">当日 sessions 合计：${total.toLocaleString('zh-CN')}</div>
+    <div class="trend-new-listing-chart-tooltip-list">${rowsHtml || '<div class="trend-new-listing-chart-tooltip-empty">无批次数据</div>'}</div>
+  `
+
+  const caretX = Number(tooltip.caretX ?? 0)
+  const caretY = Number(tooltip.caretY ?? 0)
+  const canvasRect = context.chart.canvas.getBoundingClientRect()
+  const left = Math.min(window.innerWidth - 320, Math.max(12, canvasRect.left + caretX + 18))
+  const top = Math.min(window.innerHeight - 24, Math.max(12, canvasRect.top + caretY - 12))
+
+  tooltipEl.style.opacity = '1'
+  tooltipEl.style.pointerEvents = 'none'
+  tooltipEl.style.left = `${left}px`
+  tooltipEl.style.top = `${top}px`
+}
+
+function nlCurrentPstYmd(now: Date = new Date()): string {
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Los_Angeles',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  })
+  const parts = fmt.formatToParts(now)
+  const year = parts.find((p) => p.type === 'year')?.value ?? '1970'
+  const month = parts.find((p) => p.type === 'month')?.value ?? '01'
+  const day = parts.find((p) => p.type === 'day')?.value ?? '01'
+  return `${year}-${month}-${day}`
+}
+
+function nlDiffCalendarDays(startYmd: string, endYmd: string): number | null {
+  const s = String(startYmd || '').slice(0, 10)
+  const e = String(endYmd || '').slice(0, 10)
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || !/^\d{4}-\d{2}-\d{2}$/.test(e)) return null
+  const [sy, sm, sd] = s.split('-').map(Number)
+  const [ey, em, ed] = e.split('-').map(Number)
+  const start = Date.UTC(sy, sm - 1, sd)
+  const end = Date.UTC(ey, em - 1, ed)
+  return Math.floor((end - start) / 86400000)
+}
+
+function nlShouldHighlightZeroSessionCell(
+  cohortYmd: string,
+  dayIndex: number,
+  sessionValue: number,
+  todayPstYmd: string,
+): boolean {
+  if (Number(sessionValue ?? 0) !== 0) return false
+  const cutoffYmd = nlStackTooltipYmdAddDays(todayPstYmd, -NL_ZERO_SESSION_HIGHLIGHT_EXCLUDE_RECENT_DAYS)
+  if (!cutoffYmd) return false
+  const cohortHead = String(cohortYmd || '').slice(0, 10)
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(cohortHead) || cohortHead > cutoffYmd) return false
+  const diffDays = nlDiffCalendarDays(cohortHead, cutoffYmd)
+  if (diffDays == null || diffDays < 0) return false
+  return dayIndex <= diffDays
+}
+
 const NL_COHORT_ROW_HEIGHT_PX = 34
 
 type TrendNlCohortRow = NonNullable<TrendNewListingViewPayload['cohortTable']>[number]
@@ -160,6 +277,7 @@ function TrendNewListingVirtualCohortTable({
   const scrollRef = useRef<HTMLDivElement>(null)
   const [scrollTop, setScrollTop] = useState(0)
   const [viewH, setViewH] = useState(400)
+  const todayPstYmd = useMemo(() => nlCurrentPstYmd(), [])
 
   useLayoutEffect(() => {
     const el = scrollRef.current
@@ -213,9 +331,15 @@ function TrendNewListingVirtualCohortTable({
               <tr key={cd || `r-${start}-${end}`}>
                 <td className="is-sticky-col is-sticky-col--1">{cd || '–'}</td>
                 <td className="is-sticky-col is-sticky-col--2">{newAsin.toLocaleString('zh-CN')}</td>
-                {Array.from({ length: cohortTrackDays }, (_, i) => (
-                  <td key={`${cd}-s-${i}`}>{Number(daySessions[i] ?? 0).toLocaleString('zh-CN')}</td>
-                ))}
+                {Array.from({ length: cohortTrackDays }, (_, i) => {
+                  const value = Number(daySessions[i] ?? 0)
+                  const highlight = nlShouldHighlightZeroSessionCell(cd, i, value, todayPstYmd)
+                  return (
+                    <td key={`${cd}-s-${i}`} className={highlight ? 'trend-new-listing-zero-alert' : undefined}>
+                      {value.toLocaleString('zh-CN')}
+                    </td>
+                  )
+                })}
               </tr>
             )
           })}
@@ -3083,6 +3207,15 @@ function TrendNewListingEmbeddedPage() {
 
   const cohortTrackDays = Math.max(1, Number(payload.cohortTrackDays ?? 30))
   const cohortTable: TrendNlCohortRow[] = Array.isArray(view.cohortTable) ? view.cohortTable : []
+  const todayPstYmd = useMemo(() => nlCurrentPstYmd(), [])
+  const [hideSmallCohorts, setHideSmallCohorts] = useState(false)
+  const filteredCohortTable = useMemo(
+    () =>
+      hideSmallCohorts
+        ? cohortTable.filter((row) => Number(row?.newAsin ?? 0) >= NL_COHORT_COLLAPSE_NEW_ASIN_THRESHOLD)
+        : cohortTable,
+    [cohortTable, hideSmallCohorts],
+  )
 
   return (
     <div className="trend-embed-page trend-new-listing-page">
@@ -3178,7 +3311,7 @@ function TrendNewListingEmbeddedPage() {
       </div>
       <p className="trend-new-listing-hint">
         柱形为各上新批次（open_date）贡献的 sessions 堆叠；黑色折线为每日合计。横坐标仅包含有 session 数据的日期。
-        悬停提示中各批次仅显示相对该横轴日最近 {NL_STACK_TOOLTIP_COHORT_LOOKBACK_DAYS} 个日历日内的 open_date（与 listing 同步默认窗口一致），避免列表过长。
+        悬停提示中各批次仅显示相对该横轴日最近 {NL_STACK_TOOLTIP_COHORT_LOOKBACK_DAYS} 个日历日内的 open_date，并固定展示当日 sessions 合计。
         全店数据就绪后会在浏览器空闲时用 <code className="trend-new-listing-code">json_views=store</code> 预取各店并写入本地缓存，切换店铺时优先直接用已合并的{' '}
         <code className="trend-new-listing-code">views[store_id]</code>。
         首次进入若无缓存会自动请求一次；之后默认展示浏览器本地缓存，不自动打接口。地址栏加{' '}
@@ -3210,7 +3343,8 @@ function TrendNewListingEmbeddedPage() {
               plugins: {
                 legend: { position: 'top' },
                 tooltip: {
-                  maxWidth: 320,
+                  enabled: false,
+                  external: (context) => nlRenderExternalTooltip(context, view.labels, lt),
                   filter: (tooltipItem) => {
                     const chart = tooltipItem.chart
                     const ds = chart.data.datasets[tooltipItem.datasetIndex] as {
@@ -3224,14 +3358,6 @@ function TrendNewListingEmbeddedPage() {
                     const cohortYmd = nlStackTooltipParseBatchYmd(String(ds.label ?? ''))
                     if (!cohortYmd) return true
                     return nlStackTooltipCohortInWindow(sessionYmd, cohortYmd)
-                  },
-                  callbacks: {
-                    footer: (items) => {
-                      if (!items.length) return ''
-                      const idx = items[0].dataIndex
-                      const total = lt[idx]
-                      return total != null ? `合计 ${Number(total).toLocaleString()} sessions` : ''
-                    },
                   },
                 },
               },
@@ -3265,12 +3391,30 @@ function TrendNewListingEmbeddedPage() {
         <p className="trend-new-listing-table-caption">
           前两列「上新日 / 上新 ASIN 数」来自线上 <code className="trend-new-listing-code">amazon_listing</code>
           （open_date 在 [{payload.listingSince}, {payload.listingThrough}] 内按日、asin 非空且 TRIM 非空；与顶部 KPI 全表 COUNT(*) 口径不同）。切换「店铺」按 store_id
-          切分；单店数据按需加载。后列为本地 sessions 明细。
+          切分；单店数据按需加载。后列为本地 sessions 明细。红色 0 表示按 PST 当前日期往前推 {NL_ZERO_SESSION_HIGHLIGHT_EXCLUDE_RECENT_DAYS}
+          天后的截止日来判断，该批次截至该截止日理论上已走到的天数里，sessions 仍为 0。
         </p>
+        <div className="trend-new-listing-table-controls">
+          <label className="trend-new-listing-table-toggle">
+            <input
+              type="checkbox"
+              checked={hideSmallCohorts}
+              onChange={(e) => setHideSmallCohorts(e.target.checked)}
+            />
+            <span>折叠上新 ASIN 数小于 {NL_COHORT_COLLAPSE_NEW_ASIN_THRESHOLD} 的批次</span>
+          </label>
+          <span className="trend-new-listing-table-stats">
+            当前显示 {filteredCohortTable.length} / {cohortTable.length} 个批次
+          </span>
+        </div>
         {!cohortTable.length ? (
           <p className="trend-new-listing-table-empty">暂无表格数据（需要 open_date 批次与本地 sessions 明细）。</p>
-        ) : cohortTable.length > 80 ? (
-          <TrendNewListingVirtualCohortTable cohortTable={cohortTable} cohortTrackDays={cohortTrackDays} />
+        ) : !filteredCohortTable.length ? (
+          <p className="trend-new-listing-table-empty">
+            当前筛选后暂无批次数据。请取消折叠，或检查是否存在上新 ASIN 数不小于 {NL_COHORT_COLLAPSE_NEW_ASIN_THRESHOLD} 的批次。
+          </p>
+        ) : filteredCohortTable.length > 80 ? (
+          <TrendNewListingVirtualCohortTable cohortTable={filteredCohortTable} cohortTrackDays={cohortTrackDays} />
         ) : (
           <div className="trend-new-listing-table-scroll">
             <table className="trend-new-listing-table">
@@ -3284,7 +3428,7 @@ function TrendNewListingEmbeddedPage() {
                 </tr>
               </thead>
               <tbody>
-                {cohortTable.map((row: any) => {
+                {filteredCohortTable.map((row: any) => {
                   const cd = String(row?.cohortDate ?? '')
                   const newAsin = Number(row?.newAsin ?? 0)
                   const daySessions: number[] = Array.isArray(row?.daySessions)
@@ -3294,9 +3438,15 @@ function TrendNewListingEmbeddedPage() {
                     <tr key={cd || 'row'}>
                       <td className="is-sticky-col is-sticky-col--1">{cd || '–'}</td>
                       <td className="is-sticky-col is-sticky-col--2">{newAsin.toLocaleString('zh-CN')}</td>
-                      {Array.from({ length: cohortTrackDays }, (_, i) => (
-                        <td key={`${cd}-s-${i}`}>{Number(daySessions[i] ?? 0).toLocaleString('zh-CN')}</td>
-                      ))}
+                      {Array.from({ length: cohortTrackDays }, (_, i) => {
+                        const value = Number(daySessions[i] ?? 0)
+                        const highlight = nlShouldHighlightZeroSessionCell(cd, i, value, todayPstYmd)
+                        return (
+                          <td key={`${cd}-s-${i}`} className={highlight ? 'trend-new-listing-zero-alert' : undefined}>
+                            {value.toLocaleString('zh-CN')}
+                          </td>
+                        )
+                      })}
                     </tr>
                   )
                 })}
@@ -3824,6 +3974,19 @@ function PagePlaceholder({ title }: { title: string }) {
 }
 
 function AdSalesPage() {
+  const emptyAdSalesSummary: AdSalesSummary = {
+    clicks: 0,
+    impressions: 0,
+    ad_cost: 0,
+    sales_1d: 0,
+    order_item_sales: 0,
+    tacos: 0,
+    ad_asin_count: 0,
+    cpc: 0,
+    acos: 0,
+    cvr: 0,
+    purchases: 0,
+  }
   const [storeId, setStoreId] = useState<string>('')
   const [startDate, setStartDate] = useState<string>('')
   const [endDate, setEndDate] = useState<string>('')
@@ -3834,6 +3997,8 @@ function AdSalesPage() {
   const [total, setTotal] = useState<number>(0)
   const [loading, setLoading] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
+  const [summary, setSummary] = useState<AdSalesSummary>(emptyAdSalesSummary)
+  const [dailySeries, setDailySeries] = useState<AdSalesDailyPoint[]>([])
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [sorts, setSorts] = useState<Array<{ field: string; dir: 'asc' | 'desc' }>>([])
 
@@ -3860,6 +4025,8 @@ function AdSalesPage() {
       setItems(res.items || [])
       setTotal(res.total || 0)
       setPage(res.page || nextPage)
+      setSummary(res.summary || emptyAdSalesSummary)
+      setDailySeries(res.daily_series || [])
     } catch (e) {
       setError(e instanceof Error ? e.message : '加载失败')
     } finally {
@@ -3957,10 +4124,270 @@ function AdSalesPage() {
     }
   }
 
+  const trendChartData = useMemo(() => {
+    const labels = dailySeries.map((row) => row.date || '–')
+    return {
+      labels,
+      datasets: [
+        {
+          type: 'line' as const,
+          label: '广告花费',
+          data: dailySeries.map((row) => row.ad_cost),
+          borderColor: '#f59e0b',
+          backgroundColor: 'rgba(245, 158, 11, 0.15)',
+          tension: 0.3,
+          pointRadius: 2,
+          yAxisID: 'ySales',
+        },
+        {
+          type: 'line' as const,
+          label: '广告销售额',
+          data: dailySeries.map((row) => row.sales_1d),
+          borderColor: '#22c55e',
+          backgroundColor: 'rgba(34, 197, 94, 0.15)',
+          tension: 0.3,
+          pointRadius: 2,
+          yAxisID: 'ySales',
+        },
+        {
+          type: 'line' as const,
+          label: '点击',
+          data: dailySeries.map((row) => row.clicks),
+          borderColor: '#3b82f6',
+          backgroundColor: 'rgba(59, 130, 246, 0.15)',
+          tension: 0.3,
+          pointRadius: 2,
+          yAxisID: 'yMain',
+        },
+        {
+          type: 'line' as const,
+          label: 'impressions',
+          data: dailySeries.map((row) => row.impressions),
+          borderColor: '#a855f7',
+          backgroundColor: 'rgba(168, 85, 247, 0.15)',
+          tension: 0.3,
+          pointRadius: 2,
+          yAxisID: 'yImpressions',
+        },
+        {
+          type: 'line' as const,
+          label: 'CPC',
+          data: dailySeries.map((row) => row.cpc),
+          borderColor: '#0f766e',
+          backgroundColor: 'rgba(15, 118, 110, 0.15)',
+          tension: 0.3,
+          pointRadius: 2,
+          yAxisID: 'yRate',
+        },
+        {
+          type: 'line' as const,
+          label: 'ACoS (%)',
+          data: dailySeries.map((row) => row.acos),
+          borderColor: '#111827',
+          backgroundColor: 'rgba(17, 24, 39, 0.12)',
+          tension: 0.3,
+          pointRadius: 2,
+          yAxisID: 'yAcos',
+        },
+        {
+          type: 'line' as const,
+          label: 'CVR (%)',
+          data: dailySeries.map((row) => row.cvr),
+          borderColor: '#ef4444',
+          backgroundColor: 'rgba(239, 68, 68, 0.15)',
+          tension: 0.3,
+          pointRadius: 2,
+          yAxisID: 'yRate',
+        },
+        {
+          type: 'line' as const,
+          label: '广告订单',
+          data: dailySeries.map((row) => row.purchases),
+          borderColor: '#0ea5e9',
+          backgroundColor: 'rgba(14, 165, 233, 0.15)',
+          tension: 0.3,
+          pointRadius: 2,
+          yAxisID: 'yMain',
+        },
+        {
+          type: 'line' as const,
+          label: '广告ASIN销售额',
+          data: dailySeries.map((row) => row.order_item_sales),
+          borderColor: '#14b8a6',
+          backgroundColor: 'rgba(20, 184, 166, 0.16)',
+          tension: 0.28,
+          pointRadius: 2,
+          yAxisID: 'ySales',
+        },
+        {
+          type: 'line' as const,
+          label: 'TACoS (%)',
+          data: dailySeries.map((row) => row.tacos),
+          borderColor: '#111827',
+          backgroundColor: 'rgba(17, 24, 39, 0.1)',
+          tension: 0.28,
+          pointRadius: 2,
+          borderDash: [6, 3],
+          yAxisID: 'yAcos',
+        },
+        {
+          type: 'line' as const,
+          label: '投广告ASIN数',
+          data: dailySeries.map((row) => row.ad_asin_count),
+          borderColor: '#8b5cf6',
+          backgroundColor: 'rgba(139, 92, 246, 0.12)',
+          tension: 0.28,
+          pointRadius: 2,
+          yAxisID: 'yMain',
+        },
+      ],
+    }
+  }, [dailySeries])
+
+  const ADS_AXIS_TICK_SEGMENTS = 6
+
+  const calcNiceStep = useCallback((rawStep: number, minStep: number) => {
+    if (!Number.isFinite(rawStep) || rawStep <= 0) return minStep
+    const exponent = Math.floor(Math.log10(rawStep))
+    const pow = 10 ** exponent
+    const base = rawStep / pow
+    let niceBase = 10
+    if (base <= 1) niceBase = 1
+    else if (base <= 2) niceBase = 2
+    else if (base <= 2.5) niceBase = 2.5
+    else if (base <= 5) niceBase = 5
+    return Math.max(minStep, niceBase * pow)
+  }, [])
+
+  const buildAxis = useCallback((
+    values: number[],
+    title: string,
+    color: string,
+    minStep: number,
+    position: 'left' | 'right',
+    offset = false,
+    drawOnChartArea = false,
+    fixedStepSize?: number,
+  ) => {
+    const nums = values.filter((v) => Number.isFinite(v))
+    const maxVal = nums.length ? Math.max(...nums) : minStep
+    // 固定步长：严格使用传入值，不再用 calcNiceStep 抬高（否则会 50→500）
+    const stepSize =
+      fixedStepSize && fixedStepSize > 0
+        ? fixedStepSize
+        : calcNiceStep(maxVal / ADS_AXIS_TICK_SEGMENTS, minStep)
+    const minSpan = stepSize * ADS_AXIS_TICK_SEGMENTS
+    const dataMax = Math.ceil(maxVal / stepSize) * stepSize
+    const axisMax = Math.max(minSpan, dataMax, stepSize)
+    return {
+      type: 'linear' as const,
+      position,
+      offset,
+      alignToPixels: false,
+      beginAtZero: true,
+      min: 0,
+      max: axisMax,
+      title: { display: true, text: title, color },
+      ticks: {
+        stepSize,
+        autoSkip: false,
+        color,
+      },
+      grid: { drawOnChartArea },
+    }
+  }, [calcNiceStep])
+
+  const trendChartOptions = useMemo<ChartOptions<'line'>>(() => ({
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: { mode: 'index' as const, intersect: false },
+    plugins: {
+      legend: { position: 'top' as const },
+      tooltip: {
+        callbacks: {
+          label: (ctx: TooltipItem<'line'>) => {
+            const label = ctx.dataset.label || ''
+            const value = Number(ctx.parsed.y ?? 0)
+            if (label === 'CPC' || label === '广告花费' || label === '广告销售额' || label === '广告ASIN销售额') {
+              return `${label}: $${value.toFixed(2)}`
+            }
+            if (label === 'ACoS (%)' || label === 'CVR (%)' || label === 'TACoS (%)') return `${label}: ${value.toFixed(1)}%`
+            if (label === '投广告ASIN数') return `${label}: ${value.toLocaleString()}`
+            return `${label}: ${value.toLocaleString()}`
+          },
+        },
+      },
+    },
+    scales: {
+      yMain: buildAxis(
+        [
+          ...dailySeries.map((row) => row.clicks),
+          ...dailySeries.map((row) => row.purchases),
+          ...dailySeries.map((row) => row.ad_asin_count),
+        ],
+        '点击 / 广告订单 / 投广告ASIN数',
+        '#334155',
+        100,
+        'left',
+        false,
+        true,
+        100,
+      ),
+      yImpressions: buildAxis(
+        dailySeries.map((row) => row.impressions),
+        'impressions',
+        '#a855f7',
+        10000,
+        'left',
+        false,
+      ),
+      ySales: buildAxis(
+        [
+          ...dailySeries.map((row) => row.ad_cost),
+          ...dailySeries.map((row) => row.sales_1d),
+          ...dailySeries.map((row) => row.order_item_sales),
+        ],
+        '广告花费 / 广告销售额 / 广告ASIN销售额',
+        '#22c55e',
+        500,
+        'left',
+        false,
+      ),
+      yRate: buildAxis(
+        [...dailySeries.map((row) => row.cpc), ...dailySeries.map((row) => row.cvr)],
+        'CPC / CVR (%)',
+        '#0f766e',
+        0.1,
+        'right',
+      ),
+      yAcos: buildAxis(
+        [...dailySeries.map((row) => row.acos), ...dailySeries.map((row) => row.tacos)],
+        'ACoS / TACoS (%)',
+        '#111827',
+        5,
+        'right',
+      ),
+    },
+  }), [buildAxis, dailySeries])
+
+  const metricCards = [
+    { label: '点击', value: summary.clicks.toLocaleString(), accent: 'blue' },
+    { label: 'impressions', value: summary.impressions.toLocaleString(), accent: 'purple' },
+    { label: '广告花费', value: `$${summary.ad_cost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, accent: 'orange' },
+    { label: '广告销售额', value: `$${summary.sales_1d.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, accent: 'green' },
+    { label: '广告ASIN总销售额', value: `$${summary.order_item_sales.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, accent: 'teal' },
+    { label: 'TACoS', value: `${summary.tacos.toFixed(1)}%`, accent: 'black' },
+    { label: '投广告ASIN数', value: summary.ad_asin_count.toLocaleString(), accent: 'purple' },
+    { label: 'CPC', value: `$${summary.cpc.toFixed(2)}`, accent: 'teal' },
+    { label: 'ACoS', value: `${summary.acos.toFixed(1)}%`, accent: 'black' },
+    { label: 'CVR', value: `${summary.cvr.toFixed(1)}%`, accent: 'red' },
+    { label: '广告订单', value: summary.purchases.toLocaleString(), accent: 'sky' },
+  ]
+
   return (
     <div className="app">
       <h1>Ad-Sales</h1>
-      <p className="monitor-desc">从本地 <code>daily_ad_cost_sales</code> 查询，支持按店铺与 purchase_date 筛选、分页、勾选下载。</p>
+      <p className="monitor-desc">从本地 <code>daily_ad_cost_sales</code> 查询广告指标；广告 ASIN 销售额额外通过 <code>order_item</code> 按 <code>store_id + asin + purchase_utc_date</code> 聚合。下方表格仅显示当前店铺/日期下 <code>purchases &gt; 0</code> 的 ad_asin。</p>
 
       <div className="monitor-controls" style={{ alignItems: 'flex-end' }}>
         <label>
@@ -4005,6 +4432,27 @@ function AdSalesPage() {
       {error && <div className="error" style={{ marginTop: 10 }}>{error}</div>}
       {loading && <div className="empty-hint" style={{ marginTop: 10 }}>Loading…</div>}
 
+      <div className="ads-kpi-grid" style={{ marginTop: 14 }}>
+        {metricCards.map((card) => (
+          <div key={card.label} className={`ads-kpi-card ads-kpi-card--${card.accent}`}>
+            <div className="ads-kpi-label">{card.label}</div>
+            <div className="ads-kpi-value">{card.value}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="trend-chart-card" style={{ marginTop: 14 }}>
+        <div className="trend-chart-header">
+          <div>
+            <h3>关键指标</h3>
+            <p className="trend-chart-hint">按筛选区间汇总每日点击、CPC、ACoS 与广告订单</p>
+          </div>
+        </div>
+        <div className="ads-line-chart-wrap">
+          <Chart type="line" data={trendChartData} options={trendChartOptions} />
+        </div>
+      </div>
+
       <div className="monitor-tables" style={{ marginTop: 10 }}>
         <table className="data-table monitor-track-table">
           <thead>
@@ -4017,17 +4465,14 @@ function AdSalesPage() {
                 />
               </th>
               <th>ad_asin</th>
-              <th>store_id</th>
-              <th>purchase_date</th>
+              <th>clicks</th>
+              <th>impressions</th>
+              <th>purchases</th>
               <th {...sortableThProps('ad_cost')}>ad_cost{sortMark('ad_cost')}</th>
+              <th {...sortableThProps('sales_1d')}>sales_1d{sortMark('sales_1d')}</th>
               <th {...sortableThProps('ad_sales_1d')}>ad_sales_1d{sortMark('ad_sales_1d')}</th>
-              <th {...sortableThProps('ad_sales_7d')}>ad_sales_7d{sortMark('ad_sales_7d')}</th>
-              <th {...sortableThProps('ad_sales_14d')}>ad_sales_14d{sortMark('ad_sales_14d')}</th>
-              <th {...sortableThProps('ad_sales_30d')}>ad_sales_30d{sortMark('ad_sales_30d')}</th>
               <th {...sortableThProps('tad_sales')}>Tad_sales{sortMark('tad_sales')}</th>
-              <th {...sortableThProps('tad_sales_7d')}>Tad_sales_7d{sortMark('tad_sales_7d')}</th>
-              <th {...sortableThProps('tad_sales_14d')}>Tad_sales_14d{sortMark('tad_sales_14d')}</th>
-              <th {...sortableThProps('tad_sales_30d')}>Tad_sales_30d{sortMark('tad_sales_30d')}</th>
+              <th {...sortableThProps('tsales')}>tsales{sortMark('tsales')}</th>
             </tr>
           </thead>
           <tbody>
@@ -4037,22 +4482,19 @@ function AdSalesPage() {
                   <input type="checkbox" checked={selected.has(r.id)} onChange={() => toggleSelected(r.id)} />
                 </td>
                 <td>{r.ad_asin ?? '–'}</td>
-                <td>{r.store_id ?? '–'}</td>
-                <td>{r.purchase_date ?? '–'}</td>
+                <td>{r.clicks ?? '–'}</td>
+                <td>{r.impressions ?? '–'}</td>
+                <td>{r.purchases ?? '–'}</td>
                 <td>{r.ad_cost ?? '–'}</td>
+                <td>{r.sales_1d ?? '–'}</td>
                 <td>{r.ad_sales_1d ?? '–'}</td>
-                <td>{r.ad_sales_7d ?? '–'}</td>
-                <td>{r.ad_sales_14d ?? '–'}</td>
-                <td>{r.ad_sales_30d ?? '–'}</td>
                 <td>{r.tad_sales ?? '–'}</td>
-                <td>{r.tad_sales_7d ?? '–'}</td>
-                <td>{r.tad_sales_14d ?? '–'}</td>
-                <td>{r.tad_sales_30d ?? '–'}</td>
+                <td>{r.tsales ?? '–'}</td>
               </tr>
             ))}
             {!loading && items.length === 0 && (
               <tr>
-                <td colSpan={13} className="empty-hint">No data.</td>
+                <td colSpan={10} className="empty-hint">No data.</td>
               </tr>
             )}
           </tbody>

@@ -415,15 +415,43 @@ export type AdSalesRow = {
   ad_asin: string | null;
   store_id: number | null;
   purchase_date: string | null;
+  clicks: number;
+  impressions: number;
+  purchases: number;
   ad_cost: number | null;
+  sales_1d: number | null;
   ad_sales_1d: number | null;
-  ad_sales_7d: number | null;
-  ad_sales_14d: number | null;
-  ad_sales_30d: number | null;
   tad_sales: number | null;
-  tad_sales_7d: number | null;
-  tad_sales_14d: number | null;
-  tad_sales_30d: number | null;
+  tsales: number | null;
+}
+
+export type AdSalesSummary = {
+  clicks: number;
+  impressions: number;
+  ad_cost: number;
+  sales_1d: number;
+  order_item_sales: number;
+  tacos: number;
+  ad_asin_count: number;
+  cpc: number;
+  acos: number;
+  cvr: number;
+  purchases: number;
+}
+
+export type AdSalesDailyPoint = {
+  date: string | null;
+  clicks: number;
+  impressions: number;
+  ad_cost: number;
+  sales_1d: number;
+  order_item_sales: number;
+  tacos: number;
+  ad_asin_count: number;
+  cpc: number;
+  acos: number;
+  cvr: number;
+  purchases: number;
 }
 
 export type AdSalesListResponse = {
@@ -431,6 +459,8 @@ export type AdSalesListResponse = {
   page: number;
   page_size: number;
   total: number;
+  summary: AdSalesSummary;
+  daily_series: AdSalesDailyPoint[];
 }
 
 export async function listAdSales(params: {
