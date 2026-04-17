@@ -560,7 +560,7 @@ export async function getAdsProfit(params: {
   const res = await fetch(`${API_BASE}/ads/profit?${qs.toString()}`)
   if (!res.ok) {
     const text = await res.text()
-    throw buildApiError(text, res.status, 'Failed to fetch ads profit')
+    throw buildApiError(text, res.status, 'Failed to fetch total profit')
   }
   return res.json()
 }

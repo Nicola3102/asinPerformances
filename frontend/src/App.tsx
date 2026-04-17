@@ -4708,7 +4708,7 @@ function AdsProfitPage() {
 
   return (
     <div className="app">
-      <h1>Ads Profit</h1>
+      <h1>Total Profit</h1>
       <p className="monitor-desc">
         按 <code>order_profit.invoice_date</code> 从 2026-02-23 起按周聚合销售额、退货金额与毛利率；默认展示全部店铺，可按 <code>store_id</code> 切换。
         当前最新 invoice_date：<code>{latestInvoiceDate || '–'}</code>
@@ -4881,7 +4881,7 @@ function AppLayout() {
               className="top-nav-menu-link"
               onClick={() => setAdsOpen(false)}
             >
-              Ads Profit
+              Total Profit
             </NavLink>
           </div>
         </div>
