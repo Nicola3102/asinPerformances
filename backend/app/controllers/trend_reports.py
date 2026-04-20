@@ -334,13 +334,17 @@ def trend_new_listing_json_cache_stats():
 
 @router.get("/new-listing")
 def trend_new_listing_report(
-    listing_since: date = Query(
-        DEFAULT_LISTING_SINCE,
-        description="KPI / cohort 起点；图表仅展示 open_date ≥ 该日的批次，每批次统计自上新日起 30 个日历日 sessions",
+    start_date: Optional[date] = Query(
+        None,
+        description="页面统一起始日期；默认取最新 session_date 往前 34 天（共最近 35 天），并同时作用于 KPI/cohort 与图表横轴",
+    ),
+    listing_since: Optional[date] = Query(
+        None,
+        description="KPI / cohort 起点；未传时默认跟随 start_date，若两者都未传则取最近 35 天窗口起点",
     ),
     session_start: Optional[date] = Query(
         None,
-        description="图表横轴 session_date 起始；默认与 listing_since 相同",
+        description="图表横轴 session_date 起始；未传时默认跟随 start_date / listing_since",
     ),
     session_end: Optional[date] = Query(
         None,
@@ -384,9 +388,12 @@ def trend_new_listing_report(
        聚合 sessions 堆叠柱 + 合计折线；横轴为区间内**实际有 session 数据**的日期。``format=json`` 返回同构 JSON。
     """
     end_d = session_end or _resolve_new_listing_default_session_end()
+    default_window_start = end_d - timedelta(days=34)
+    effective_listing_since = start_date or listing_since or default_window_start
+    effective_session_start = start_date or session_start or effective_listing_since
     # cohort / 上新统计不早于 PST 报表默认起点 2026-02-20
-    listing_since = max(listing_since, DEFAULT_LISTING_SINCE)
-    start_d = session_start or listing_since
+    listing_since = max(effective_listing_since, DEFAULT_LISTING_SINCE)
+    start_d = effective_session_start or listing_since
     if start_d < listing_since:
         start_d = listing_since
     if start_d > end_d:

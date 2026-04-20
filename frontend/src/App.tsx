@@ -88,6 +88,8 @@ interface TrendNewListingJsonPayload {
   storeIds: number[]
   listingSince: string
   listingThrough: string
+  sessionRequestedStart?: string
+  sessionRequestedEnd?: string
   sessionChartStart: string
   sessionChartEnd: string
   chartRangeAutoExpanded?: boolean
@@ -102,7 +104,7 @@ interface TrendNewListingJsonPayload {
 }
 
 /** v4：KPI 与线上 COUNT(*) open_date>since、status='Active' 对账 SQL 一致 */
-const TREND_NEW_LISTING_CACHE_KEY = 'asinPerformances.v4.trendNewListingJson'
+const TREND_NEW_LISTING_CACHE_KEY = 'asinPerformances.v5.trendNewListingJson'
 /** 超过此大小的 JSON 在 Worker 中 parse，减轻主线程卡顿 */
 const TREND_NL_JSON_WORKER_MIN_LEN = 48_000
 
@@ -374,6 +376,15 @@ function readTrendNewListingCache(): TrendNewListingJsonPayload | null {
   }
 }
 
+function isTrendNewListingDefaultRange(data: TrendNewListingJsonPayload | null): boolean {
+  if (!data) return false
+  const endYmd = String(data.sessionRequestedEnd ?? data.sessionChartEnd ?? '').slice(0, 10)
+  const expectedStart = nlStackTooltipYmdAddDays(endYmd, -34)
+  const listingSince = String(data.listingSince ?? '').slice(0, 10)
+  const requestedStart = String(data.sessionRequestedStart ?? data.listingSince ?? '').slice(0, 10)
+  return Boolean(expectedStart && listingSince === expectedStart && requestedStart === expectedStart)
+}
+
 function writeTrendNewListingCache(data: TrendNewListingJsonPayload): void {
   try {
     localStorage.setItem(TREND_NEW_LISTING_CACHE_KEY, JSON.stringify(data))
@@ -391,7 +402,7 @@ function getTrendNewListingBoot(): { payload: TrendNewListingJsonPayload | null;
       return { payload: null, useCacheOnly: false }
     }
     const cached = readTrendNewListingCache()
-    if (cached) return { payload: cached, useCacheOnly: true }
+    if (cached && isTrendNewListingDefaultRange(cached)) return { payload: cached, useCacheOnly: true }
   } catch {
     /* ignore */
   }
@@ -2815,10 +2826,19 @@ function TrendNewListingEmbeddedPage() {
   const [payload, setPayload] = useState<TrendNewListingJsonPayload | null>(boot.payload)
   const [fromCache, setFromCache] = useState(boot.useCacheOnly)
   const [storeKey, setStoreKey] = useState<string>('all')
+  const [displayStoreKey, setDisplayStoreKey] = useState<string>('all')
+  const [startDateInput, setStartDateInput] = useState<string>(boot.payload?.listingSince ?? '')
+  const [endDateInput, setEndDateInput] = useState<string>(
+    boot.payload?.sessionRequestedEnd ?? boot.payload?.sessionChartEnd ?? '',
+  )
+  const [useDefaultDateRange, setUseDefaultDateRange] = useState<boolean>(
+    boot.payload ? isTrendNewListingDefaultRange(boot.payload) : true,
+  )
   const [err, setErr] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [storeViewLoading, setStoreViewLoading] = useState<string | null>(null)
   const [chartMountReady, setChartMountReady] = useState(false)
+  const [hideSmallCohorts, setHideSmallCohorts] = useState(false)
   const nlProfilePendingRef = useRef<{
     t0: number
     afterParse: number
@@ -2840,12 +2860,52 @@ function TrendNewListingEmbeddedPage() {
 
   nlPayloadRef.current = payload
 
+  const storeOptionsEarly = useMemo(
+    () => [
+      { value: 'all', label: '全部店铺' },
+      ...((payload?.storeIds || []).map((id) => ({ value: String(id), label: `店铺 ${id}` })) as Array<{
+        value: string
+        label: string
+      }>),
+    ],
+    [payload?.storeIds],
+  )
+  const view: TrendNewListingViewPayload | undefined = useMemo(() => {
+    if (!payload?.views) return undefined
+    if (storeKey === 'all') return payload.views.all
+    if (payload.views[storeKey]) return payload.views[storeKey]
+    if (displayStoreKey !== 'all' && payload.views[displayStoreKey]) return payload.views[displayStoreKey]
+    return payload.views.all
+  }, [displayStoreKey, payload?.views, storeKey])
+  const showingFallbackStoreView = Boolean(payload?.views?.all) && storeKey !== 'all' && !payload?.views?.[storeKey]
+  const storeOptions = storeOptionsEarly
+  const cohortTrackDays = Math.max(1, Number(payload?.cohortTrackDays ?? 30))
+  const cohortTable: TrendNlCohortRow[] = useMemo(
+    () => (Array.isArray(view?.cohortTable) ? view.cohortTable : []),
+    [view?.cohortTable],
+  )
+  const latestSessionYmd = useMemo(
+    () => String(view?.labels?.[view.labels.length - 1] ?? payload?.sessionChartEnd ?? nlCurrentPstYmd()),
+    [payload?.sessionChartEnd, view?.labels],
+  )
+  const filteredCohortTable = useMemo(
+    () =>
+      hideSmallCohorts
+        ? cohortTable.filter((row) => Number(row?.newAsin ?? 0) >= NL_COHORT_COLLAPSE_NEW_ASIN_THRESHOLD)
+        : cohortTable,
+    [cohortTable, hideSmallCohorts],
+  )
+
   const fetchNewListingJson = useCallback(
     async (opts: {
       skipSync: boolean
       writeCache: boolean
       jsonViews: 'all' | 'full' | 'store'
       storeId?: number
+      startDate?: string | null
+      endDate?: string | null
+      defaultDateRange?: boolean
+      syncFormState?: boolean
       signal?: AbortSignal
       mergeIntoExisting?: boolean
     }) => {
@@ -2861,6 +2921,8 @@ function TrendNewListingEmbeddedPage() {
       }
       let url = `/api/trend/new-listing?format=json&json_views=${opts.jsonViews}`
       if (opts.jsonViews === 'store' && opts.storeId != null) url += `&store_id=${opts.storeId}`
+      if (opts.startDate) url += `&start_date=${encodeURIComponent(opts.startDate)}`
+      if (opts.endDate) url += `&session_end=${encodeURIComponent(opts.endDate)}`
       if (opts.skipSync) url += '&skip_sync=false'
       if (serverNocache) url += '&nocache=1'
       if (wantProfile) url += '&profile=1'
@@ -2899,9 +2961,57 @@ function TrendNewListingEmbeddedPage() {
         if (opts.writeCache) writeTrendNewListingCache(data)
         setPayload(data)
       }
+      if (opts.syncFormState && opts.jsonViews === 'all') {
+        setStartDateInput(String(data.listingSince ?? '').slice(0, 10))
+        setEndDateInput(String(data.sessionRequestedEnd ?? data.sessionChartEnd ?? '').slice(0, 10))
+        setUseDefaultDateRange(Boolean(opts.defaultDateRange) || isTrendNewListingDefaultRange(data))
+      }
       setFromCache(false)
     },
     [],
+  )
+
+  const runNewListingAllViewFetch = useCallback(
+    async (
+      forceSync: boolean,
+      next: { startDate?: string; endDate?: string; useDefaultDateRange?: boolean } = {},
+    ) => {
+      const nextUseDefaultDateRange = next.useDefaultDateRange ?? useDefaultDateRange
+      const nextStartDate = (next.startDate ?? startDateInput).trim()
+      const nextEndDate = (next.endDate ?? endDateInput).trim()
+      if (nextStartDate && nextEndDate && nextStartDate > nextEndDate) {
+        setErr('开始日期不能晚于结束日期')
+        return
+      }
+      const requestStartDate = nextUseDefaultDateRange ? null : nextStartDate || null
+      const requestEndDate = nextUseDefaultDateRange ? null : nextEndDate || null
+      nlShellAbortRef.current?.abort()
+      nlStoreAbortRef.current?.abort()
+      nlPrefetchGenRef.current += 1
+      const ac = new AbortController()
+      nlShellAbortRef.current = ac
+      setRefreshing(true)
+      setErr(null)
+      try {
+        await fetchNewListingJson({
+          skipSync: forceSync,
+          writeCache: nextUseDefaultDateRange,
+          jsonViews: 'all',
+          startDate: requestStartDate,
+          endDate: requestEndDate,
+          defaultDateRange: nextUseDefaultDateRange,
+          syncFormState: true,
+          signal: ac.signal,
+          mergeIntoExisting: false,
+        })
+      } catch (e: unknown) {
+        if (typeof e === 'object' && e !== null && (e as { name?: string }).name === 'AbortError') return
+        setErr(e instanceof Error ? e.message : '请求失败')
+      } finally {
+        setRefreshing(false)
+      }
+    },
+    [endDateInput, fetchNewListingJson, startDateInput, useDefaultDateRange],
   )
 
   useLayoutEffect(() => {
@@ -2936,6 +3046,8 @@ function TrendNewListingEmbeddedPage() {
       skipSync: false,
       writeCache: true,
       jsonViews: 'all',
+      defaultDateRange: true,
+      syncFormState: true,
       signal: ac.signal,
       mergeIntoExisting: false,
     }).catch((e: unknown) => {
@@ -2987,9 +3099,11 @@ function TrendNewListingEmbeddedPage() {
 
       fetchNewListingJson({
         skipSync: false,
-        writeCache: true,
+        writeCache: useDefaultDateRange,
         jsonViews: 'store',
         storeId: sid,
+        startDate: useDefaultDateRange ? null : startDateInput.trim() || null,
+        endDate: useDefaultDateRange ? null : endDateInput.trim() || null,
         signal: prefetchAc.signal,
         mergeIntoExisting: true,
       })
@@ -3045,11 +3159,15 @@ function TrendNewListingEmbeddedPage() {
     payload?.sessionChartStart,
     payload?.sessionChartEnd,
     (payload?.storeIds || []).join(','),
+    endDateInput,
+    startDateInput,
+    useDefaultDateRange,
     fetchNewListingJson,
   ])
 
   useEffect(() => {
     if (storeKey === 'all') {
+      setDisplayStoreKey('all')
       setStoreViewLoading(null)
       return
     }
@@ -3070,9 +3188,11 @@ function TrendNewListingEmbeddedPage() {
     setStoreViewLoading(storeKey)
     fetchNewListingJson({
       skipSync: false,
-      writeCache: true,
+      writeCache: useDefaultDateRange,
       jsonViews: 'store',
       storeId: sid,
+      startDate: useDefaultDateRange ? null : startDateInput.trim() || null,
+      endDate: useDefaultDateRange ? null : endDateInput.trim() || null,
       signal: ac.signal,
       mergeIntoExisting: true,
     })
@@ -3085,16 +3205,19 @@ function TrendNewListingEmbeddedPage() {
         setStoreViewLoading((k) => (k === storeKey ? null : k))
       })
     return () => ac.abort()
-  }, [storeKey, payload?.views, fetchNewListingJson])
+  }, [storeKey, payload?.views, startDateInput, endDateInput, useDefaultDateRange, fetchNewListingJson])
 
   useEffect(() => {
-    if (storeKey !== 'all' && payload?.views?.[storeKey]) {
+    if (storeKey === 'all') {
+      setDisplayStoreKey('all')
+      setStoreViewLoading(null)
+      return
+    }
+    if (payload?.views?.[storeKey]) {
+      setDisplayStoreKey(storeKey)
       setStoreViewLoading(null)
     }
   }, [storeKey, payload?.views])
-
-  const view: TrendNewListingViewPayload | undefined =
-    storeKey === 'all' ? payload?.views?.all : payload?.views?.[storeKey]
 
   useEffect(() => {
     setChartMountReady(false)
@@ -3128,38 +3251,6 @@ function TrendNewListingEmbeddedPage() {
     return (
       <div className="trend-embed-page trend-embed-page--message">
         <p className="trend-embed-loading">正在加载 New Listing 报表…</p>
-      </div>
-    )
-  }
-
-  const storeOptionsEarly = [
-    { value: 'all', label: '全部店铺' },
-    ...(payload.storeIds || []).map((id) => ({ value: String(id), label: `店铺 ${id}` })),
-  ]
-
-  if (storeKey !== 'all' && view == null) {
-    return (
-      <div className="trend-embed-page trend-new-listing-page">
-        <div className="trend-new-listing-toolbar">
-          <label className="trend-new-listing-label" htmlFor="trend-nl-store-w">
-            店铺
-          </label>
-          <select
-            id="trend-nl-store-w"
-            className="trend-new-listing-select"
-            value={storeKey}
-            onChange={(e) => setStoreKey(e.target.value)}
-          >
-            {storeOptionsEarly.map((o) => (
-              <option key={o.value} value={o.value}>
-                {o.label}
-              </option>
-            ))}
-          </select>
-        </div>
-        <p className="trend-embed-loading" style={{ marginTop: '1rem' }}>
-          {storeViewLoading ? `正在加载店铺 ${storeKey} 的图表与明细…` : `准备加载店铺 ${storeKey}…`}
-        </p>
       </div>
     )
   }
@@ -3208,23 +3299,6 @@ function TrendNewListingEmbeddedPage() {
     ],
   }
 
-  const storeOptions = storeOptionsEarly
-
-  const cohortTrackDays = Math.max(1, Number(payload.cohortTrackDays ?? 30))
-  const cohortTable: TrendNlCohortRow[] = Array.isArray(view.cohortTable) ? view.cohortTable : []
-  const latestSessionYmd = useMemo(
-    () => String(view.labels[view.labels.length - 1] ?? payload.sessionChartEnd ?? nlCurrentPstYmd()),
-    [payload.sessionChartEnd, view.labels],
-  )
-  const [hideSmallCohorts, setHideSmallCohorts] = useState(false)
-  const filteredCohortTable = useMemo(
-    () =>
-      hideSmallCohorts
-        ? cohortTable.filter((row) => Number(row?.newAsin ?? 0) >= NL_COHORT_COLLAPSE_NEW_ASIN_THRESHOLD)
-        : cohortTable,
-    [cohortTable, hideSmallCohorts],
-  )
-
   return (
     <div className="trend-embed-page trend-new-listing-page">
       <div className="trend-new-listing-toolbar">
@@ -3244,56 +3318,62 @@ function TrendNewListingEmbeddedPage() {
             </option>
           ))}
         </select>
+        <label className="trend-new-listing-label" htmlFor="trend-nl-start-date">
+          起始日期
+        </label>
+        <input
+          id="trend-nl-start-date"
+          className="trend-new-listing-select trend-new-listing-date-input"
+          type="date"
+          value={startDateInput}
+          disabled={refreshing}
+          max={endDateInput || payload?.sessionChartEnd || undefined}
+          onChange={(e) => {
+            const next = e.target.value
+            setStartDateInput(next)
+            setUseDefaultDateRange(!next && !endDateInput)
+          }}
+        />
+        <label className="trend-new-listing-label" htmlFor="trend-nl-end-date">
+          结束日期
+        </label>
+        <input
+          id="trend-nl-end-date"
+          className="trend-new-listing-select trend-new-listing-date-input"
+          type="date"
+          value={endDateInput}
+          disabled={refreshing}
+          min={startDateInput || undefined}
+          onChange={(e) => {
+            const next = e.target.value
+            setEndDateInput(next)
+            setUseDefaultDateRange(!startDateInput && !next)
+          }}
+        />
         <button
           type="button"
           className="trend-new-listing-refresh-btn"
           disabled={refreshing}
-          onClick={async () => {
-            setRefreshing(true)
-            setErr(null)
-            try {
-              nlShellAbortRef.current?.abort()
-              await fetchNewListingJson({
-                skipSync: false,
-                writeCache: true,
-                jsonViews: 'all',
-                mergeIntoExisting: false,
-              })
-            } catch (e: unknown) {
-              setErr(e instanceof Error ? e.message : '请求失败')
-            } finally {
-              setRefreshing(false)
-            }
-          }}
+          onClick={() => void runNewListingAllViewFetch(false)}
         >
-          {refreshing ? '加载中…' : '重新从服务器加载'}
+          {refreshing ? '加载中…' : '查询'}
         </button>
         <button
           type="button"
           className="trend-new-listing-refresh-btn trend-new-listing-refresh-btn--secondary"
           disabled={refreshing}
-          onClick={async () => {
-            setRefreshing(true)
-            setErr(null)
-            try {
-              nlShellAbortRef.current?.abort()
-              await fetchNewListingJson({
-                skipSync: true,
-                writeCache: true,
-                jsonViews: 'all',
-                mergeIntoExisting: false,
-              })
-            } catch (e: unknown) {
-              setErr(e instanceof Error ? e.message : '请求失败')
-            } finally {
-              setRefreshing(false)
-            }
-          }}
+          onClick={() => void runNewListingAllViewFetch(true)}
         >
           同步 listing 并重载
         </button>
+        {showingFallbackStoreView ? (
+          <span className="trend-new-listing-loading-note">
+            {storeViewLoading ? `正在加载店铺 ${storeKey} 的图表与明细，当前先保留已加载内容…` : `准备加载店铺 ${storeKey}…`}
+          </span>
+        ) : null}
         <span className="trend-new-listing-meta">
-          KPI：open_date &gt; {payload.listingSince}（amazon_listing 全表行）· 每批 {payload.cohortTrackDays ?? 30} 日 · 横轴{' '}
+          查询区间：{payload.sessionChartStart}～{payload.sessionChartEnd} {useDefaultDateRange ? '（默认最近35天）' : '（自定义）'} · KPI：open_date &gt; {payload.listingSince}
+          （amazon_listing 全表行）· 每批 {payload.cohortTrackDays ?? 30} 日 · 横轴{' '}
           {payload.sessionChartStart}～{payload.sessionChartEnd}
           {payload.chartRangeAutoExpanded ? '（已按本地数据扩展区间）' : ''}
           {fromCache ? (
@@ -3318,6 +3398,7 @@ function TrendNewListingEmbeddedPage() {
         </div>
       </div>
       <p className="trend-new-listing-hint">
+        支持按开始日期与结束日期查询；若两个日期都不传，则默认按当前最新 session_date 自动展示最近 35 天数据。
         柱形为各上新批次（open_date）贡献的 sessions 堆叠；黑色折线为每日合计。横坐标仅包含有 session 数据的日期。
         悬停提示中各批次仅显示相对该横轴日最近 {NL_STACK_TOOLTIP_COHORT_LOOKBACK_DAYS} 个日历日内的 open_date，并固定展示当日 sessions 合计。
         全店数据就绪后会在浏览器空闲时用 <code className="trend-new-listing-code">json_views=store</code> 预取各店并写入本地缓存，切换店铺时优先直接用已合并的{' '}

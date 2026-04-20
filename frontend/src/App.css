@@ -207,6 +207,10 @@
   min-width: 160px;
 }
 
+.trend-new-listing-date-input {
+  min-width: 150px;
+}
+
 .trend-new-listing-meta {
   font-size: 0.78rem;
   color: #8b9cb3;
@@ -240,6 +244,12 @@
 
 .trend-new-listing-refresh-btn--secondary:hover:not(:disabled) {
   background: rgba(125, 211, 192, 0.18);
+}
+
+.trend-new-listing-loading-note {
+  font-size: 0.8rem;
+  color: #fbbf24;
+  white-space: nowrap;
 }
 
 .trend-new-listing-kpi {
