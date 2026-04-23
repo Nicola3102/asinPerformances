@@ -521,6 +521,82 @@
   background: rgba(220, 38, 38, 0.28);
 }
 
+/* New Listing cohort：每日 session 格悬停 ASIN 明细（portal 到 body） */
+.trend-nl-day-popover {
+  min-width: 260px;
+  max-width: min(440px, calc(100vw - 24px));
+  max-height: min(340px, 62vh);
+  overflow: auto;
+  padding: 0.65rem 0.75rem 0.55rem;
+  background: #0f172a;
+  border: 1px solid rgba(148, 163, 184, 0.38);
+  border-radius: 10px;
+  box-shadow: 0 14px 44px rgba(0, 0, 0, 0.5);
+  font-size: 0.78rem;
+  color: #e8ecf1;
+  text-align: left;
+  white-space: normal;
+  pointer-events: auto;
+}
+
+.trend-nl-day-popover-head {
+  font-weight: 650;
+  color: #94a3b8;
+  font-size: 0.72rem;
+  margin-bottom: 0.45rem;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.trend-nl-day-popover-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.trend-nl-day-popover-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 0.35rem 0.75rem;
+  align-items: baseline;
+  padding: 0.22rem 0;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+}
+
+.trend-nl-day-popover-row:last-child {
+  border-bottom: none;
+}
+
+.trend-nl-day-popover-asin {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+}
+
+.trend-nl-day-popover-store,
+.trend-nl-day-popover-sessions {
+  font-variant-numeric: tabular-nums;
+  color: #cbd5e1;
+}
+
+.trend-nl-day-popover-sessions {
+  text-align: right;
+  min-width: 3rem;
+}
+
+.trend-nl-day-popover-stale-title {
+  font-weight: 650;
+  color: #fcd34d;
+  margin-bottom: 0.45rem;
+}
+
+.trend-nl-day-popover-stale-hint {
+  margin: 0;
+  line-height: 1.45;
+  color: #94a3b8;
+  font-size: 0.76rem;
+}
+
 .top-nav-menu-link {
   display: block;
   padding: 0.5rem 0.7rem;

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { NavLink, Navigate, Outlet, Route, Routes, useLocation } from 'react-router-dom'
 import {
   listSummaryConsolidatedByWeek,
@@ -92,6 +93,8 @@ interface TrendNewListingViewPayload {
     listingNewCount?: number | null
     listingRefurbishedCount?: number | null
     daySessions: number[]
+    /** 与 daySessions 同索引：该天 sessions>0 的 ASIN 明细 */
+    daySessionAsins?: Array<Array<{ asin: string; storeId: number; sessions: number }>>
   }>
 }
 
@@ -117,7 +120,7 @@ interface TrendNewListingJsonPayload {
 }
 
 /** v4：KPI 与线上 COUNT(*) open_date>since、status='Active' 对账 SQL 一致 */
-const TREND_NEW_LISTING_CACHE_KEY = 'asinPerformances.v6.trendNewListingJson'
+const TREND_NEW_LISTING_CACHE_KEY = 'asinPerformances.v8.trendNewListingJson'
 /** 超过此大小的 JSON 在 Worker 中 parse，减轻主线程卡顿 */
 const TREND_NL_JSON_WORKER_MIN_LEN = 48_000
 
@@ -295,25 +298,97 @@ function nlComputeCohortSessionPerAsin(daySessions: number[], cohortTrackDays: n
   return totalSessions / newAsin
 }
 
-function nlComputeTotalAsinCount(
-  newAsin: number,
-  listingNewCount: number | null | undefined,
-  listingRefurbishedCount: number | null | undefined,
-): number {
-  const newCount = Number(listingNewCount)
-  const refurbCount = Number(listingRefurbishedCount)
-  if (Number.isFinite(newCount) && Number.isFinite(refurbCount)) return newCount + refurbCount
-  return Number.isFinite(newAsin) ? newAsin : 0
+function nlSumCohortDaySessions(daySessions: number[], cohortTrackDays: number): number {
+  let sum = 0
+  for (let i = 0; i < cohortTrackDays; i++) sum += Number(daySessions[i] ?? 0)
+  return sum
+}
+
+type NlDaySessionPopoverAnchor = {
+  left: number
+  top: number
+  items: Array<{ asin: string; storeId: number; sessions: number }>
+  cellTotal: number
+}
+
+/** 固定定位浮动层（替代原生 title：可避免服务端旧缓存 JSON、多行 title 不显示等问题） */
+function NlDaySessionPopoverPortal({
+  anchor,
+  cancelClose,
+  scheduleClose,
+}: {
+  anchor: NlDaySessionPopoverAnchor | null
+  cancelClose: () => void
+  scheduleClose: () => void
+}) {
+  if (anchor == null || typeof document === 'undefined') return null
+  const { left, top, items, cellTotal } = anchor
+  const stale = cellTotal > 0 && items.length === 0
+
+  return createPortal(
+    <div
+      className="trend-nl-day-popover"
+      style={{
+        position: 'fixed',
+        left,
+        top,
+        transform: 'translateX(-50%)',
+        zIndex: 10050,
+      }}
+      role="tooltip"
+      onMouseEnter={cancelClose}
+      onMouseLeave={scheduleClose}
+    >
+      {stale ? (
+        <div className="trend-nl-day-popover-stale">
+          <div className="trend-nl-day-popover-stale-title">
+            当日合计 {cellTotal.toLocaleString('zh-CN')} sessions
+          </div>
+          <p className="trend-nl-day-popover-stale-hint">
+            未返回 ASIN 明细（常见于浏览器或服务端缓存了旧 JSON）。请点击「刷新数据」或 URL 加{' '}
+            <code className="trend-new-listing-code">?refresh=1</code>
+            ，请求加 <code className="trend-new-listing-code">nocache=1</code>。
+          </p>
+        </div>
+      ) : (
+        <>
+          <div className="trend-nl-day-popover-head">ASIN · 店铺 ID · 当日 sessions</div>
+          <div className="trend-nl-day-popover-body">
+            {items.map((x, idx) => (
+              <div key={`${x.asin}-${x.storeId}-${idx}`} className="trend-nl-day-popover-row">
+                <span className="trend-nl-day-popover-asin">{x.asin}</span>
+                <span className="trend-nl-day-popover-store">{x.storeId}</span>
+                <span className="trend-nl-day-popover-sessions">{x.sessions.toLocaleString('zh-CN')}</span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </div>,
+    document.body,
+  )
 }
 
 function TrendNewListingVirtualCohortTable({
   cohortTable,
   cohortTrackDays,
   latestSessionYmd,
+  nlPopoverOpenFromCell,
+  nlPopoverScheduleClose,
+  nlPopoverCancelClose,
+  nlPopoverCloseNow,
 }: {
   cohortTable: TrendNlCohortRow[]
   cohortTrackDays: number
   latestSessionYmd: string
+  nlPopoverOpenFromCell: (
+    e: React.MouseEvent<HTMLTableCellElement>,
+    rawItems: Array<{ asin: string; storeId: number; sessions: number }> | undefined,
+    cellTotal: number,
+  ) => void
+  nlPopoverScheduleClose: () => void
+  nlPopoverCancelClose: () => void
+  nlPopoverCloseNow: () => void
 }) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const [scrollTop, setScrollTop] = useState(0)
@@ -340,14 +415,17 @@ function TrendNewListingVirtualCohortTable({
     <div
       ref={scrollRef}
       className="trend-new-listing-table-scroll"
-      onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+      onScroll={(e) => {
+        nlPopoverCloseNow()
+        setScrollTop(e.currentTarget.scrollTop)
+      }}
     >
       <table className="trend-new-listing-table">
         <thead>
           <tr>
             <th className="is-sticky-col is-sticky-col--1">上新日（PST）</th>
             <th className="is-sticky-col is-sticky-col--2">上新/补录</th>
-            <th className="is-sticky-col is-sticky-col--3">总 ASIN 数</th>
+            <th className="is-sticky-col is-sticky-col--3">总 session 数</th>
             <th>比值</th>
             {Array.from({ length: cohortTrackDays }, (_, i) => (
               <th key={`d${i + 1}`}>{`第${i + 1}天`}</th>
@@ -368,24 +446,37 @@ function TrendNewListingVirtualCohortTable({
             const newAsin = Number(row?.newAsin ?? 0)
             const listingNewCount = row?.listingNewCount
             const listingRefurbishedCount = row?.listingRefurbishedCount
-            const totalAsin = nlComputeTotalAsinCount(newAsin, listingNewCount, listingRefurbishedCount)
             const daySessions: number[] = Array.isArray(row?.daySessions)
               ? row.daySessions.map((x) => Number(x ?? 0))
               : []
+            const totalSessions = nlSumCohortDaySessions(daySessions, cohortTrackDays)
             const sessionPerAsin = nlComputeCohortSessionPerAsin(daySessions, cohortTrackDays, newAsin)
+            const dayAsins = row?.daySessionAsins
             return (
               <tr key={cd || `r-${start}-${end}`}>
                 <td className="is-sticky-col is-sticky-col--1">{cd || '–'}</td>
                 <td className="is-sticky-col is-sticky-col--2">
                   {formatListingMixCell(listingNewCount, listingRefurbishedCount)}
                 </td>
-                <td className="is-sticky-col is-sticky-col--3">{totalAsin.toLocaleString('zh-CN')}</td>
+                <td className="is-sticky-col is-sticky-col--3">{totalSessions.toLocaleString('zh-CN')}</td>
                 <td>{formatPercentUntilVisible(sessionPerAsin, 2, 8)}</td>
                 {Array.from({ length: cohortTrackDays }, (_, i) => {
                   const value = Number(daySessions[i] ?? 0)
                   const highlight = nlShouldHighlightZeroSessionCell(cd, i, value, latestSessionYmd)
                   return (
-                    <td key={`${cd}-s-${i}`} className={highlight ? 'trend-new-listing-zero-alert' : undefined}>
+                    <td
+                      key={`${cd}-s-${i}`}
+                      className={highlight ? 'trend-new-listing-zero-alert' : undefined}
+                      onMouseEnter={(e) => {
+                        nlPopoverCancelClose()
+                        nlPopoverOpenFromCell(
+                          e,
+                          Array.isArray(dayAsins) ? dayAsins[i] : undefined,
+                          value,
+                        )
+                      }}
+                      onMouseLeave={nlPopoverScheduleClose}
+                    >
                       {value.toLocaleString('zh-CN')}
                     </td>
                   )
@@ -2928,6 +3019,56 @@ function TrendNewListingEmbeddedPage() {
   const nlPrefetchRicRef = useRef<number | null>(null)
   const nlPrefetchRicIsNativeRef = useRef(false)
 
+  const [nlDayPopover, setNlDayPopover] = useState<NlDaySessionPopoverAnchor | null>(null)
+  const nlPopTimerRef = useRef<number | null>(null)
+
+  const nlPopoverCancelClose = useCallback(() => {
+    if (nlPopTimerRef.current != null) {
+      window.clearTimeout(nlPopTimerRef.current)
+      nlPopTimerRef.current = null
+    }
+  }, [])
+
+  const nlPopoverScheduleClose = useCallback(() => {
+    nlPopoverCancelClose()
+    nlPopTimerRef.current = window.setTimeout(() => {
+      setNlDayPopover(null)
+      nlPopTimerRef.current = null
+    }, 180)
+  }, [nlPopoverCancelClose])
+
+  const nlPopoverCloseNow = useCallback(() => {
+    nlPopoverCancelClose()
+    setNlDayPopover(null)
+  }, [nlPopoverCancelClose])
+
+  const nlPopoverOpenFromCell = useCallback(
+    (
+      e: React.MouseEvent<HTMLTableCellElement>,
+      rawItems: Array<{ asin: string; storeId: number; sessions: number }> | undefined,
+      cellTotal: number,
+    ) => {
+      nlPopoverCancelClose()
+      const arr = Array.isArray(rawItems) ? rawItems : []
+      if (cellTotal <= 0 && arr.length === 0) {
+        setNlDayPopover(null)
+        return
+      }
+      const r = e.currentTarget.getBoundingClientRect()
+      setNlDayPopover({
+        left: r.left + r.width / 2,
+        top: r.bottom + 8,
+        items: arr,
+        cellTotal,
+      })
+    },
+    [nlPopoverCancelClose],
+  )
+
+  useEffect(() => {
+    return () => nlPopoverCancelClose()
+  }, [nlPopoverCancelClose])
+
   nlPayloadRef.current = payload
 
   const storeOptionsEarly = useMemo(
@@ -3572,15 +3713,19 @@ function TrendNewListingEmbeddedPage() {
             cohortTable={filteredCohortTable}
             cohortTrackDays={cohortTrackDays}
             latestSessionYmd={latestSessionYmd}
+            nlPopoverOpenFromCell={nlPopoverOpenFromCell}
+            nlPopoverScheduleClose={nlPopoverScheduleClose}
+            nlPopoverCancelClose={nlPopoverCancelClose}
+            nlPopoverCloseNow={nlPopoverCloseNow}
           />
         ) : (
-          <div className="trend-new-listing-table-scroll">
+          <div className="trend-new-listing-table-scroll" onScroll={nlPopoverCloseNow}>
             <table className="trend-new-listing-table">
               <thead>
                 <tr>
                   <th className="is-sticky-col is-sticky-col--1">上新日（PST）</th>
                   <th className="is-sticky-col is-sticky-col--2">上新/补录</th>
-                  <th className="is-sticky-col is-sticky-col--3">总 ASIN 数</th>
+                  <th className="is-sticky-col is-sticky-col--3">总 session 数</th>
                   <th>比值</th>
                   {Array.from({ length: cohortTrackDays }, (_, i) => (
                     <th key={`d${i + 1}`}>{`第${i + 1}天`}</th>
@@ -3588,29 +3733,42 @@ function TrendNewListingEmbeddedPage() {
                 </tr>
               </thead>
               <tbody>
-                {filteredCohortTable.map((row: any) => {
+                {filteredCohortTable.map((row: TrendNlCohortRow) => {
                   const cd = String(row?.cohortDate ?? '')
                   const newAsin = Number(row?.newAsin ?? 0)
                   const listingNewCount = row?.listingNewCount
                   const listingRefurbishedCount = row?.listingRefurbishedCount
-                  const totalAsin = nlComputeTotalAsinCount(newAsin, listingNewCount, listingRefurbishedCount)
                   const daySessions: number[] = Array.isArray(row?.daySessions)
-                    ? row.daySessions.map((x: any) => Number(x ?? 0))
+                    ? row.daySessions.map((x) => Number(x ?? 0))
                     : []
+                  const totalSessions = nlSumCohortDaySessions(daySessions, cohortTrackDays)
                   const sessionPerAsin = nlComputeCohortSessionPerAsin(daySessions, cohortTrackDays, newAsin)
+                  const dayAsins = row?.daySessionAsins
                   return (
                     <tr key={cd || 'row'}>
                       <td className="is-sticky-col is-sticky-col--1">{cd || '–'}</td>
                       <td className="is-sticky-col is-sticky-col--2">
                         {formatListingMixCell(listingNewCount, listingRefurbishedCount)}
                       </td>
-                      <td className="is-sticky-col is-sticky-col--3">{totalAsin.toLocaleString('zh-CN')}</td>
+                      <td className="is-sticky-col is-sticky-col--3">{totalSessions.toLocaleString('zh-CN')}</td>
                       <td>{formatPercentUntilVisible(sessionPerAsin, 2, 8)}</td>
                       {Array.from({ length: cohortTrackDays }, (_, i) => {
                         const value = Number(daySessions[i] ?? 0)
                         const highlight = nlShouldHighlightZeroSessionCell(cd, i, value, latestSessionYmd)
                         return (
-                          <td key={`${cd}-s-${i}`} className={highlight ? 'trend-new-listing-zero-alert' : undefined}>
+                          <td
+                            key={`${cd}-s-${i}`}
+                            className={highlight ? 'trend-new-listing-zero-alert' : undefined}
+                            onMouseEnter={(e) => {
+                              nlPopoverCancelClose()
+                              nlPopoverOpenFromCell(
+                                e,
+                                Array.isArray(dayAsins) ? dayAsins[i] : undefined,
+                                value,
+                              )
+                            }}
+                            onMouseLeave={nlPopoverScheduleClose}
+                          >
                             {value.toLocaleString('zh-CN')}
                           </td>
                         )
@@ -3623,6 +3781,11 @@ function TrendNewListingEmbeddedPage() {
           </div>
         )}
       </div>
+      <NlDaySessionPopoverPortal
+        anchor={nlDayPopover}
+        cancelClose={nlPopoverCancelClose}
+        scheduleClose={nlPopoverScheduleClose}
+      />
     </div>
   )
 }
@@ -4586,7 +4749,14 @@ function AdSalesPage() {
   return (
     <div className="app">
       <h1>Ad-Sales</h1>
-      <p className="monitor-desc">从本地 <code>daily_ad_cost_sales</code> 查询广告指标；广告 ASIN 销售额额外通过 <code>order_item</code> 按 <code>store_id + asin + purchase_utc_date</code> 聚合。下方表格仅显示当前店铺/日期下 <code>purchases &gt; 0</code> 的 ad_asin。</p>
+      <p className="monitor-desc">
+        从本地 <code>daily_ad_cost_sales</code> 查询点击/曝光/花费等指标；汇总卡片中的「广告 ASIN 总销售额」与「广告订单」来自线上{' '}
+        <code>order_item</code> INNER JOIN <code>amazon_ads_ad_group_ad</code>（按 PST 日历日过滤），销售额为 DISTINCT 行上{' '}
+        <code>item_price_amount * quantity_ordered</code> 之和，广告订单为上述 DISTINCT 行数。下方表格仅显示当前店铺/日期下 <code>
+          purchases &gt; 0
+        </code>{' '}
+        的 ad_asin。
+      </p>
 
       <div className="monitor-controls" style={{ alignItems: 'flex-end' }}>
         <label>

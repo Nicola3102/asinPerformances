@@ -133,90 +133,96 @@ def _fetch_order_item_ad_asin_sales(
     store_id: int | None,
     sd: date | None,
     ed: date | None,
-) -> tuple[float, dict[str, float]]:
+) -> tuple[float, dict[str, float], int | None]:
+    """
+    广告 ASIN 销售额 / 广告订单（条数）：online order_item × amazon_ads_ad_group_ad。
+    - 销售额：DISTINCT 行上 (item_price_amount * quantity_ordered) 之和；
+    - 广告订单：上述 DISTINCT 结果行数。
+    与本地 daily_ad_cost_sales 是否已有广告行无关。
+    """
+    del db  # 口径仅依赖线上库；保留参数以兼容调用方
     if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
-        return 0.0, {}
+        return 0.0, {}, None
 
-    ads_q = db.query(
-        DailyAdCostSales.purchase_date,
-        DailyAdCostSales.store_id,
-        func.trim(DailyAdCostSales.ad_asin),
-    ).filter(
-        DailyAdCostSales.purchase_date.is_not(None),
-        DailyAdCostSales.store_id.is_not(None),
-        DailyAdCostSales.ad_asin.is_not(None),
-        func.trim(DailyAdCostSales.ad_asin) != "",
-    )
-    if store_id is not None:
-        ads_q = ads_q.filter(DailyAdCostSales.store_id == int(store_id))
-    if sd is not None and ed is not None:
-        ads_q = ads_q.filter(
-            DailyAdCostSales.purchase_date >= sd,
-            DailyAdCostSales.purchase_date <= ed,
-        )
-
-    ad_asin_keys: set[tuple[int, str]] = set()
-    for _d, sid, asin in ads_q.distinct().all():
-        if sid is None:
-            continue
-        asin_key = str(asin or "").strip()
-        if not asin_key:
-            continue
-        ad_asin_keys.add((int(sid), asin_key))
-    if not ad_asin_keys:
-        return 0.0, {}
-
-    params: dict[str, object] = {}
     purchase_day_sql = _order_item_purchase_date_sql("oi")
-    report_max_day = _fetch_ads_report_max_current_date()
+    line_total_sql = "(COALESCE(oi.item_price_amount, 0) * COALESCE(oi.quantity_ordered, 0))"
+
     where_parts = [
         "oi.order_status != 'Canceled'",
+        "COALESCE(oi.is_cancel, 0) = 0",
         "oi.purchase_utc_date IS NOT NULL",
         "oi.asin IS NOT NULL",
         "TRIM(oi.asin) <> ''",
     ]
+    params: dict[str, object] = {}
     if store_id is not None:
         where_parts.append("oi.store_id = :store_id")
         params["store_id"] = int(store_id)
     if sd is not None and ed is not None:
-        effective_ed = min(ed, report_max_day) if report_max_day is not None else ed
-        if sd > effective_ed:
-            return 0.0, {}
         where_parts.append(f"{purchase_day_sql} BETWEEN :sd AND :ed")
         params["sd"] = sd
-        params["ed"] = effective_ed
-    elif report_max_day is not None:
-        where_parts.append(f"{purchase_day_sql} <= :report_max_day")
-        params["report_max_day"] = report_max_day
+        params["ed"] = ed
+    else:
+        report_max_day = _fetch_ads_report_max_current_date()
+        if report_max_day is not None:
+            where_parts.append(f"{purchase_day_sql} <= :report_max_day")
+            params["report_max_day"] = report_max_day
 
-    online_sql = text(
+    where_sql = " AND ".join(where_parts)
+    inner_from = f"""
+        FROM amazon_ads_ad_group_ad aaag
+        INNER JOIN order_item oi ON oi.asin = aaag.asin AND oi.store_id = aaag.store_id
+        WHERE {where_sql}
+    """
+
+    summary_sql = text(
         f"""
-        SELECT {purchase_day_sql} AS d,
-               oi.store_id AS sid,
-               TRIM(oi.asin) AS asin,
-               SUM(COALESCE(oi.total_amount, 0)) AS amt
-        FROM order_item oi
-        WHERE {' AND '.join(where_parts)}
-        GROUP BY {purchase_day_sql}, oi.store_id, TRIM(oi.asin)
-        ORDER BY {purchase_day_sql} ASC
+        SELECT COUNT(*) AS cnt, COALESCE(SUM(x.line_total), 0) AS total_amt
+        FROM (
+            SELECT DISTINCT
+                oi.order_id,
+                oi.asin,
+                oi.item_price_amount,
+                oi.quantity_ordered,
+                {line_total_sql} AS line_total
+            {inner_from}
+        ) AS x
         """
     )
+    daily_sql = text(
+        f"""
+        SELECT x.d AS d, COALESCE(SUM(x.line_total), 0) AS day_amt
+        FROM (
+            SELECT DISTINCT
+                oi.order_id,
+                oi.asin,
+                oi.item_price_amount,
+                oi.quantity_ordered,
+                {line_total_sql} AS line_total,
+                {purchase_day_sql} AS d
+            {inner_from}
+        ) AS x
+        GROUP BY x.d
+        ORDER BY x.d ASC
+        """
+    )
+
     with get_online_reporting_engine().connect() as conn:
-        rows = conn.execute(online_sql, params).fetchall()
+        sum_row = conn.execute(summary_sql, params).fetchone()
+        daily_rows = conn.execute(daily_sql, params).fetchall()
+
+    row_cnt = int(sum_row[0] or 0) if sum_row else 0
+    total = _num_to_float(sum_row[1] if sum_row else 0)
 
     by_day: dict[str, float] = {}
-    total = 0.0
-    for d, sid, asin, amt in rows:
-        if d is None or sid is None:
+    for r in daily_rows:
+        d, amt = r[0], r[1]
+        if d is None:
             continue
         key = d.isoformat() if hasattr(d, "isoformat") else str(d)[:10]
-        asin_key = str(asin or "").strip()
-        if (int(sid), asin_key) not in ad_asin_keys:
-            continue
-        val = _num_to_float(amt)
-        by_day[key] = _num_to_float(by_day.get(key, 0.0)) + val
-        total += val
-    return total, by_day
+        by_day[key] = _num_to_float(amt)
+
+    return total, by_day, row_cnt
 
 
 @router.get("/ad-sales")
@@ -275,12 +281,15 @@ def list_ad_sales(
     total_ad_cost = _num_to_float(summary_row[2] if summary_row else 0)
     total_sales_1d = _num_to_float(summary_row[3] if summary_row else 0)
     total_purchases = int(summary_row[4] or 0) if summary_row else 0
-    total_order_item_sales, order_item_sales_by_day = _fetch_order_item_ad_asin_sales(
+    total_order_item_sales, order_item_sales_by_day, ad_order_count = _fetch_order_item_ad_asin_sales(
         db,
         store_id=store_id,
         sd=sd,
         ed=ed,
     )
+    summary_purchases = int(total_purchases)
+    if ad_order_count is not None:
+        summary_purchases = int(ad_order_count)
     summary = {
         "clicks": total_clicks,
         "impressions": total_impressions,
@@ -291,8 +300,8 @@ def list_ad_sales(
         "ad_asin_count": int(total_ad_asin_count),
         "cpc": (total_ad_cost / total_clicks) if total_clicks > 0 else 0.0,
         "acos": (total_ad_cost / total_sales_1d * 100.0) if total_sales_1d > 0 else 0.0,
-        "cvr": (total_purchases / total_clicks * 100.0) if total_clicks > 0 else 0.0,
-        "purchases": total_purchases,
+        "cvr": (summary_purchases / total_clicks * 100.0) if total_clicks > 0 else 0.0,
+        "purchases": summary_purchases,
     }
 
     daily_rows = (

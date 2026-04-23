@@ -135,7 +135,8 @@ _new_listing_sync_report_lock = threading.Lock()
 # format=json 短 TTL 内存缓存（按日期参数 + 是否跳过同步）；本地表变化后最多滞后 TTL
 _new_listing_json_cache_lock = threading.Lock()
 _new_listing_json_cache: "OrderedDict[tuple, tuple[float, dict]]" = OrderedDict()
-_NEW_LISTING_JSON_CACHE_SCHEMA = "cohort-lookback-v1"
+# bump when cohort JSON shape changes (e.g. views.*.cohortTable[].daySessionAsins)
+_NEW_LISTING_JSON_CACHE_SCHEMA = "cohort-day-session-asins-v2-online-bd"
 
 
 def _new_listing_json_cache_get(key: tuple) -> dict | None:

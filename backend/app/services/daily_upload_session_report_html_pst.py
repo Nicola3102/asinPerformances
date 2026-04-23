@@ -34,7 +34,7 @@ import logging
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 import threading
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -453,6 +453,114 @@ def _fetch_matrix_rows_online(
             continue
         mat[(sd, cd)] = int(r[2] or 0)
     return mat
+
+
+def _cohort_day_asin_breakdown_online(
+    conn: Connection,
+    store_id: int | None,
+    cohort_dates: list[date],
+    *,
+    traffic_d0: date,
+    traffic_d1: date,
+    open_date_start: date | None,
+    open_date_end: date | None,
+) -> dict[tuple[date, date], list[dict]]:
+    """
+    与 ``_fetch_matrix_rows_online`` 同源（listing×variation 定批次 + traffic_daily 取 session）。
+    cohort 表每日合计若来自线上矩阵，悬停明细必须走此函数；否则本地 ``daily_upload_asin_dates``
+    与线上 traffic 不一致会导致「格子合计 ≠ 明细之和」。
+    """
+    if not cohort_dates:
+        return {}
+    uniq = sorted({d for d in cohort_dates if d is not None})
+    if not uniq:
+        return {}
+    ph = ", ".join([f":cd{i}" for i in range(len(uniq))])
+    params: dict[str, object] = {
+        f"cd{i}": uniq[i] for i in range(len(uniq))
+    }
+    params["d0"] = traffic_d0
+    params["d1x"] = traffic_d1 + timedelta(days=1)
+    nd = max(0, COHORT_TRACK_DAYS - 1)
+    extra_nl = ""
+    if store_id is not None:
+        extra_nl += " AND al.store_id = :sid"
+        params["sid"] = int(store_id)
+    if open_date_start is not None:
+        extra_nl += " AND al.open_date >= :od0"
+        params["od0"] = open_date_start
+    if open_date_end is not None:
+        extra_nl += " AND al.open_date < :od1x"
+        params["od1x"] = open_date_end + timedelta(days=1)
+    q = text(
+        f"""
+        SELECT nl.open_day AS cd,
+               td.session_day AS sd,
+               TRIM(nl.asin) AS asin_b,
+               nl.store_id AS sid_raw,
+               SUM(td.sessions) AS s
+        FROM (
+            SELECT DISTINCT
+                   TRIM(al.asin) AS asin,
+                   al.store_id,
+                   DATE(al.open_date) AS open_day
+            FROM amazon_listing al
+            INNER JOIN amazon_variation av
+                ON av.id = al.variation_id
+            WHERE al.asin IS NOT NULL
+              AND TRIM(al.asin) <> ''
+              AND al.store_id IS NOT NULL
+              AND al.created_at IS NOT NULL
+              AND al.open_date IS NOT NULL
+              AND av.created_at IS NOT NULL
+              AND DATE(al.created_at) = DATE(av.created_at)
+              AND DATE(al.open_date) IN ({ph})
+              {extra_nl}
+        ) AS nl
+        INNER JOIN (
+            SELECT d.asin,
+                   d.store_id,
+                   DATE(d.`current_date`) AS session_day,
+                   SUM(COALESCE(d.sessions, 0)) AS sessions
+            FROM amazon_sales_and_traffic_daily AS d
+            WHERE d.`current_date` >= :d0
+              AND d.`current_date` < :d1x
+            GROUP BY d.asin, d.store_id, DATE(d.`current_date`)
+        ) AS td
+            ON td.asin = nl.asin AND td.store_id = nl.store_id
+        WHERE td.session_day >= nl.open_day
+          AND td.session_day <= DATE_ADD(nl.open_day, INTERVAL {nd} DAY)
+        GROUP BY nl.open_day, td.session_day, nl.asin, nl.store_id
+        HAVING SUM(td.sessions) > 0
+        """
+    )
+    rows = conn.execute(q, params).fetchall()
+    merged: dict[tuple[date, date], list[dict]] = {}
+    for r in rows:
+        try:
+            cd = _as_calendar_date(r[0])
+            sd = _as_calendar_date(r[1])
+        except (TypeError, ValueError):
+            continue
+        asin_key = str(r[2] or "").strip()
+        if not asin_key:
+            continue
+        try:
+            sid = int(r[3])
+        except (TypeError, ValueError):
+            continue
+        s = int(r[4] or 0)
+        if s <= 0:
+            continue
+        pair = (cd, sd)
+        if pair not in merged:
+            merged[pair] = []
+        merged[pair].append({"asin": asin_key, "storeId": sid, "sessions": s})
+    out: dict[tuple[date, date], list[dict]] = {}
+    for pair, lst in merged.items():
+        lst.sort(key=lambda x: (-int(x["sessions"]), x["asin"], x["storeId"]))
+        out[pair] = lst
+    return out
 
 
 def _fetch_matrix_rows_online_bulk(
@@ -1138,6 +1246,118 @@ def _sum_sessions_by_cohorts_local_batch(
     return out
 
 
+def _cohort_day_asin_breakdown_batch(
+    db: Session,
+    store_id: int | None,
+    cohort_dates: list[date],
+    *,
+    valid_listing_keys: set[NewListingKey] | None = None,
+) -> dict[tuple[date, date], list[dict]]:
+    """
+    (cohort open_date, session_date) → 当日 sessions>0 的 ASIN 明细（asin + store_id + sessions），
+    按 sessions 降序；同一 ASIN+store 合并多条 listing 粒度行。
+    """
+    if not cohort_dates:
+        return {}
+    uniq = sorted({d for d in cohort_dates if d is not None})
+    if not uniq:
+        return {}
+    ph = ", ".join([f":cd{i}" for i in range(len(uniq))])
+    params: dict = {f"cd{i}": uniq[i] for i in range(len(uniq))}
+    nd = max(0, COHORT_TRACK_DAYS - 1)
+    extra = " AND store_id = :sid" if store_id is not None else ""
+    if store_id is not None:
+        params["sid"] = store_id
+
+    merged: dict[tuple[date, date], dict[tuple[str, int], int]] = defaultdict(
+        lambda: defaultdict(int)
+    )
+
+    if valid_listing_keys is not None:
+        q = text(
+            f"""
+            SELECT asin, COALESCE(pid, 0) AS pid_key, store_id, created_at, open_date AS cd,
+                   session_date AS sd, SUM(COALESCE(sessions, 0)) AS s
+            FROM {TABLE}
+            WHERE open_date IS NOT NULL
+              AND created_at IS NOT NULL
+              AND open_date IN ({ph})
+              AND session_date >= open_date
+              AND session_date <= DATE_ADD(open_date, INTERVAL {nd} DAY)
+              {extra}
+            GROUP BY asin, COALESCE(pid, 0), store_id, created_at, open_date, session_date
+            """
+        )
+        rows = db.execute(q, params).fetchall()
+        for r in rows:
+            lk = _local_listing_key(r[0], r[1], r[2], r[3], r[4])
+            if lk is None or lk not in valid_listing_keys:
+                continue
+            try:
+                cd = _as_calendar_date(r[4])
+                sd = _as_calendar_date(r[5])
+            except (ValueError, TypeError):
+                continue
+            asin_key = str(r[0] or "").strip()
+            if not asin_key:
+                continue
+            try:
+                sid = int(r[2])
+            except (TypeError, ValueError):
+                continue
+            s = int(r[6] or 0)
+            if s <= 0:
+                continue
+            merged[(cd, sd)][(asin_key, sid)] += s
+    else:
+        q = text(
+            f"""
+            SELECT TRIM(asin) AS asin_b, store_id, open_date AS cd, session_date AS sd,
+                   SUM(COALESCE(sessions, 0)) AS s
+            FROM {TABLE}
+            WHERE open_date IS NOT NULL
+              AND asin IS NOT NULL
+              AND TRIM(asin) <> ''
+              AND store_id IS NOT NULL
+              AND open_date IN ({ph})
+              AND session_date >= open_date
+              AND session_date <= DATE_ADD(open_date, INTERVAL {nd} DAY)
+              {extra}
+            GROUP BY TRIM(asin), store_id, open_date, session_date
+            HAVING SUM(COALESCE(sessions, 0)) > 0
+            """
+        )
+        rows = db.execute(q, params).fetchall()
+        for r in rows:
+            try:
+                cd = _as_calendar_date(r[2])
+                sd = _as_calendar_date(r[3])
+            except (ValueError, TypeError):
+                continue
+            asin_key = str(r[0] or "").strip()
+            if not asin_key:
+                continue
+            try:
+                sid = int(r[1])
+            except (TypeError, ValueError):
+                continue
+            s = int(r[4] or 0)
+            if s <= 0:
+                continue
+            merged[(cd, sd)][(asin_key, sid)] += s
+
+    out: dict[tuple[date, date], list[dict]] = {}
+    for pair, amap in merged.items():
+        items = [
+            {"asin": a, "storeId": sid, "sessions": int(t)}
+            for (a, sid), t in amap.items()
+            if int(t or 0) > 0
+        ]
+        items.sort(key=lambda x: (-int(x["sessions"]), x["asin"], x["storeId"]))
+        out[pair] = items
+    return out
+
+
 def _fetch_local_session_bounds(db: Session) -> tuple[date | None, date | None]:
     row = db.execute(
         text(f"SELECT MIN(session_date), MAX(session_date) FROM {TABLE}")
@@ -1186,6 +1406,9 @@ def _build_cohort_table_rows(
     prefetched_mix_by_day: dict[date, dict[str, int]] | None = None,
     prefetched_session_mat_raw: dict[tuple[date, date], int] | None = None,
     valid_listing_keys: set[NewListingKey] | None = None,
+    asin_breakdown_online_conn: Connection | None = None,
+    matrix_session_start: date | None = None,
+    matrix_session_end: date | None = None,
 ) -> list[dict]:
     """
     一行 = 一个上新日：优先 amazon_listing 当日「纯上新」ASIN 数；
@@ -1218,14 +1441,35 @@ def _build_cohort_table_rows(
             valid_listing_keys=valid_listing_keys,
         )
 
+    if (
+        asin_breakdown_online_conn is not None
+        and matrix_session_start is not None
+        and matrix_session_end is not None
+    ):
+        breakdown_by_pair = _cohort_day_asin_breakdown_online(
+            asin_breakdown_online_conn,
+            store_id,
+            cohort_dates,
+            traffic_d0=matrix_session_start,
+            traffic_d1=matrix_session_end,
+            open_date_start=listing_since,
+            open_date_end=listing_through,
+        )
+    else:
+        breakdown_by_pair = _cohort_day_asin_breakdown_batch(
+            db, store_id, cohort_dates, valid_listing_keys=valid_listing_keys
+        )
+
     rows: list[dict] = []
     for cd in cohort_dates:
         n_new = int(new_by_day[cd])
         mix = mix_by_day.get(cd, {})
         day_sessions: list[int] = []
+        day_session_asins: list[list[dict]] = []
         for k in range(COHORT_TRACK_DAYS):
             sd = cd + timedelta(days=k)
             day_sessions.append(int(batch_sess.get((cd, sd), 0)))
+            day_session_asins.append(breakdown_by_pair.get((cd, sd), []))
         rows.append(
             {
                 "cohortDate": cd.isoformat(),
@@ -1233,6 +1477,7 @@ def _build_cohort_table_rows(
                 "listingNewCount": int(mix.get("new", 0)) if mix else None,
                 "listingRefurbishedCount": int(mix.get("refurbished", 0)) if mix else None,
                 "daySessions": day_sessions,
+                "daySessionAsins": day_session_asins,
             }
         )
     return rows
@@ -1751,6 +1996,9 @@ def build_report_payload(
                     mat_all_raw, mat_by_store_raw = table_mat_all_raw, table_mat_by_store_raw
             _t("phase.local_matrix_filter_new_only", t_phase)
 
+        # cohort 表格子若走线上矩阵，悬停 ASIN 明细必须与同一数据源（见 _cohort_day_asin_breakdown_online）
+        asin_bd_online = listing_conn if use_amazon_listing and listing_conn is not None else None
+
         views: dict[str, dict] = {}
         if json_views_mode == "store" and single_store_id is not None:
             sid = single_store_id
@@ -1767,6 +2015,9 @@ def build_report_payload(
                 prefetched_mix_by_day=listing_mix_cohort_by.get(sid),
                 prefetched_session_mat_raw=mat_one,
                 valid_listing_keys=valid_new_keys_by.get(sid),
+                asin_breakdown_online_conn=asin_bd_online,
+                matrix_session_start=matrix_session_start,
+                matrix_session_end=matrix_session_end,
             )
             _t("phase.cohort_single_store", t_phase)
             t_phase2 = time.perf_counter()
@@ -1806,6 +2057,9 @@ def build_report_payload(
                 prefetched_mix_by_day=listing_mix_cohort_by.get(None),
                 prefetched_session_mat_raw=mat_all_raw,
                 valid_listing_keys=valid_new_keys_by.get(None),
+                asin_breakdown_online_conn=asin_bd_online,
+                matrix_session_start=matrix_session_start,
+                matrix_session_end=matrix_session_end,
             )
             _t("phase.cohort_all", t_phase)
             t_phase_va = time.perf_counter()
@@ -1848,6 +2102,9 @@ def build_report_payload(
                         prefetched_mix_by_day=listing_mix_cohort_by.get(sid),
                         prefetched_session_mat_raw=mat_s if mat_s is not None else {},
                         valid_listing_keys=valid_new_keys_by.get(sid),
+                        asin_breakdown_online_conn=asin_bd_online,
+                        matrix_session_start=matrix_session_start,
+                        matrix_session_end=matrix_session_end,
                     )
                     if profile:
                         timings.setdefault("phase.cohort_per_store_total", 0.0)
