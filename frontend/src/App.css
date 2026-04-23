@@ -275,6 +275,7 @@
 }
 
 .trend-new-listing-kpi-card strong {
+  display: block;
   font-size: 1.35rem;
   font-weight: 600;
   color: #7dd3c0;
@@ -489,6 +490,14 @@
 .trend-new-listing-table th.is-sticky-col--2,
 .trend-new-listing-table td.is-sticky-col--2 {
   left: 150px;
+  z-index: 3;
+  min-width: 140px;
+  text-align: left;
+}
+
+.trend-new-listing-table th.is-sticky-col--3,
+.trend-new-listing-table td.is-sticky-col--3 {
+  left: 290px;
   z-index: 3;
   text-align: right;
 }

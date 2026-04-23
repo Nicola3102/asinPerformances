@@ -461,6 +461,18 @@ export type AdSalesListResponse = {
   total: number;
   summary: AdSalesSummary;
   daily_series: AdSalesDailyPoint[];
+  sync_info?: {
+    mode?: string;
+    rows_upsert?: number;
+    skipped?: boolean;
+    reason?: string;
+    gap_days?: string[];
+  };
+}
+
+export type AdSalesEnsureLatestResponse = {
+  status: string;
+  message?: string;
 }
 
 export type AdsProfitSummary = {
@@ -508,6 +520,7 @@ export async function listAdSales(params: {
   store_id?: number | null;
   start_date?: string | null;
   end_date?: string | null;
+  ensure_latest?: boolean;
   sort?: string | null;
   page?: number;
   page_size?: number;
@@ -516,6 +529,7 @@ export async function listAdSales(params: {
   if (params.store_id != null && !Number.isNaN(Number(params.store_id))) qs.set('store_id', String(params.store_id))
   if (params.start_date) qs.set('start_date', params.start_date)
   if (params.end_date) qs.set('end_date', params.end_date)
+  if (params.ensure_latest) qs.set('ensure_latest', '1')
   if (params.sort) qs.set('sort', params.sort)
   if (params.page != null) qs.set('page', String(params.page))
   if (params.page_size != null) qs.set('page_size', String(params.page_size))
@@ -523,6 +537,15 @@ export async function listAdSales(params: {
   if (!res.ok) {
     const text = await res.text()
     throw buildApiError(text, res.status, 'Failed to fetch ad-sales')
+  }
+  return res.json()
+}
+
+export async function triggerAdSalesEnsureLatest(): Promise<AdSalesEnsureLatestResponse> {
+  const res = await fetch(`${API_BASE}/ads/ad-sales/ensure-latest`, { method: 'POST' })
+  if (!res.ok) {
+    const text = await res.text()
+    throw buildApiError(text, res.status, 'Failed to trigger ad-sales ensure-latest')
   }
   return res.json()
 }

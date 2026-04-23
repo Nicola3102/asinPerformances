@@ -22,6 +22,7 @@ import {
   getMonitorTrack,
   getTrendData,
   listAdSales,
+  triggerAdSalesEnsureLatest,
   downloadAdSales,
   getAdsProfit,
   type SummaryRowConsolidated,
@@ -77,9 +78,21 @@ interface TrendNewListingViewPayload {
     yAxisID?: string
   }>
   lineTotal?: number[]
-  kpi: { totalAsin: number; activeAsin: number; listingSince: string }
+  kpi: {
+    totalAsin: number
+    activeAsin: number
+    listingSince: string
+    listingNewCount?: number | null
+    listingRefurbishedCount?: number | null
+  }
   /** 表格：每批上新(open_date)的上新数 + 上新后每天 sessions（第 1..N 天） */
-  cohortTable?: Array<{ cohortDate: string; newAsin: number; daySessions: number[] }>
+  cohortTable?: Array<{
+    cohortDate: string
+    newAsin: number
+    listingNewCount?: number | null
+    listingRefurbishedCount?: number | null
+    daySessions: number[]
+  }>
 }
 
 interface TrendNewListingJsonPayload {
@@ -104,7 +117,7 @@ interface TrendNewListingJsonPayload {
 }
 
 /** v4：KPI 与线上 COUNT(*) open_date>since、status='Active' 对账 SQL 一致 */
-const TREND_NEW_LISTING_CACHE_KEY = 'asinPerformances.v5.trendNewListingJson'
+const TREND_NEW_LISTING_CACHE_KEY = 'asinPerformances.v6.trendNewListingJson'
 /** 超过此大小的 JSON 在 Worker 中 parse，减轻主线程卡顿 */
 const TREND_NL_JSON_WORKER_MIN_LEN = 48_000
 
@@ -273,6 +286,26 @@ const NL_COHORT_ROW_HEIGHT_PX = 34
 
 type TrendNlCohortRow = NonNullable<TrendNewListingViewPayload['cohortTable']>[number]
 
+function nlComputeCohortSessionPerAsin(daySessions: number[], cohortTrackDays: number, newAsin: number): number {
+  if (!Number.isFinite(newAsin) || newAsin <= 0 || !Number.isFinite(cohortTrackDays) || cohortTrackDays <= 0) return 0
+  const totalSessions = Array.from({ length: cohortTrackDays }, (_, i) => Number(daySessions[i] ?? 0)).reduce(
+    (acc, value) => acc + value,
+    0,
+  )
+  return totalSessions / newAsin
+}
+
+function nlComputeTotalAsinCount(
+  newAsin: number,
+  listingNewCount: number | null | undefined,
+  listingRefurbishedCount: number | null | undefined,
+): number {
+  const newCount = Number(listingNewCount)
+  const refurbCount = Number(listingRefurbishedCount)
+  if (Number.isFinite(newCount) && Number.isFinite(refurbCount)) return newCount + refurbCount
+  return Number.isFinite(newAsin) ? newAsin : 0
+}
+
 function TrendNewListingVirtualCohortTable({
   cohortTable,
   cohortTrackDays,
@@ -313,7 +346,9 @@ function TrendNewListingVirtualCohortTable({
         <thead>
           <tr>
             <th className="is-sticky-col is-sticky-col--1">上新日（PST）</th>
-            <th className="is-sticky-col is-sticky-col--2">上新 ASIN 数</th>
+            <th className="is-sticky-col is-sticky-col--2">上新/补录</th>
+            <th className="is-sticky-col is-sticky-col--3">总 ASIN 数</th>
+            <th>比值</th>
             {Array.from({ length: cohortTrackDays }, (_, i) => (
               <th key={`d${i + 1}`}>{`第${i + 1}天`}</th>
             ))}
@@ -323,7 +358,7 @@ function TrendNewListingVirtualCohortTable({
           {topPad > 0 ? (
             <tr className="trend-nl-vpad" aria-hidden>
               <td
-                colSpan={2 + cohortTrackDays}
+                colSpan={4 + cohortTrackDays}
                 style={{ height: topPad, padding: 0, border: 'none', background: 'transparent' }}
               />
             </tr>
@@ -331,13 +366,21 @@ function TrendNewListingVirtualCohortTable({
           {cohortTable.slice(start, end).map((row) => {
             const cd = String(row?.cohortDate ?? '')
             const newAsin = Number(row?.newAsin ?? 0)
+            const listingNewCount = row?.listingNewCount
+            const listingRefurbishedCount = row?.listingRefurbishedCount
+            const totalAsin = nlComputeTotalAsinCount(newAsin, listingNewCount, listingRefurbishedCount)
             const daySessions: number[] = Array.isArray(row?.daySessions)
               ? row.daySessions.map((x) => Number(x ?? 0))
               : []
+            const sessionPerAsin = nlComputeCohortSessionPerAsin(daySessions, cohortTrackDays, newAsin)
             return (
               <tr key={cd || `r-${start}-${end}`}>
                 <td className="is-sticky-col is-sticky-col--1">{cd || '–'}</td>
-                <td className="is-sticky-col is-sticky-col--2">{newAsin.toLocaleString('zh-CN')}</td>
+                <td className="is-sticky-col is-sticky-col--2">
+                  {formatListingMixCell(listingNewCount, listingRefurbishedCount)}
+                </td>
+                <td className="is-sticky-col is-sticky-col--3">{totalAsin.toLocaleString('zh-CN')}</td>
+                <td>{formatPercentUntilVisible(sessionPerAsin, 2, 8)}</td>
                 {Array.from({ length: cohortTrackDays }, (_, i) => {
                   const value = Number(daySessions[i] ?? 0)
                   const highlight = nlShouldHighlightZeroSessionCell(cd, i, value, latestSessionYmd)
@@ -353,7 +396,7 @@ function TrendNewListingVirtualCohortTable({
           {bottomPad > 0 ? (
             <tr className="trend-nl-vpad" aria-hidden>
               <td
-                colSpan={2 + cohortTrackDays}
+                colSpan={4 + cohortTrackDays}
                 style={{ height: bottomPad, padding: 0, border: 'none', background: 'transparent' }}
               />
             </tr>
@@ -448,6 +491,33 @@ function formatDecimal(v: number | null | undefined, fractionDigits = 2): string
     minimumFractionDigits: fractionDigits,
     maximumFractionDigits: fractionDigits,
   })
+}
+
+function formatPercentUntilVisible(v: number | null | undefined, minDigits = 2, maxDigits = 8): string {
+  if (v == null || Number.isNaN(v)) return '–'
+  const pct = Number(v) * 100
+  if (!Number.isFinite(pct)) return '–'
+  if (pct === 0) return '0'
+  const lower = Math.max(0, Math.trunc(minDigits))
+  const upper = Math.max(lower, Math.trunc(maxDigits))
+  for (let digits = lower; digits <= upper; digits += 1) {
+    const text = pct.toLocaleString('zh-CN', {
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    })
+    if (Number(text.replace(/,/g, '')) !== 0 || digits === upper) return `${text}%`
+  }
+  return `${pct.toLocaleString('zh-CN', {
+    minimumFractionDigits: upper,
+    maximumFractionDigits: upper,
+  })}%`
+}
+
+function formatListingMixCell(newCount: number | null | undefined, refurbCount: number | null | undefined): string {
+  const newValue = Number(newCount)
+  const refurbValue = Number(refurbCount)
+  if (!Number.isFinite(newValue) || !Number.isFinite(refurbValue)) return '–'
+  return `${newValue.toLocaleString('zh-CN')} / ${refurbValue.toLocaleString('zh-CN')}`
 }
 
 function parseOptionalInt(v: string): number | null {
@@ -3477,12 +3547,7 @@ function TrendNewListingEmbeddedPage() {
 
       <div className="trend-new-listing-table-wrap">
         <h3 className="trend-new-listing-table-title">批次明细（上新数 &amp; 上新后每日 sessions）</h3>
-        <p className="trend-new-listing-table-caption">
-          前两列「上新日 / 上新 ASIN 数」来自线上 <code className="trend-new-listing-code">amazon_listing</code>
-          （open_date 在 [{payload.listingSince}, {payload.listingThrough}] 内按日、asin 非空且 TRIM 非空；与顶部 KPI 全表 COUNT(*) 口径不同）。切换「店铺」按 store_id
-          切分；单店数据按需加载。后列为本地 sessions 明细。红色 0 表示按当前视图最新 session_date 往前推 {NL_ZERO_SESSION_HIGHLIGHT_EXCLUDE_RECENT_DAYS}
-          天后的截止日来判断，该批次截至该截止日理论上已走到的天数里，sessions 仍为 0。
-        </p>
+        
         <div className="trend-new-listing-table-controls">
           <label className="trend-new-listing-table-toggle">
             <input
@@ -3514,7 +3579,9 @@ function TrendNewListingEmbeddedPage() {
               <thead>
                 <tr>
                   <th className="is-sticky-col is-sticky-col--1">上新日（PST）</th>
-                  <th className="is-sticky-col is-sticky-col--2">上新 ASIN 数</th>
+                  <th className="is-sticky-col is-sticky-col--2">上新/补录</th>
+                  <th className="is-sticky-col is-sticky-col--3">总 ASIN 数</th>
+                  <th>比值</th>
                   {Array.from({ length: cohortTrackDays }, (_, i) => (
                     <th key={`d${i + 1}`}>{`第${i + 1}天`}</th>
                   ))}
@@ -3524,13 +3591,21 @@ function TrendNewListingEmbeddedPage() {
                 {filteredCohortTable.map((row: any) => {
                   const cd = String(row?.cohortDate ?? '')
                   const newAsin = Number(row?.newAsin ?? 0)
+                  const listingNewCount = row?.listingNewCount
+                  const listingRefurbishedCount = row?.listingRefurbishedCount
+                  const totalAsin = nlComputeTotalAsinCount(newAsin, listingNewCount, listingRefurbishedCount)
                   const daySessions: number[] = Array.isArray(row?.daySessions)
                     ? row.daySessions.map((x: any) => Number(x ?? 0))
                     : []
+                  const sessionPerAsin = nlComputeCohortSessionPerAsin(daySessions, cohortTrackDays, newAsin)
                   return (
                     <tr key={cd || 'row'}>
                       <td className="is-sticky-col is-sticky-col--1">{cd || '–'}</td>
-                      <td className="is-sticky-col is-sticky-col--2">{newAsin.toLocaleString('zh-CN')}</td>
+                      <td className="is-sticky-col is-sticky-col--2">
+                        {formatListingMixCell(listingNewCount, listingRefurbishedCount)}
+                      </td>
+                      <td className="is-sticky-col is-sticky-col--3">{totalAsin.toLocaleString('zh-CN')}</td>
+                      <td>{formatPercentUntilVisible(sessionPerAsin, 2, 8)}</td>
                       {Array.from({ length: cohortTrackDays }, (_, i) => {
                         const value = Number(daySessions[i] ?? 0)
                         const highlight = nlShouldHighlightZeroSessionCell(cd, i, value, latestSessionYmd)
@@ -4094,6 +4169,9 @@ function AdSalesPage() {
   const [dailySeries, setDailySeries] = useState<AdSalesDailyPoint[]>([])
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [sorts, setSorts] = useState<Array<{ field: string; dir: 'asc' | 'desc' }>>([])
+  const [syncNotice, setSyncNotice] = useState<string | null>(null)
+  const [syncRefreshing, setSyncRefreshing] = useState<boolean>(false)
+  const adSalesSortEffectReadyRef = useRef(false)
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
 
@@ -4102,7 +4180,7 @@ function AdSalesPage() {
     return sorts.map((s) => `${s.field}:${s.dir}`).join(',')
   }, [sorts])
 
-  const load = useCallback(async (nextPage: number) => {
+  const load = useCallback(async (nextPage: number, ensureLatest = false) => {
     setLoading(true)
     setError(null)
     try {
@@ -4111,6 +4189,7 @@ function AdSalesPage() {
         store_id: Number.isFinite(sid as number) ? (sid as number) : null,
         start_date: startDate.trim() || null,
         end_date: endDate.trim() || null,
+        ensure_latest: ensureLatest,
         sort: sortQuery,
         page: nextPage,
         page_size: pageSize,
@@ -4127,12 +4206,39 @@ function AdSalesPage() {
     }
   }, [storeId, startDate, endDate, sortQuery])
 
-  useEffect(() => {
-    void load(1)
+  const triggerLatestRefresh = useCallback(async () => {
+    setSyncRefreshing(true)
+    setError(null)
+    try {
+      const res = await triggerAdSalesEnsureLatest()
+      setSyncNotice(res.message || '已在后台触发最新数据刷新，请稍后点击 Search 查看最新结果。')
+    } catch (e) {
+      setSyncNotice(null)
+      setError(e instanceof Error ? e.message : '后台刷新触发失败')
+    } finally {
+      setSyncRefreshing(false)
+    }
   }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    const boot = async () => {
+      await load(1)
+      if (cancelled) return
+      void triggerLatestRefresh()
+    }
+    void boot()
+    return () => {
+      cancelled = true
+    }
+  }, [load, triggerLatestRefresh])
 
   // 排序变化后立即重新拉取（回到第 1 页）
   useEffect(() => {
+    if (!adSalesSortEffectReadyRef.current) {
+      adSalesSortEffectReadyRef.current = true
+      return
+    }
     void load(1)
   }, [sortQuery])
 
@@ -4511,6 +4617,9 @@ function AdSalesPage() {
           />
         </label>
         <button className="btn" onClick={handleSearch} disabled={loading}>Search</button>
+        <button className="btn" onClick={() => void triggerLatestRefresh()} disabled={loading || syncRefreshing}>
+          {syncRefreshing ? 'Refreshing…' : '后台刷新最新数据'}
+        </button>
         <button className="btn" onClick={handleDownloadSelected} disabled={loading || selected.size === 0}>
           Download selected ({selected.size})
         </button>
@@ -4523,6 +4632,7 @@ function AdSalesPage() {
       </div>
 
       {error && <div className="error" style={{ marginTop: 10 }}>{error}</div>}
+      {syncNotice && <div className="empty-hint" style={{ marginTop: 10 }}>{syncNotice}</div>}
       {loading && <div className="empty-hint" style={{ marginTop: 10 }}>Loading…</div>}
 
       <div className="ads-kpi-grid" style={{ marginTop: 14 }}>
@@ -4652,6 +4762,10 @@ function AdsProfitPage() {
 
   const profitChartData = useMemo(() => {
     const labels = weeklySeries.map((row) => row.week_start || '–')
+    const grossMarginAfterReturnData = weeklySeries.map((row) => (
+      row.gross_margin_after_return_rate === 0 ? null : row.gross_margin_after_return_rate
+    ))
+    const hasGrossMarginAfterReturnData = grossMarginAfterReturnData.some((value) => value != null && Number.isFinite(value))
     return {
       labels,
       datasets: [
@@ -4684,17 +4798,19 @@ function AdsProfitPage() {
           pointRadius: 3,
           order: 0,
         },
-        {
-          type: 'line' as const,
-          label: '毛利率（含退货）',
-          data: weeklySeries.map((row) => row.gross_margin_after_return_rate),
-          borderColor: '#f87171',
-          backgroundColor: 'rgba(248, 113, 113, 0.12)',
-          yAxisID: 'yRate',
-          tension: 0.25,
-          pointRadius: 3,
-          order: 0,
-        },
+        ...(hasGrossMarginAfterReturnData
+          ? [{
+              type: 'line' as const,
+              label: '毛利率（含退货）',
+              data: grossMarginAfterReturnData,
+              borderColor: '#f87171',
+              backgroundColor: 'rgba(248, 113, 113, 0.12)',
+              yAxisID: 'yRate',
+              tension: 0.25,
+              pointRadius: 3,
+              order: 0,
+            }]
+          : []),
       ],
     } as any
   }, [weeklySeries])
@@ -4706,7 +4822,10 @@ function AdsProfitPage() {
   }, [weeklySeries])
 
   const rateMinMax = useMemo(() => {
-    const vals = weeklySeries.flatMap((row) => [row.gross_margin_rate, row.gross_margin_after_return_rate]).filter((v) => Number.isFinite(v))
+    const vals = weeklySeries.flatMap((row) => [
+      row.gross_margin_rate,
+      ...(row.gross_margin_after_return_rate === 0 ? [] : [row.gross_margin_after_return_rate]),
+    ]).filter((v) => Number.isFinite(v))
     if (!vals.length) return { min: -10, max: 20 }
     const min = Math.min(...vals, 0)
     const max = Math.max(...vals, 0)

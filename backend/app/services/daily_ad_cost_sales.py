@@ -111,27 +111,33 @@ def _tad_over_order_sum(ad_cost: Decimal | None, order_sum: Decimal) -> float:
     return float(ad_cost / order_sum)
 
 
+def _order_item_purchase_date_sql(alias: str = "oi") -> str:
+    """直接使用 purchase_utc_date 的日历日。"""
+    return f"DATE({alias}.purchase_utc_date)"
+
+
 def _fetch_order_totals_by_day_store_asin(
     online_conn,
     low: date,
     high: date,
 ) -> dict[tuple[date, int, str], Decimal]:
     """
-    order_item：与报表日对齐的「店铺 + ASIN + 日」SUM(total_amount)，order_status!=Canceled。
-    键 (DATE(purchase_utc_date), store_id, TRIM(asin))。
+    order_item：按 purchase_utc_date 的日历日，与报表日对齐的「店铺 + ASIN + 日」SUM(total_amount)，
+    order_status!=Canceled。键 (DATE(purchase_utc_date), store_id, TRIM(asin))。
     """
+    purchase_day_sql = _order_item_purchase_date_sql("oi")
     rows = online_conn.execute(
         text(
-            """
-            SELECT DATE(oi.purchase_utc_date) AS d, oi.store_id,
+            f"""
+            SELECT {purchase_day_sql} AS d, oi.store_id,
                    oi.asin AS asin,
                    SUM(COALESCE(oi.total_amount, 0)) AS amt
             FROM order_item oi
             WHERE oi.order_status != 'Canceled'
               AND oi.purchase_utc_date IS NOT NULL
-              AND DATE(oi.purchase_utc_date) BETWEEN :a AND :b
+              AND {purchase_day_sql} BETWEEN :a AND :b
               AND oi.asin IS NOT NULL AND oi.asin <> ''
-            GROUP BY DATE(oi.purchase_utc_date), oi.store_id, oi.asin
+            GROUP BY {purchase_day_sql}, oi.store_id, oi.asin
             """
         ),
         {"a": low, "b": high},
@@ -290,6 +296,13 @@ def default_gap_days_to_sync(local_db, online_conn, day_sql: str) -> list[date]:
     lmin_raw, lmax_raw = lr[0] if lr else None, lr[1] if lr else None
     lmin = _cell_date(lmin_raw)
     lmax = _cell_date(lmax_raw)
+
+    if lmax is None:
+        low = max(omin, omax - timedelta(days=_DEFAULT_FIRST_SYNC_SPAN_DAYS - 1))
+        high = omax
+    else:
+        low = min(omin, lmin) if lmin is not None else omin
+        high = omax
 
     if lmax is None:
         low = max(omin, omax - timedelta(days=_DEFAULT_FIRST_SYNC_SPAN_DAYS - 1))
@@ -606,6 +619,48 @@ def sync_ad_cost_sales(
 
 
 _scheduled_ad_sales_lock = threading.Lock()
+
+
+def ensure_latest_ad_cost_sales_data() -> dict:
+    """
+    页面/接口触发的轻量增量同步入口。
+
+    - 只同步线上已有但本地尚无的报表日；
+    - 若无缺口则直接返回，不改动本地表；
+    - 若已有同步在执行，则跳过，避免重复发起。
+    """
+    if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
+        logger.warning("[DailyAdCostSales] ensure_latest skipped: online DB not configured")
+        return {"mode": "gap", "rows_upsert": 0, "skipped": True, "reason": "online_db_not_configured"}
+
+    if not _scheduled_ad_sales_lock.acquire(blocking=False):
+        logger.info("[DailyAdCostSales] ensure_latest skipped: previous run still in progress")
+        return {"mode": "gap", "rows_upsert": 0, "skipped": True, "reason": "sync_in_progress"}
+
+    try:
+        init_db()
+        ldb = SessionLocal()
+        try:
+            online_engine = get_online_engine()
+            with online_engine.connect() as oc:
+                day_sql = _resolve_report_day_sql(oc)
+                missing = default_gap_days_to_sync(ldb, oc, day_sql)
+        finally:
+            ldb.close()
+
+        if not missing:
+            logger.info("[DailyAdCostSales] ensure_latest: local data already up to date")
+            return {"mode": "gap", "rows_upsert": 0, "skipped": True, "reason": "already_latest"}
+
+        out = sync_ad_cost_sales(gap_days=missing)
+        out["reason"] = "synced_missing_days"
+        out["gap_days"] = [d.isoformat() for d in missing]
+        return out
+    finally:
+        try:
+            _scheduled_ad_sales_lock.release()
+        except Exception:
+            pass
 
 
 def run_daily_ad_cost_sales_scheduled(*, force: bool = False) -> dict | None:

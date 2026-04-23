@@ -2,16 +2,20 @@
 按 invoice_date 汇总一段时间内的销售/毛利/退货数据。
 
 数据来源（online DB）：
-- ``order_profit``：按 ``invoice_date`` 过滤，汇总 ``net_revenue`` / ``gross_profit``；
+- ``order_profit``：按 ``invoice_date`` 过滤，汇总 ``net_revenue * qty`` / ``gross_profit * qty``；
 - ``order_item``：作为订单桥接表，使用 ``amazon_order_id``；
 - ``order_return``：对筛出的订单，统计 ``is_refund = 1`` 或 ``track_status = '-'`` 的退货金额。
 
 口径：
-- 销售金额 = SUM(order_profit.net_revenue)
-- 毛利率（不含退货） = SUM(order_profit.gross_profit) / 销售金额
+- 销售金额 = SUM(order_profit.net_revenue * qty)
+- 毛利 = SUM(order_profit.gross_profit * qty)
+- 毛利率（不含退货） = 毛利 / 销售金额
 - 退货金额 = SUM(order_return.refund_amount * 对应订单 exchange_rate)
 - 退货率 = 退货金额 / 销售金额
-- 毛利率（包含退货） = (SUM(order_profit.gross_profit) - 退货金额) / 销售金额
+- 毛利率（包含退货） = (毛利 - 退货金额) / 销售金额
+
+退货相关指标（退货金额 / 退货率 / 退货订单数 / 含退货毛利率）只统计「当前日期前 45 天」的成熟数据，
+避免展示仍在退货窗口内的实时值。
 
 默认汇总全部店铺；传 ``store_id`` 时仅统计该店铺。
 
@@ -24,7 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy import text
@@ -59,6 +63,11 @@ def _quantize_money(val: Decimal) -> float:
 
 def _quantize_pct(val: Decimal) -> float:
     return float(val.quantize(Decimal("0.01")))
+
+
+def _mature_return_end(end_date: date) -> date:
+    """退货相关指标只统计当前日期前 45 天的成熟区间。"""
+    return min(end_date, date.today() - timedelta(days=45))
 
 
 def _build_scoped_profit_parts(
@@ -123,13 +132,14 @@ def fetch_profit_summary(
     store_id: int | None = None,
 ) -> dict:
     params, store_filter = _build_scoped_profit_parts(start_date, end_date, store_id)
+    mature_end = _mature_return_end(end_date)
 
     profit_sql = text(
         f"""
         SELECT
             COUNT(DISTINCT op.order_id) AS order_count,
-            COALESCE(SUM(COALESCE(op.net_revenue, 0)), 0) AS sales_amount,
-            COALESCE(SUM(COALESCE(op.gross_profit, 0)), 0) AS gross_profit
+            COALESCE(SUM(COALESCE(op.net_revenue, 0) * COALESCE(op.qty, 0)), 0) AS sales_amount,
+            COALESCE(SUM(COALESCE(op.gross_profit, 0) * COALESCE(op.qty, 0)), 0) AS gross_profit
         FROM order_profit op
         WHERE op.invoice_date >= :start_date
           AND op.invoice_date <= :end_date
@@ -139,54 +149,78 @@ def fetch_profit_summary(
         """
     )
 
-    return_sql = text(
-        f"""
-        WITH scoped_orders AS (
-            SELECT
-                op.store_id,
-                op.order_id AS amazon_order_id,
-                MAX(COALESCE(op.exchange_rate, 1)) AS exchange_rate
-            FROM order_profit op
-            WHERE op.invoice_date >= :start_date
-              AND op.invoice_date <= :end_date
-              AND op.order_id IS NOT NULL
-              AND TRIM(op.order_id) <> ''
-              {store_filter}
-            GROUP BY op.store_id, op.order_id
-        )
-        SELECT
-            COUNT(DISTINCT r.amazon_order_id) AS returned_order_count,
-            COUNT(*) AS return_row_count,
-            COALESCE(SUM(COALESCE(r.refund_amount, 0) * COALESCE(scoped_items.exchange_rate, 1)), 0) AS refund_amount
-        FROM order_return r
-        INNER JOIN (
-            SELECT DISTINCT oi.store_id, oi.amazon_order_id, so.exchange_rate
-            FROM order_item oi
-            INNER JOIN scoped_orders so
-                ON so.store_id = oi.store_id
-               AND so.amazon_order_id = oi.amazon_order_id
-            WHERE oi.amazon_order_id IS NOT NULL
-              AND TRIM(oi.amazon_order_id) <> ''
-        ) scoped_items
-            ON scoped_items.store_id = r.store_id
-           AND scoped_items.amazon_order_id = r.amazon_order_id
-        WHERE COALESCE(r.is_refund, 0) = 1
-           OR TRIM(COALESCE(r.track_status, '')) = '-'
-        """
-    )
-
     with get_online_reporting_engine().connect() as conn:
         profit_row = conn.execute(profit_sql, params).mappings().one()
-        return_row = conn.execute(return_sql, params).mappings().one()
+        if start_date <= mature_end:
+            mature_params, mature_store_filter = _build_scoped_profit_parts(start_date, mature_end, store_id)
+            mature_profit_sql_run = text(
+                f"""
+                SELECT
+                    COALESCE(SUM(COALESCE(op.net_revenue, 0) * COALESCE(op.qty, 0)), 0) AS sales_amount,
+                    COALESCE(SUM(COALESCE(op.gross_profit, 0) * COALESCE(op.qty, 0)), 0) AS gross_profit
+                FROM order_profit op
+                WHERE op.invoice_date >= :start_date
+                  AND op.invoice_date <= :end_date
+                  AND op.order_id IS NOT NULL
+                  AND op.order_id <> ''
+                  {mature_store_filter}
+                """
+            )
+            return_sql_run = text(
+                f"""
+                WITH scoped_orders AS (
+                    SELECT
+                        op.store_id,
+                        op.order_id AS amazon_order_id,
+                        MAX(COALESCE(op.exchange_rate, 1)) AS exchange_rate
+                    FROM order_profit op
+                    WHERE op.invoice_date >= :start_date
+                      AND op.invoice_date <= :end_date
+                      AND op.order_id IS NOT NULL
+                      AND op.order_id <> ''
+                      {mature_store_filter}
+                    GROUP BY op.store_id, op.order_id
+                )
+                SELECT
+                    COUNT(DISTINCT r.amazon_order_id) AS returned_order_count,
+                    COUNT(*) AS return_row_count,
+                    COALESCE(SUM(COALESCE(r.refund_amount, 0) * COALESCE(scoped_items.exchange_rate, 1)), 0) AS refund_amount
+                FROM order_return r
+                INNER JOIN (
+                    SELECT DISTINCT oi.store_id, oi.amazon_order_id, so.exchange_rate
+                    FROM order_item oi
+                    INNER JOIN scoped_orders so
+                        ON so.store_id = oi.store_id
+                       AND so.amazon_order_id = oi.amazon_order_id
+                    WHERE oi.amazon_order_id IS NOT NULL
+                      AND oi.amazon_order_id <> ''
+                ) scoped_items
+                    ON scoped_items.store_id = r.store_id
+                   AND scoped_items.amazon_order_id = r.amazon_order_id
+                WHERE COALESCE(r.is_refund, 0) = 1
+                   OR COALESCE(r.track_status, '') = '-'
+                """
+            )
+            mature_profit_row = conn.execute(mature_profit_sql_run, mature_params).mappings().one()
+            return_row = conn.execute(return_sql_run, mature_params).mappings().one()
+        else:
+            mature_profit_row = {"sales_amount": Decimal("0"), "gross_profit": Decimal("0")}
+            return_row = {
+                "returned_order_count": 0,
+                "return_row_count": 0,
+                "refund_amount": Decimal("0"),
+            }
 
     sales_amount = _to_decimal(profit_row["sales_amount"])
     gross_profit = _to_decimal(profit_row["gross_profit"])
+    mature_sales_amount = _to_decimal(mature_profit_row["sales_amount"])
+    mature_gross_profit = _to_decimal(mature_profit_row["gross_profit"])
     refund_amount = _to_decimal(return_row["refund_amount"])
 
     gross_margin_rate = _pct(gross_profit, sales_amount)
-    return_rate = _pct(refund_amount, sales_amount)
-    gross_profit_after_return = gross_profit - refund_amount
-    gross_margin_after_return_rate = _pct(gross_profit_after_return, sales_amount)
+    return_rate = _pct(refund_amount, mature_sales_amount)
+    gross_profit_after_return = mature_gross_profit - refund_amount
+    gross_margin_after_return_rate = _pct(gross_profit_after_return, mature_sales_amount)
 
     return {
         "start_date": start_date.isoformat(),
@@ -211,6 +245,7 @@ def fetch_profit_weekly_series(
     store_id: int | None = None,
 ) -> list[dict]:
     params, store_filter = _build_scoped_profit_parts(start_date, end_date, store_id)
+    params["mature_end_date"] = _mature_return_end(end_date).strftime("%Y-%m-%d")
     sql = text(
         f"""
         WITH scoped_profit AS (
@@ -219,14 +254,14 @@ def fetch_profit_weekly_series(
                 op.order_id,
                 op.invoice_date,
                 DATE_SUB(op.invoice_date, INTERVAL WEEKDAY(op.invoice_date) DAY) AS week_start,
-                COALESCE(op.net_revenue, 0) AS net_revenue,
-                COALESCE(op.gross_profit, 0) AS gross_profit,
+                COALESCE(op.net_revenue, 0) * COALESCE(op.qty, 0) AS net_revenue,
+                COALESCE(op.gross_profit, 0) * COALESCE(op.qty, 0) AS gross_profit,
                 COALESCE(op.exchange_rate, 1) AS exchange_rate
             FROM order_profit op
             WHERE op.invoice_date >= :start_date
               AND op.invoice_date <= :end_date
               AND op.order_id IS NOT NULL
-              AND TRIM(op.order_id) <> ''
+              AND op.order_id <> ''
               {store_filter}
         ),
         profit_by_week AS (
@@ -238,13 +273,26 @@ def fetch_profit_weekly_series(
             FROM scoped_profit sp
             GROUP BY sp.week_start
         ),
+        mature_scoped_profit AS (
+            SELECT *
+            FROM scoped_profit
+            WHERE invoice_date <= :mature_end_date
+        ),
+        mature_profit_by_week AS (
+            SELECT
+                sp.week_start,
+                SUM(sp.net_revenue) AS mature_sales_amount,
+                SUM(sp.gross_profit) AS mature_gross_profit
+            FROM mature_scoped_profit sp
+            GROUP BY sp.week_start
+        ),
         valid_orders AS (
             SELECT
                 sp.store_id,
                 sp.order_id AS amazon_order_id,
                 MIN(sp.week_start) AS week_start,
                 MAX(sp.exchange_rate) AS exchange_rate
-            FROM scoped_profit sp
+            FROM mature_scoped_profit sp
             WHERE EXISTS (
                 SELECT 1
                 FROM order_item oi
@@ -264,7 +312,7 @@ def fetch_profit_weekly_series(
                 ON r.store_id = vo.store_id
                AND r.amazon_order_id = vo.amazon_order_id
             WHERE COALESCE(r.is_refund, 0) = 1
-               OR TRIM(COALESCE(r.track_status, '')) = '-'
+               OR COALESCE(r.track_status, '') = '-'
             GROUP BY vo.week_start
         )
         SELECT
@@ -274,9 +322,13 @@ def fetch_profit_weekly_series(
             COALESCE(rbw.returned_order_count, 0) AS returned_order_count,
             COALESCE(rbw.return_row_count, 0) AS return_row_count,
             COALESCE(pbw.sales_amount, 0) AS sales_amount,
+            COALESCE(mpbw.mature_sales_amount, 0) AS mature_sales_amount,
             COALESCE(rbw.refund_amount, 0) AS refund_amount,
-            COALESCE(pbw.gross_profit, 0) AS gross_profit
+            COALESCE(pbw.gross_profit, 0) AS gross_profit,
+            COALESCE(mpbw.mature_gross_profit, 0) AS mature_gross_profit
         FROM profit_by_week pbw
+        LEFT JOIN mature_profit_by_week mpbw
+            ON mpbw.week_start = pbw.week_start
         LEFT JOIN refund_by_week rbw
             ON rbw.week_start = pbw.week_start
         ORDER BY pbw.week_start ASC
@@ -288,9 +340,11 @@ def fetch_profit_weekly_series(
     out: list[dict] = []
     for r in rows:
         sales_amount = _to_decimal(r["sales_amount"])
+        mature_sales_amount = _to_decimal(r["mature_sales_amount"])
         refund_amount = _to_decimal(r["refund_amount"])
         gross_profit = _to_decimal(r["gross_profit"])
-        gross_profit_after_return = gross_profit - refund_amount
+        mature_gross_profit = _to_decimal(r["mature_gross_profit"])
+        gross_profit_after_return = mature_gross_profit - refund_amount
         out.append(
             {
                 "week_start": r["week_start"].isoformat() if r["week_start"] is not None else None,
@@ -303,8 +357,8 @@ def fetch_profit_weekly_series(
                 "gross_profit": _quantize_money(gross_profit),
                 "gross_profit_after_return": _quantize_money(gross_profit_after_return),
                 "gross_margin_rate": _quantize_pct(_pct(gross_profit, sales_amount)),
-                "gross_margin_after_return_rate": _quantize_pct(_pct(gross_profit_after_return, sales_amount)),
-                "return_rate": _quantize_pct(_pct(refund_amount, sales_amount)),
+                "gross_margin_after_return_rate": _quantize_pct(_pct(gross_profit_after_return, mature_sales_amount)),
+                "return_rate": _quantize_pct(_pct(refund_amount, mature_sales_amount)),
             }
         )
     return out

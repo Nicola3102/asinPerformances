@@ -367,6 +367,14 @@ def _build_report_html(payload: dict, source_url: str, chart_js_tag: str) -> str
       if (sourceEl) sourceEl.textContent = sourceUrl;
 
       const formatNum = (value) => Number(value ?? 0).toLocaleString('zh-CN');
+      const formatSessionSharePercent = (numerator, denominator) => {{
+        const n = Number(numerator ?? 0);
+        const d = Number(denominator ?? 0);
+        if (!Number.isFinite(n) || !Number.isFinite(d) || d <= 0) return '—';
+        const pct = n / d * 100;
+        const digits = pct !== 0 && Math.abs(pct) < 0.1 ? 4 : 2;
+        return `${{pct.toFixed(digits)}}%`;
+      }};
       const escapeHtml = (value) =>
         String(value ?? '')
           .replace(/&/g, '&amp;')
@@ -440,13 +448,16 @@ def _build_report_html(payload: dict, source_url: str, chart_js_tag: str) -> str
           tableEl.innerHTML = '<tbody><tr><td class="trend-new-listing-table-empty">暂无表格数据。</td></tr></tbody>';
           return;
         }}
-        const headerDays = Array.from({{ length: cohortTrackDays }}, (_, i) => `<th>第${{i + 1}}天</th>`).join('');
+        const headerDays = Array.from({{ length: cohortTrackDays }}, (_, i) => `<th title="sessions 合计；括号内为 sessions / 上新 ASIN 数">第${{i + 1}}天</th>`).join('');
         const body = rows
           .map((row) => {{
             const cd = String(row?.cohortDate ?? '');
             const newAsin = Number(row?.newAsin ?? 0);
             const daySessions = Array.isArray(row?.daySessions) ? row.daySessions : [];
-            const cells = Array.from({{ length: cohortTrackDays }}, (_, i) => `<td>${{formatNum(daySessions[i] ?? 0)}}</td>`).join('');
+            const cells = Array.from(
+              {{ length: cohortTrackDays }},
+              (_, i) => `<td>${{formatNum(daySessions[i] ?? 0)}} (${{formatSessionSharePercent(daySessions[i] ?? 0, newAsin)}})</td>`
+            ).join('');
             return `
               <tr>
                 <td class="is-sticky-col is-sticky-col--1">${{escapeHtml(cd || '–')}}</td>
@@ -544,7 +555,10 @@ def _build_report_html(payload: dict, source_url: str, chart_js_tag: str) -> str
                     if (!items.length) return '';
                     const idx = items[0].dataIndex;
                     const total = lineTotal[idx];
-                    return total != null ? `合计 ${{formatNum(total)}} sessions` : '';
+                    const day = Array.isArray(view.byDay) ? view.byDay[idx] : null;
+                    const newAsinCount = Number(day?.newAsinCount ?? 0);
+                    if (total == null) return '';
+                    return `合计 ${{formatNum(total)}} sessions / 上新 ASIN 数 ${{formatNum(newAsinCount)}} / 占比 ${{formatSessionSharePercent(total, newAsinCount)}}`;
                   }},
                 }},
               }},

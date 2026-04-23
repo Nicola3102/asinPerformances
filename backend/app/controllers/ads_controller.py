@@ -1,9 +1,10 @@
 import csv
+import logging
 from datetime import date, datetime
 from io import StringIO
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from decimal import Decimal
 
@@ -20,8 +21,10 @@ from app.services.weekly_profit import (
     fetch_profit_latest_invoice_date,
     fetch_profit_report,
 )
+from app.services.daily_ad_cost_sales import ensure_latest_ad_cost_sales_data
 
 router = APIRouter(prefix="/api/ads", tags=["ads"])
+logger = logging.getLogger(__name__)
 
 _SORT_FIELDS = {
     "ad_cost": DailyAdCostSales.ad_cost,
@@ -30,6 +33,14 @@ _SORT_FIELDS = {
     "tad_sales": DailyAdCostSales.tad_sales,
     "tsales": DailyAdCostSales.tsales,
 }
+
+
+def _bg_ensure_latest_ad_sales() -> None:
+    try:
+        out = ensure_latest_ad_cost_sales_data()
+        logger.info("[Ads] background ensure_latest finished: %s", out)
+    except Exception as exc:
+        logger.warning("[Ads] background ensure_latest failed: %s", exc)
 
 
 def _num_to_float(val) -> float:
@@ -86,6 +97,36 @@ def _parse_ymd_or_400(raw: str | None, field: str) -> date | None:
         raise HTTPException(status_code=400, detail=f"{field} 格式不合法，需 YYYY-MM-DD")
 
 
+def _order_item_purchase_date_sql(alias: str = "oi") -> str:
+    """将 purchase_utc_date 转成 PST 后取日历日。"""
+    return f"DATE(CONVERT_TZ({alias}.purchase_utc_date, '+00:00', '-07:00'))"
+
+
+def _fetch_ads_report_max_current_date() -> date | None:
+    """读取 amazon_ads_ad_group_ad_report 当前可用的最大报表日。"""
+    if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
+        return None
+    sql = text(
+        """
+        SELECT MAX(DATE(r.`current_date`)) AS max_current_date
+        FROM amazon_ads_ad_group_ad_report r
+        WHERE r.`current_date` IS NOT NULL
+        """
+    )
+    with get_online_reporting_engine().connect() as conn:
+        raw = conn.execute(sql).scalar()
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    try:
+        return datetime.strptime(str(raw)[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
 def _fetch_order_item_ad_asin_sales(
     db: Session,
     *,
@@ -114,18 +155,20 @@ def _fetch_order_item_ad_asin_sales(
             DailyAdCostSales.purchase_date <= ed,
         )
 
-    ad_keys: set[tuple[str, int, str]] = set()
-    for d, sid, asin in ads_q.distinct().all():
-        if d is None or sid is None:
+    ad_asin_keys: set[tuple[int, str]] = set()
+    for _d, sid, asin in ads_q.distinct().all():
+        if sid is None:
             continue
         asin_key = str(asin or "").strip()
         if not asin_key:
             continue
-        ad_keys.add((d.isoformat(), int(sid), asin_key))
-    if not ad_keys:
+        ad_asin_keys.add((int(sid), asin_key))
+    if not ad_asin_keys:
         return 0.0, {}
 
     params: dict[str, object] = {}
+    purchase_day_sql = _order_item_purchase_date_sql("oi")
+    report_max_day = _fetch_ads_report_max_current_date()
     where_parts = [
         "oi.order_status != 'Canceled'",
         "oi.purchase_utc_date IS NOT NULL",
@@ -136,20 +179,26 @@ def _fetch_order_item_ad_asin_sales(
         where_parts.append("oi.store_id = :store_id")
         params["store_id"] = int(store_id)
     if sd is not None and ed is not None:
-        where_parts.append("DATE(oi.purchase_utc_date) BETWEEN :sd AND :ed")
+        effective_ed = min(ed, report_max_day) if report_max_day is not None else ed
+        if sd > effective_ed:
+            return 0.0, {}
+        where_parts.append(f"{purchase_day_sql} BETWEEN :sd AND :ed")
         params["sd"] = sd
-        params["ed"] = ed
+        params["ed"] = effective_ed
+    elif report_max_day is not None:
+        where_parts.append(f"{purchase_day_sql} <= :report_max_day")
+        params["report_max_day"] = report_max_day
 
     online_sql = text(
         f"""
-        SELECT DATE(oi.purchase_utc_date) AS d,
+        SELECT {purchase_day_sql} AS d,
                oi.store_id AS sid,
                TRIM(oi.asin) AS asin,
                SUM(COALESCE(oi.total_amount, 0)) AS amt
         FROM order_item oi
         WHERE {' AND '.join(where_parts)}
-        GROUP BY DATE(oi.purchase_utc_date), oi.store_id, TRIM(oi.asin)
-        ORDER BY DATE(oi.purchase_utc_date) ASC
+        GROUP BY {purchase_day_sql}, oi.store_id, TRIM(oi.asin)
+        ORDER BY {purchase_day_sql} ASC
         """
     )
     with get_online_reporting_engine().connect() as conn:
@@ -162,7 +211,7 @@ def _fetch_order_item_ad_asin_sales(
             continue
         key = d.isoformat() if hasattr(d, "isoformat") else str(d)[:10]
         asin_key = str(asin or "").strip()
-        if (key, int(sid), asin_key) not in ad_keys:
+        if (int(sid), asin_key) not in ad_asin_keys:
             continue
         val = _num_to_float(amt)
         by_day[key] = _num_to_float(by_day.get(key, 0.0)) + val
@@ -175,11 +224,19 @@ def list_ad_sales(
     store_id: Optional[int] = Query(None),
     start_date: Optional[str] = Query(None, description="purchase_date 起始 YYYY-MM-DD（含）"),
     end_date: Optional[str] = Query(None, description="purchase_date 结束 YYYY-MM-DD（含）"),
+    ensure_latest: bool = Query(
+        False,
+        description="为 true 时，请求前先执行 daily_ad_cost_sales 增量同步：补缺失报表日，并重算最近 7 天实际存在的线上报表日",
+    ),
     sort: Optional[str] = Query(None, description="排序：field:asc,field2:desc"),
     page: int = Query(1, ge=1),
     page_size: int = Query(30, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
+    sync_info = None
+    if ensure_latest:
+        sync_info = ensure_latest_ad_cost_sales_data()
+
     sd = _parse_ymd_or_400(start_date, "start_date")
     ed = _parse_ymd_or_400(end_date, "end_date")
     if (sd is None) ^ (ed is None):
@@ -318,6 +375,20 @@ def list_ad_sales(
         "total": int(total),
         "summary": summary,
         "daily_series": daily_series,
+        "sync_info": sync_info,
+    }
+
+
+@router.post("/ad-sales/ensure-latest")
+def trigger_ad_sales_ensure_latest(background_tasks: BackgroundTasks):
+    """
+    后台触发一次 ad-sales 最新数据补齐，不阻塞当前页面请求。
+    实际执行仍受 daily_ad_cost_sales 内部全局锁保护；若已有任务在跑，本次会被自动跳过。
+    """
+    background_tasks.add_task(_bg_ensure_latest_ad_sales)
+    return {
+        "status": "accepted",
+        "message": "Ad-Sales 最新数据已在后台检查/刷新，可先查看本地数据，稍后手动刷新页面。",
     }
 
 

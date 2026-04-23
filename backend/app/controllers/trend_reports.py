@@ -135,6 +135,7 @@ _new_listing_sync_report_lock = threading.Lock()
 # format=json 短 TTL 内存缓存（按日期参数 + 是否跳过同步）；本地表变化后最多滞后 TTL
 _new_listing_json_cache_lock = threading.Lock()
 _new_listing_json_cache: "OrderedDict[tuple, tuple[float, dict]]" = OrderedDict()
+_NEW_LISTING_JSON_CACHE_SCHEMA = "cohort-lookback-v1"
 
 
 def _new_listing_json_cache_get(key: tuple) -> dict | None:
@@ -435,6 +436,7 @@ def trend_new_listing_report(
 
     if response_format == "json" and not nocache:
         cache_key = (
+            _NEW_LISTING_JSON_CACHE_SCHEMA,
             listing_since.isoformat(),
             start_d.isoformat(),
             end_d.isoformat(),
@@ -529,6 +531,7 @@ def trend_new_listing_report(
                         except Exception:
                             continue
                         key = (
+                            _NEW_LISTING_JSON_CACHE_SCHEMA,
                             listing_since.isoformat(),
                             start_d.isoformat(),
                             end_d.isoformat(),
@@ -635,6 +638,7 @@ def trend_new_listing_report(
             if not nocache:
                 _new_listing_json_cache_set(
                     (
+                        _NEW_LISTING_JSON_CACHE_SCHEMA,
                         listing_since.isoformat(),
                         start_d.isoformat(),
                         end_d.isoformat(),
