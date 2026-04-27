@@ -42,9 +42,17 @@ class _Progress:
     rows_prepared: int = 0
 
 
-def _progress_heartbeat_loop(progress: _Progress, lock: threading.Lock, write_queue: Queue, writer_thread: threading.Thread, write_stats: dict, interval_sec: float = 30.0):
-    while True:
-        time.sleep(interval_sec)
+def _progress_heartbeat_loop(
+    progress: _Progress,
+    lock: threading.Lock,
+    write_queue: Queue,
+    writer_thread: threading.Thread,
+    write_stats: dict,
+    stop_event: threading.Event,
+    interval_sec: float = 30.0,
+):
+    """周期性打进度；须由 sync 在 finally 里 ``stop_event.set()`` + ``join``，否则会永久跑满日志磁盘。"""
+    while not stop_event.wait(timeout=interval_sec):
         with lock:
             now = time.time()
             idle_reader = now - progress.last_reader_ts
@@ -1364,9 +1372,10 @@ def sync_listing_tracking(
             total_chunks=len(pid_group_chunks),
             rows_prepared=0,
         )
+        heartbeat_stop = threading.Event()
         heartbeat_thread = threading.Thread(
             target=_progress_heartbeat_loop,
-            args=(progress, progress_lock, write_queue, writer_thread, write_stats_total),
+            args=(progress, progress_lock, write_queue, writer_thread, write_stats_total, heartbeat_stop),
             name="listing-tracking-heartbeat",
             daemon=True,
         )
@@ -1453,6 +1462,8 @@ def sync_listing_tracking(
             if writer_errors:
                 raise writer_errors[0]
         finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=max(5.0, 35.0))
             if writer_thread.is_alive():
                 write_queue.put(None)
                 write_queue.join()

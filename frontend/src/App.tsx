@@ -120,7 +120,7 @@ interface TrendNewListingJsonPayload {
 }
 
 /** v4：KPI 与线上 COUNT(*) open_date>since、status='Active' 对账 SQL 一致 */
-const TREND_NEW_LISTING_CACHE_KEY = 'asinPerformances.v8.trendNewListingJson'
+const TREND_NEW_LISTING_CACHE_KEY = 'asinPerformances.v9.trendNewListingJson'
 /** 超过此大小的 JSON 在 Worker 中 parse，减轻主线程卡顿 */
 const TREND_NL_JSON_WORKER_MIN_LEN = 48_000
 
@@ -305,10 +305,13 @@ function nlSumCohortDaySessions(daySessions: number[], cohortTrackDays: number):
 }
 
 type NlDaySessionPopoverAnchor = {
+  cellKey: string
+  title: string
   left: number
   top: number
   items: Array<{ asin: string; storeId: number; sessions: number }>
   cellTotal: number
+  pinned?: boolean
 }
 
 /** 固定定位浮动层（替代原生 title：可避免服务端旧缓存 JSON、多行 title 不显示等问题） */
@@ -316,14 +319,18 @@ function NlDaySessionPopoverPortal({
   anchor,
   cancelClose,
   scheduleClose,
+  onUnpin,
 }: {
   anchor: NlDaySessionPopoverAnchor | null
   cancelClose: () => void
   scheduleClose: () => void
+  onUnpin: () => void
 }) {
   if (anchor == null || typeof document === 'undefined') return null
-  const { left, top, items, cellTotal } = anchor
+  const { left, top, items, cellTotal, pinned } = anchor
   const stale = cellTotal > 0 && items.length === 0
+  const detailSum = items.reduce((acc, x) => acc + Number(x.sessions || 0), 0)
+  const diff = Number(cellTotal || 0) - detailSum
 
   return createPortal(
     <div
@@ -352,7 +359,23 @@ function NlDaySessionPopoverPortal({
         </div>
       ) : (
         <>
-          <div className="trend-nl-day-popover-head">ASIN · 店铺 ID · 当日 sessions</div>
+          <div className="trend-nl-day-popover-head">
+            <span>{anchor.title}</span>
+            {pinned ? (
+              <button
+                type="button"
+                className="trend-nl-day-popover-unpin-btn"
+                onClick={onUnpin}
+                title="取消固定"
+              >
+                取消固定
+              </button>
+            ) : null}
+          </div>
+          <div className="trend-nl-day-popover-meta">
+            明细合计 {detailSum.toLocaleString('zh-CN')} / 单元格 {Number(cellTotal || 0).toLocaleString('zh-CN')}
+            {diff !== 0 ? `（差值 ${diff.toLocaleString('zh-CN')}）` : ''}
+          </div>
           <div className="trend-nl-day-popover-body">
             {items.map((x, idx) => (
               <div key={`${x.asin}-${x.storeId}-${idx}`} className="trend-nl-day-popover-row">
@@ -374,6 +397,7 @@ function TrendNewListingVirtualCohortTable({
   cohortTrackDays,
   latestSessionYmd,
   nlPopoverOpenFromCell,
+  nlPopoverPinFromCell,
   nlPopoverScheduleClose,
   nlPopoverCancelClose,
   nlPopoverCloseNow,
@@ -383,6 +407,15 @@ function TrendNewListingVirtualCohortTable({
   latestSessionYmd: string
   nlPopoverOpenFromCell: (
     e: React.MouseEvent<HTMLTableCellElement>,
+    cellKey: string,
+    title: string,
+    rawItems: Array<{ asin: string; storeId: number; sessions: number }> | undefined,
+    cellTotal: number,
+  ) => void
+  nlPopoverPinFromCell: (
+    e: React.MouseEvent<HTMLTableCellElement>,
+    cellKey: string,
+    title: string,
     rawItems: Array<{ asin: string; storeId: number; sessions: number }> | undefined,
     cellTotal: number,
   ) => void
@@ -443,39 +476,65 @@ function TrendNewListingVirtualCohortTable({
           ) : null}
           {cohortTable.slice(start, end).map((row) => {
             const cd = String(row?.cohortDate ?? '')
-            const newAsin = Number(row?.newAsin ?? 0)
-            const listingNewCount = row?.listingNewCount
-            const listingRefurbishedCount = row?.listingRefurbishedCount
+            const listingCounts = nlResolveListingCounts(row)
             const daySessions: number[] = Array.isArray(row?.daySessions)
               ? row.daySessions.map((x) => Number(x ?? 0))
               : []
             const totalSessions = nlSumCohortDaySessions(daySessions, cohortTrackDays)
-            const sessionPerAsin = nlComputeCohortSessionPerAsin(daySessions, cohortTrackDays, newAsin)
+            const sessionPerAsin = nlComputeCohortSessionPerAsin(
+              daySessions,
+              cohortTrackDays,
+              listingCounts.newCount,
+            )
             const dayAsins = row?.daySessionAsins
+            const totalItems = nlAggregateTotalSessionItems(dayAsins, cohortTrackDays)
             return (
               <tr key={cd || `r-${start}-${end}`}>
                 <td className="is-sticky-col is-sticky-col--1">{cd || '–'}</td>
                 <td className="is-sticky-col is-sticky-col--2">
-                  {formatListingMixCell(listingNewCount, listingRefurbishedCount)}
+                  {formatListingMixCell(listingCounts.newCount, listingCounts.refurbishedCount)}
                 </td>
-                <td className="is-sticky-col is-sticky-col--3">{totalSessions.toLocaleString('zh-CN')}</td>
-                <td>{formatPercentUntilVisible(sessionPerAsin, 2, 8)}</td>
+                <td
+                  className="is-sticky-col is-sticky-col--3 trend-nl-hoverable-cell"
+                  onMouseEnter={(e) => {
+                    nlPopoverCancelClose()
+                    nlPopoverOpenFromCell(e, `${cd}-total`, 'ASIN · 店铺 ID · 累计 sessions(>0)', totalItems, totalSessions)
+                  }}
+                  onMouseLeave={nlPopoverScheduleClose}
+                  onClick={(e) =>
+                    nlPopoverPinFromCell(e, `${cd}-total`, 'ASIN · 店铺 ID · 累计 sessions(>0)', totalItems, totalSessions)
+                  }
+                >
+                  {totalSessions.toLocaleString('zh-CN')}
+                </td>
+                <td>{formatPermyriadUntilVisible(sessionPerAsin, 2, 4)}</td>
                 {Array.from({ length: cohortTrackDays }, (_, i) => {
                   const value = Number(daySessions[i] ?? 0)
                   const highlight = nlShouldHighlightZeroSessionCell(cd, i, value, latestSessionYmd)
                   return (
                     <td
                       key={`${cd}-s-${i}`}
-                      className={highlight ? 'trend-new-listing-zero-alert' : undefined}
+                      className={`${highlight ? 'trend-new-listing-zero-alert ' : ''}trend-nl-hoverable-cell`}
                       onMouseEnter={(e) => {
                         nlPopoverCancelClose()
                         nlPopoverOpenFromCell(
                           e,
+                          `${cd}-day-${i}`,
+                          `ASIN · 店铺 ID · 第${i + 1}天 sessions`,
                           Array.isArray(dayAsins) ? dayAsins[i] : undefined,
                           value,
                         )
                       }}
                       onMouseLeave={nlPopoverScheduleClose}
+                      onClick={(e) =>
+                        nlPopoverPinFromCell(
+                          e,
+                          `${cd}-day-${i}`,
+                          `ASIN · 店铺 ID · 第${i + 1}天 sessions`,
+                          Array.isArray(dayAsins) ? dayAsins[i] : undefined,
+                          value,
+                        )
+                      }
                     >
                       {value.toLocaleString('zh-CN')}
                     </td>
@@ -527,7 +586,7 @@ function writeTrendNewListingCache(data: TrendNewListingJsonPayload): void {
   }
 }
 
-/** 默认用缓存、不自动打接口；?refresh=1 或 ?nocache=1 强制走网络 */
+/** 默认先用缓存首屏展示，同时后台刷新；?refresh=1 或 ?nocache=1 强制走网络且不读本地缓存。 */
 function getTrendNewListingBoot(): { payload: TrendNewListingJsonPayload | null; useCacheOnly: boolean } {
   if (typeof window === 'undefined') return { payload: null, useCacheOnly: false }
   try {
@@ -584,24 +643,46 @@ function formatDecimal(v: number | null | undefined, fractionDigits = 2): string
   })
 }
 
-function formatPercentUntilVisible(v: number | null | undefined, minDigits = 2, maxDigits = 8): string {
+function formatPermyriadUntilVisible(v: number | null | undefined, minDigits = 2, maxDigits = 4): string {
   if (v == null || Number.isNaN(v)) return '–'
-  const pct = Number(v) * 100
-  if (!Number.isFinite(pct)) return '–'
-  if (pct === 0) return '0'
+  const permyriad = Number(v) * 10000
+  if (!Number.isFinite(permyriad)) return '–'
+  if (permyriad === 0) return `0.${'0'.repeat(Math.max(0, minDigits))}‱`
   const lower = Math.max(0, Math.trunc(minDigits))
   const upper = Math.max(lower, Math.trunc(maxDigits))
   for (let digits = lower; digits <= upper; digits += 1) {
-    const text = pct.toLocaleString('zh-CN', {
+    const text = permyriad.toLocaleString('zh-CN', {
       minimumFractionDigits: digits,
       maximumFractionDigits: digits,
     })
-    if (Number(text.replace(/,/g, '')) !== 0 || digits === upper) return `${text}%`
+    if (Number(text.replace(/,/g, '')) !== 0 || digits === upper) return `${text}‱`
   }
-  return `${pct.toLocaleString('zh-CN', {
+  return `${permyriad.toLocaleString('zh-CN', {
     minimumFractionDigits: upper,
     maximumFractionDigits: upper,
-  })}%`
+  })}‱`
+}
+
+function nlAggregateTotalSessionItems(
+  daySessionAsins: Array<Array<{ asin: string; storeId: number; sessions: number }>> | undefined,
+  cohortTrackDays: number,
+): Array<{ asin: string; storeId: number; sessions: number }> {
+  if (!Array.isArray(daySessionAsins) || cohortTrackDays <= 0) return []
+  const acc = new Map<string, { asin: string; storeId: number; sessions: number }>()
+  for (let i = 0; i < cohortTrackDays; i += 1) {
+    const items = Array.isArray(daySessionAsins[i]) ? daySessionAsins[i] : []
+    for (const it of items) {
+      const asin = String(it?.asin ?? '').trim()
+      const storeId = Number(it?.storeId ?? 0)
+      const sessions = Number(it?.sessions ?? 0)
+      if (!asin || !Number.isFinite(storeId) || !Number.isFinite(sessions) || sessions <= 0) continue
+      const key = `${asin}||${storeId}`
+      const prev = acc.get(key)
+      if (prev) prev.sessions += sessions
+      else acc.set(key, { asin, storeId, sessions })
+    }
+  }
+  return Array.from(acc.values()).sort((a, b) => (b.sessions - a.sessions) || a.asin.localeCompare(b.asin))
 }
 
 function formatListingMixCell(newCount: number | null | undefined, refurbCount: number | null | undefined): string {
@@ -609,6 +690,26 @@ function formatListingMixCell(newCount: number | null | undefined, refurbCount: 
   const refurbValue = Number(refurbCount)
   if (!Number.isFinite(newValue) || !Number.isFinite(refurbValue)) return '–'
   return `${newValue.toLocaleString('zh-CN')} / ${refurbValue.toLocaleString('zh-CN')}`
+}
+
+function nlResolveListingCounts(row: TrendNlCohortRow): {
+  newCount: number
+  refurbishedCount: number
+} {
+  const totalNewAsin = Math.max(0, Number(row?.newAsin ?? 0))
+  const listingNewRaw = Number(row?.listingNewCount ?? NaN)
+  const listingRefurbRaw = Number(row?.listingRefurbishedCount ?? NaN)
+  const hasMix = Number.isFinite(listingNewRaw) && Number.isFinite(listingRefurbRaw)
+  if (!hasMix) {
+    return { newCount: totalNewAsin, refurbishedCount: 0 }
+  }
+  const newCount = Math.max(0, listingNewRaw)
+  const refurbishedCount = Math.max(0, listingRefurbRaw)
+  // 旧缓存/后端未回填 mix 时可能出现 0/0，但 totalNewAsin>0；回退到总上新口径避免“0/0”误导
+  if (newCount + refurbishedCount <= 0 && totalNewAsin > 0) {
+    return { newCount: totalNewAsin, refurbishedCount: 0 }
+  }
+  return { newCount, refurbishedCount }
 }
 
 function parseOptionalInt(v: string): number | null {
@@ -3021,6 +3122,11 @@ function TrendNewListingEmbeddedPage() {
 
   const [nlDayPopover, setNlDayPopover] = useState<NlDaySessionPopoverAnchor | null>(null)
   const nlPopTimerRef = useRef<number | null>(null)
+  const nlDayPopoverRef = useRef<NlDaySessionPopoverAnchor | null>(null)
+
+  useEffect(() => {
+    nlDayPopoverRef.current = nlDayPopover
+  }, [nlDayPopover])
 
   const nlPopoverCancelClose = useCallback(() => {
     if (nlPopTimerRef.current != null) {
@@ -3030,8 +3136,14 @@ function TrendNewListingEmbeddedPage() {
   }, [])
 
   const nlPopoverScheduleClose = useCallback(() => {
+    if (nlDayPopoverRef.current?.pinned) return
     nlPopoverCancelClose()
     nlPopTimerRef.current = window.setTimeout(() => {
+      // 定时器触发时再次读取最新状态，避免“先触发关闭计时、后点击固定”被旧计时器误关闭
+      if (nlDayPopoverRef.current?.pinned) {
+        nlPopTimerRef.current = null
+        return
+      }
       setNlDayPopover(null)
       nlPopTimerRef.current = null
     }, 180)
@@ -3045,10 +3157,15 @@ function TrendNewListingEmbeddedPage() {
   const nlPopoverOpenFromCell = useCallback(
     (
       e: React.MouseEvent<HTMLTableCellElement>,
+      cellKey: string,
+      title: string,
       rawItems: Array<{ asin: string; storeId: number; sessions: number }> | undefined,
       cellTotal: number,
+      pinned = false,
     ) => {
       nlPopoverCancelClose()
+      // 固定态下，鼠标掠过其它格子不改写当前弹层；仅允许点击触发的 pinned 更新
+      if (!pinned && nlDayPopoverRef.current?.pinned) return
       const arr = Array.isArray(rawItems) ? rawItems : []
       if (cellTotal <= 0 && arr.length === 0) {
         setNlDayPopover(null)
@@ -3056,13 +3173,33 @@ function TrendNewListingEmbeddedPage() {
       }
       const r = e.currentTarget.getBoundingClientRect()
       setNlDayPopover({
+        cellKey,
+        title,
         left: r.left + r.width / 2,
         top: r.bottom + 8,
-        items: arr,
+        items: [...arr].sort((a, b) => (Number(b.sessions || 0) - Number(a.sessions || 0)) || String(a.asin).localeCompare(String(b.asin))),
         cellTotal,
+        pinned,
       })
     },
     [nlPopoverCancelClose],
+  )
+
+  const nlPopoverPinFromCell = useCallback(
+    (
+      e: React.MouseEvent<HTMLTableCellElement>,
+      cellKey: string,
+      title: string,
+      rawItems: Array<{ asin: string; storeId: number; sessions: number }> | undefined,
+      cellTotal: number,
+    ) => {
+      if (nlDayPopover?.pinned && nlDayPopover.cellKey === cellKey) {
+        setNlDayPopover(null)
+        return
+      }
+      nlPopoverOpenFromCell(e, cellKey, title, rawItems, cellTotal, true)
+    },
+    [nlDayPopover?.cellKey, nlDayPopover?.pinned, nlPopoverOpenFromCell],
   )
 
   useEffect(() => {
@@ -3245,11 +3382,6 @@ function TrendNewListingEmbeddedPage() {
   useEffect(() => {
     let cancelled = false
     setErr(null)
-    if (boot.useCacheOnly && boot.payload) {
-      return () => {
-        cancelled = true
-      }
-    }
     nlShellAbortRef.current?.abort()
     const ac = new AbortController()
     nlShellAbortRef.current = ac
@@ -3274,7 +3406,6 @@ function TrendNewListingEmbeddedPage() {
 
   /** views.all 就绪后空闲预取各店 json_views=store，合并进 payload / 本地缓存；切换店铺时直接命中 views[id] */
   useEffect(() => {
-    if (boot.useCacheOnly && boot.payload) return
     if (!payload?.views?.all) return
     const ids = payload.storeIds || []
     if (!ids.length) return
@@ -3714,6 +3845,7 @@ function TrendNewListingEmbeddedPage() {
             cohortTrackDays={cohortTrackDays}
             latestSessionYmd={latestSessionYmd}
             nlPopoverOpenFromCell={nlPopoverOpenFromCell}
+            nlPopoverPinFromCell={nlPopoverPinFromCell}
             nlPopoverScheduleClose={nlPopoverScheduleClose}
             nlPopoverCancelClose={nlPopoverCancelClose}
             nlPopoverCloseNow={nlPopoverCloseNow}
@@ -3735,39 +3867,65 @@ function TrendNewListingEmbeddedPage() {
               <tbody>
                 {filteredCohortTable.map((row: TrendNlCohortRow) => {
                   const cd = String(row?.cohortDate ?? '')
-                  const newAsin = Number(row?.newAsin ?? 0)
-                  const listingNewCount = row?.listingNewCount
-                  const listingRefurbishedCount = row?.listingRefurbishedCount
+                  const listingCounts = nlResolveListingCounts(row)
                   const daySessions: number[] = Array.isArray(row?.daySessions)
                     ? row.daySessions.map((x) => Number(x ?? 0))
                     : []
                   const totalSessions = nlSumCohortDaySessions(daySessions, cohortTrackDays)
-                  const sessionPerAsin = nlComputeCohortSessionPerAsin(daySessions, cohortTrackDays, newAsin)
+                  const sessionPerAsin = nlComputeCohortSessionPerAsin(
+                    daySessions,
+                    cohortTrackDays,
+                    listingCounts.newCount,
+                  )
                   const dayAsins = row?.daySessionAsins
+                  const totalItems = nlAggregateTotalSessionItems(dayAsins, cohortTrackDays)
                   return (
                     <tr key={cd || 'row'}>
                       <td className="is-sticky-col is-sticky-col--1">{cd || '–'}</td>
                       <td className="is-sticky-col is-sticky-col--2">
-                        {formatListingMixCell(listingNewCount, listingRefurbishedCount)}
+                        {formatListingMixCell(listingCounts.newCount, listingCounts.refurbishedCount)}
                       </td>
-                      <td className="is-sticky-col is-sticky-col--3">{totalSessions.toLocaleString('zh-CN')}</td>
-                      <td>{formatPercentUntilVisible(sessionPerAsin, 2, 8)}</td>
+                      <td
+                        className="is-sticky-col is-sticky-col--3 trend-nl-hoverable-cell"
+                        onMouseEnter={(e) => {
+                          nlPopoverCancelClose()
+                          nlPopoverOpenFromCell(e, `${cd}-total`, 'ASIN · 店铺 ID · 累计 sessions(>0)', totalItems, totalSessions)
+                        }}
+                        onMouseLeave={nlPopoverScheduleClose}
+                        onClick={(e) =>
+                          nlPopoverPinFromCell(e, `${cd}-total`, 'ASIN · 店铺 ID · 累计 sessions(>0)', totalItems, totalSessions)
+                        }
+                      >
+                        {totalSessions.toLocaleString('zh-CN')}
+                      </td>
+                      <td>{formatPermyriadUntilVisible(sessionPerAsin, 2, 4)}</td>
                       {Array.from({ length: cohortTrackDays }, (_, i) => {
                         const value = Number(daySessions[i] ?? 0)
                         const highlight = nlShouldHighlightZeroSessionCell(cd, i, value, latestSessionYmd)
                         return (
                           <td
                             key={`${cd}-s-${i}`}
-                            className={highlight ? 'trend-new-listing-zero-alert' : undefined}
+                            className={`${highlight ? 'trend-new-listing-zero-alert ' : ''}trend-nl-hoverable-cell`}
                             onMouseEnter={(e) => {
                               nlPopoverCancelClose()
                               nlPopoverOpenFromCell(
                                 e,
+                                `${cd}-day-${i}`,
+                                `ASIN · 店铺 ID · 第${i + 1}天 sessions`,
                                 Array.isArray(dayAsins) ? dayAsins[i] : undefined,
                                 value,
                               )
                             }}
                             onMouseLeave={nlPopoverScheduleClose}
+                            onClick={(e) =>
+                              nlPopoverPinFromCell(
+                                e,
+                                `${cd}-day-${i}`,
+                                `ASIN · 店铺 ID · 第${i + 1}天 sessions`,
+                                Array.isArray(dayAsins) ? dayAsins[i] : undefined,
+                                value,
+                              )
+                            }
                           >
                             {value.toLocaleString('zh-CN')}
                           </td>
@@ -3785,6 +3943,7 @@ function TrendNewListingEmbeddedPage() {
         anchor={nlDayPopover}
         cancelClose={nlPopoverCancelClose}
         scheduleClose={nlPopoverScheduleClose}
+        onUnpin={nlPopoverCloseNow}
       />
     </div>
   )

@@ -540,12 +540,38 @@
 }
 
 .trend-nl-day-popover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
   font-weight: 650;
   color: #94a3b8;
   font-size: 0.72rem;
   margin-bottom: 0.45rem;
   padding-bottom: 0.35rem;
   border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.trend-nl-day-popover-meta {
+  font-size: 0.7rem;
+  color: #93c5fd;
+  margin: -0.1rem 0 0.45rem;
+  line-height: 1.4;
+}
+
+.trend-nl-day-popover-unpin-btn {
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: rgba(15, 23, 42, 0.7);
+  color: #cbd5e1;
+  border-radius: 6px;
+  font-size: 0.68rem;
+  line-height: 1.1;
+  padding: 0.15rem 0.4rem;
+  cursor: pointer;
+}
+
+.trend-nl-day-popover-unpin-btn:hover {
+  background: rgba(30, 41, 59, 0.85);
 }
 
 .trend-nl-day-popover-body {
@@ -571,17 +597,23 @@
   overflow: hidden;
   text-overflow: ellipsis;
   font-variant-numeric: tabular-nums;
+  user-select: text;
 }
 
 .trend-nl-day-popover-store,
 .trend-nl-day-popover-sessions {
   font-variant-numeric: tabular-nums;
   color: #cbd5e1;
+  user-select: text;
 }
 
 .trend-nl-day-popover-sessions {
   text-align: right;
   min-width: 3rem;
+}
+
+.trend-nl-hoverable-cell {
+  cursor: pointer;
 }
 
 .trend-nl-day-popover-stale-title {

@@ -1,5 +1,8 @@
 """
 日志配置：将后台日志按日期写入 app/log 目录，当天日志写入当天文件（如 2026-02-26.log）。
+
+``setup_logging`` 可被多处调用（如 ``main`` 与各服务 ``if __name__ == "__main__"``）；
+对 root 的 ``DailyFileHandler`` 仅挂载一次，避免同一行被写入文件多遍。
 """
 import logging
 from datetime import date
@@ -45,24 +48,39 @@ class DailyFileHandler(logging.FileHandler):
         super().emit(record)
 
 
+def _root_daily_file_handler(root: logging.Logger) -> DailyFileHandler | None:
+    for h in root.handlers:
+        if isinstance(h, DailyFileHandler):
+            return h
+    return None
+
+
 def setup_logging(level: int = logging.INFO) -> None:
-    """配置根 logger：输出到控制台 + 按日期写入 app/log/YYYY-MM-DD.log。"""
+    """配置根 logger：输出到控制台 + 按日期写入 app/log/YYYY-MM-DD.log（DailyFileHandler 幂等）。"""
     root = logging.getLogger()
     root.setLevel(level)
     formatter = logging.Formatter(LOG_MSG_FORMAT, datefmt=LOG_DATE_FMT)
 
-    # 控制台
-    if not any(h for h in root.handlers if isinstance(h, logging.StreamHandler)):
+    # 控制台（排除 FileHandler：FileHandler 也是 StreamHandler 子类）
+    if not any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        for h in root.handlers
+    ):
         console = logging.StreamHandler()
         console.setLevel(level)
         console.setFormatter(formatter)
         root.addHandler(console)
 
-    # 按日期写入 app/log
-    try:
-        file_handler = DailyFileHandler()
-        file_handler.setLevel(level)
-        file_handler.setFormatter(formatter)
-        root.addHandler(file_handler)
-    except OSError as e:
-        root.warning("Could not create daily log file in app/log: %s", e)
+    # 按日期写入 app/log（仅挂载一个 DailyFileHandler）
+    existing_daily = _root_daily_file_handler(root)
+    if existing_daily is not None:
+        existing_daily.setLevel(level)
+        existing_daily.setFormatter(formatter)
+    else:
+        try:
+            file_handler = DailyFileHandler()
+            file_handler.setLevel(level)
+            file_handler.setFormatter(formatter)
+            root.addHandler(file_handler)
+        except OSError as e:
+            root.warning("Could not create daily log file in app/log: %s", e)

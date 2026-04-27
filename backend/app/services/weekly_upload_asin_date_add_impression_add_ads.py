@@ -163,7 +163,7 @@ def fetch_traffic_daily_by_store(
         # 排除黑名单 ASIN（按 asin + store_id 精确匹配），避免其 sessions 进入日汇总
         "NOT EXISTS ("
         "  SELECT 1 FROM black_asin b"
-        "  WHERE TRIM(b.asin) = TRIM(asatd.asin) AND b.store_id = asatd.store_id"
+        "  WHERE b.asin = asatd.asin AND b.store_id = asatd.store_id"
         ")"
     ]
     params: dict = {}
@@ -421,6 +421,178 @@ def fetch_impression_weekly(
     return per_store, all_weeks
 
 
+def fetch_ads_impression_weekly_filtered(
+    start_date: date,
+    end_date: date,
+) -> tuple[dict[int, list[dict]], list[dict]]:
+    """
+    按与 total impressions 相同的 week_no 候选集合，统计「广告 impressions（投放位>0）」的整周值。
+
+    广告来源：
+    - amazon_ads_ad_group_ad_report aaagar.impressions
+    - INNER JOIN amazon_ads_campaign aac
+    - 条件：aac.rest_of_search > 0 OR aac.top_of_search > 0
+
+    周口径：
+    - 先取报表区间内 amazon_search_data.start_date 出现过的 week_no
+    - week_no -> (周日~周六) 后，把广告日数据映射回该 week_no 汇总
+    """
+    if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
+        raise ValueError("Online DB 未配置")
+
+    params = {
+        "d0": start_date.strftime("%Y-%m-%d"),
+        "d1": end_date.strftime("%Y-%m-%d"),
+    }
+    sql_week_no = text(
+        """
+        SELECT DISTINCT asd2.week_no
+        FROM amazon_search_data AS asd2
+        WHERE asd2.week_no IS NOT NULL
+          AND DATE(asd2.start_date) >= :d0
+          AND DATE(asd2.start_date) <= :d1
+        ORDER BY asd2.week_no ASC
+        """
+    )
+    with get_online_engine().connect() as conn:
+        wn_rows = conn.execute(sql_week_no, params).fetchall()
+
+    week_meta: dict[str, dict] = {}
+    day_to_week: dict[date, str] = {}
+    for r in wn_rows:
+        wn = str(r[0]).strip() if r and r[0] is not None else ""
+        if not wn:
+            continue
+        try:
+            d_min, d_max, mid = _week_no_to_week_range(wn)
+        except ValueError:
+            logger.warning("[AdsImpressionWeekly] skip invalid week_no=%r", wn)
+            continue
+        week_meta[wn] = {
+            "week_no": wn,
+            "d_min": d_min.isoformat(),
+            "d_max": d_max.isoformat(),
+            "mid": mid.isoformat(),
+        }
+        cur = d_min
+        while cur <= d_max:
+            day_to_week[cur] = wn
+            cur += timedelta(days=1)
+
+    if not week_meta:
+        return {}, []
+
+    min_day = min(_parse_ymd(x["d_min"]) for x in week_meta.values())
+    max_day = max(_parse_ymd(x["d_max"]) for x in week_meta.values())
+    sql_ads_daily = text(
+        """
+        SELECT aaagar.store_id,
+               DATE(aaagar.`current_date`) AS d,
+               SUM(COALESCE(aaagar.impressions, 0)) AS imp
+        FROM amazon_ads_ad_group_ad_report AS aaagar
+        INNER JOIN amazon_ads_campaign AS aac
+            ON aac.campaign_id = aaagar.campaign_id
+        WHERE DATE(aaagar.`current_date`) >= :d0
+          AND DATE(aaagar.`current_date`) <= :d1
+          AND (COALESCE(aac.rest_of_search, 0) > 0 OR COALESCE(aac.top_of_search, 0) > 0)
+        GROUP BY aaagar.store_id, DATE(aaagar.`current_date`)
+        ORDER BY d ASC, aaagar.store_id ASC
+        """
+    )
+    with get_online_engine().connect() as conn:
+        daily_rows = conn.execute(
+            sql_ads_daily,
+            {"d0": min_day.strftime("%Y-%m-%d"), "d1": max_day.strftime("%Y-%m-%d")},
+        ).fetchall()
+
+    per_store_sum: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    all_sum: dict[str, int] = defaultdict(int)
+    for r in daily_rows:
+        sid = _parse_store_id_or_unassigned(r[0])
+        sid_key = ADS_UNASSIGNED_STORE_ID if sid is None else int(sid)
+        d = _cell_date(r[1])
+        wn = day_to_week.get(d)
+        if wn is None:
+            continue
+        imp = int(r[2] or 0)
+        per_store_sum[sid_key][wn] += imp
+        all_sum[wn] += imp
+
+    per_store: dict[int, list[dict]] = {}
+    for sid, by_week in per_store_sum.items():
+        arr: list[dict] = []
+        for wn in sorted(by_week.keys()):
+            m = week_meta.get(wn)
+            if not m:
+                continue
+            arr.append(
+                {
+                    "week_no": wn,
+                    "impressions": int(by_week[wn]),
+                    "store_id": sid,
+                    "d_min": m["d_min"],
+                    "d_max": m["d_max"],
+                    "mid": m["mid"],
+                }
+            )
+        per_store[sid] = arr
+
+    all_weeks: list[dict] = []
+    for wn in sorted(all_sum.keys()):
+        m = week_meta.get(wn)
+        if not m:
+            continue
+        all_weeks.append(
+            {
+                "week_no": wn,
+                "impressions": int(all_sum[wn]),
+                "d_min": m["d_min"],
+                "d_max": m["d_max"],
+                "mid": m["mid"],
+            }
+        )
+
+    logger.info(
+        "[AdsImpressionWeekly] week_filter=amazon_search_data.start_date range=%s..%s store_groups=%s aggregate_weeks=%s",
+        params["d0"],
+        params["d1"],
+        len(per_store),
+        len(all_weeks),
+    )
+    return per_store, all_weeks
+
+
+def _subtract_weekly_impressions(
+    total_per_store: dict[int, list[dict]],
+    total_all: list[dict],
+    ads_per_store: dict[int, list[dict]],
+    ads_all: list[dict],
+) -> tuple[dict[int, list[dict]], list[dict]]:
+    """按 week_no 计算去广告 impressions：max(total - ads, 0)。"""
+    ads_all_map = {str(w["week_no"]): int(w.get("impressions") or 0) for w in ads_all}
+    out_all: list[dict] = []
+    for w in total_all:
+        wn = str(w["week_no"])
+        total_imp = int(w.get("impressions") or 0)
+        ad_imp = int(ads_all_map.get(wn, 0))
+        out_all.append({**w, "impressions": max(total_imp - ad_imp, 0)})
+
+    out_store: dict[int, list[dict]] = {}
+    for sid, weeks in total_per_store.items():
+        ads_map = {
+            str(w["week_no"]): int(w.get("impressions") or 0)
+            for w in ads_per_store.get(sid, [])
+        }
+        arr: list[dict] = []
+        for w in weeks:
+            wn = str(w["week_no"])
+            total_imp = int(w.get("impressions") or 0)
+            ad_imp = int(ads_map.get(wn, 0))
+            arr.append({**w, "impressions": max(total_imp - ad_imp, 0)})
+        out_store[sid] = arr
+    return out_store, out_all
+
+
 def _merge_label_dates(
     traffic_dates: list[date],
     imp_weeks_all: list[dict],
@@ -488,6 +660,9 @@ def build_chart_payload(
     impression_per_store: dict[int, list[dict]],
     impression_all: list[dict],
     impression_enabled: bool,
+    non_ad_impression_per_store: dict[int, list[dict]],
+    non_ad_impression_all: list[dict],
+    non_ad_impression_enabled: bool,
     ads_series_map: dict[int | None, dict[date, int]],
     ads_impressions_map: dict[int | None, dict[date, int]],
     ads_enabled: bool,
@@ -504,13 +679,22 @@ def build_chart_payload(
         return _series_for_labels(ads_impressions_map.get(key, {}), labels)
 
     imp_all_vals, imp_all_meta = _impression_line_for_labels(impression_all, labels)
+    non_ad_imp_all_vals, non_ad_imp_all_meta = _impression_line_for_labels(
+        non_ad_impression_all, labels
+    )
     by_store_imp: dict[str, list[int | None]] = {}
     by_store_meta: dict[str, list[dict | None]] = {}
+    by_store_non_ad_imp: dict[str, list[int | None]] = {}
+    by_store_non_ad_meta: dict[str, list[dict | None]] = {}
     for sid in store_ids:
         wks = impression_per_store.get(sid, [])
         v, m = _impression_line_for_labels(wks, labels)
         by_store_imp[str(sid)] = v
         by_store_meta[str(sid)] = m
+        wks_non_ad = non_ad_impression_per_store.get(sid, [])
+        v2, m2 = _impression_line_for_labels(wks_non_ad, labels)
+        by_store_non_ad_imp[str(sid)] = v2
+        by_store_non_ad_meta[str(sid)] = m2
 
     return {
         "labels": lab_iso,
@@ -522,6 +706,11 @@ def build_chart_payload(
         "impression_all_meta": imp_all_meta,
         "impression_by_store": by_store_imp,
         "impression_meta_by_store": by_store_meta,
+        "nonAdImpressionEnabled": non_ad_impression_enabled,
+        "non_ad_impression_all": non_ad_imp_all_vals,
+        "non_ad_impression_all_meta": non_ad_imp_all_meta,
+        "non_ad_impression_by_store": by_store_non_ad_imp,
+        "non_ad_impression_meta_by_store": by_store_non_ad_meta,
         "adsEnabled": ads_enabled,
         "ads_all_data": ads_series(None),
         "ads_by_store": {str(sid): ads_series(sid) for sid in store_ids},
@@ -669,7 +858,9 @@ def render_html(payload: dict) -> str:
     <p class="sub">
       <strong>左轴（0～500～1000…，步长 500）</strong>：<code>amazon_sales_and_traffic_daily</code> 按日 <code>SUM(sessions)</code>（绿）与 <code>amazon_ads_ad_group_ad_report</code> 按日 <code>SUM(clicks)</code>（紫）共用。<br />
       <strong>右轴（0～1万～2万…，步长 1 万）</strong>：<code>amazon_search</code> 按该 <code>week_no</code> 汇总<strong>整周</strong>
-      <code>SUM(impression_count)</code>（橙点；图上 <code>week_no</code> 为表内原值，横坐标为周三）与 <code>广告日 impressions</code>（黄线）共用。<br />
+      <code>SUM(impression_count)</code>（橙点）、
+      去广告 impressions（蓝点 = 周 total impressions - 该周广告 impressions）、
+      以及 <code>广告日 impressions</code>（黄线）共用；周点横坐标均为周三。<br />
     </p>
     <div class="toolbar">
       <div>
@@ -707,6 +898,11 @@ def render_html(payload: dict) -> str:
     var impAllMeta = payload.impression_all_meta || [];
     var impByStore = payload.impression_by_store || {{}};
     var impMetaByStore = payload.impression_meta_by_store || {{}};
+    var nonAdImpOn = payload.nonAdImpressionEnabled;
+    var nonAdImpAll = payload.non_ad_impression_all || [];
+    var nonAdImpAllMeta = payload.non_ad_impression_all_meta || [];
+    var nonAdImpByStore = payload.non_ad_impression_by_store || {{}};
+    var nonAdImpMetaByStore = payload.non_ad_impression_meta_by_store || {{}};
     var adsOn = payload.adsEnabled;
     var adsAll = payload.ads_all_data || [];
     var adsByStore = payload.ads_by_store || {{}};
@@ -714,9 +910,11 @@ def render_html(payload: dict) -> str:
     var adsImpByStore = payload.ads_impressions_by_store || {{}};
 
     var idxSessions = 0;
-    var idxImp = impOn ? 1 : -1;
-    var idxAdsClicks = adsOn ? (impOn ? 2 : 1) : -1;
-    var idxAdsImp = adsOn ? (impOn ? 3 : 2) : -1;
+    var _idx = 1;
+    var idxImp = impOn ? _idx++ : -1;
+    var idxNonAdImp = nonAdImpOn ? _idx++ : -1;
+    var idxAdsClicks = adsOn ? _idx++ : -1;
+    var idxAdsImp = adsOn ? _idx++ : -1;
 
     var sel = document.getElementById('storeSel');
     storeIds.forEach(function (sid) {{
@@ -761,6 +959,16 @@ def render_html(payload: dict) -> str:
       return {{
         data: impByStore[v] || labels.map(function () {{ return null; }}),
         meta: impMetaByStore[v] || labels.map(function () {{ return null; }})
+      }};
+    }}
+
+    function currentNonAdImpressionSeries() {{
+      var v = sel.value;
+      if (!nonAdImpOn) return {{ data: [], meta: [] }};
+      if (!v) return {{ data: nonAdImpAll, meta: nonAdImpAllMeta }};
+      return {{
+        data: nonAdImpByStore[v] || labels.map(function () {{ return null; }}),
+        meta: nonAdImpMetaByStore[v] || labels.map(function () {{ return null; }})
       }};
     }}
 
@@ -830,10 +1038,10 @@ def render_html(payload: dict) -> str:
           var yRaw = ds.data[ix];
           var axisHint = ds.yAxisID === 'y1' ? '右轴' : '左轴';
           showPointValue(xLab, ds.label || '', yRaw, axisHint);
-          if (dsIdx === idxImp && idxImp >= 0) {{
+          if ((dsIdx === idxImp && idxImp >= 0) || (dsIdx === idxNonAdImp && idxNonAdImp >= 0)) {{
             var meta = null;
             try {{
-              var is = currentImpressionSeries();
+              var is = (dsIdx === idxNonAdImp) ? currentNonAdImpressionSeries() : currentImpressionSeries();
               meta = (is && is.meta && is.meta[ix]) ? is.meta[ix] : null;
             }} catch (e2) {{
               meta = null;
@@ -854,6 +1062,8 @@ def render_html(payload: dict) -> str:
                 if (ctx.dataset.yAxisID === 'y1') {{
                   if (idxAdsImp >= 0 && ctx.datasetIndex === idxAdsImp)
                     return ' 广告 impressions（日）: ' + Number(v).toLocaleString();
+                  if (idxNonAdImp >= 0 && ctx.datasetIndex === idxNonAdImp)
+                    return ' 去广告 impressions（week_no）: ' + Number(v).toLocaleString();
                   var line = ' total impressions（week_no）: ' + Number(v).toLocaleString();
                   if (idxImp >= 0 && ctx.datasetIndex === idxImp && ctx.dataset._impressionMeta) {{
                     var m = ctx.dataset._impressionMeta[ctx.dataIndex];
@@ -929,6 +1139,28 @@ def render_html(payload: dict) -> str:
       dsImp._impressionMeta = impSeries.meta;
       chart.data.datasets.push(dsImp);
     }}
+    if (nonAdImpOn) {{
+      var nonAdSeries = currentNonAdImpressionSeries();
+      var dsNonAdImp = {{
+        label: '去广告 impressions · week_no（右轴，点=周三）',
+        data: nonAdSeries.data,
+        yAxisID: 'y1',
+        borderColor: '#60a5fa',
+        backgroundColor: 'rgba(96, 165, 250, 0.15)',
+        fill: false,
+        tension: 0.2,
+        spanGaps: false,
+        pointRadius: 6,
+        pointHoverRadius: 9,
+        pointBackgroundColor: '#60a5fa',
+        pointBorderColor: '#1a2332',
+        pointBorderWidth: 2,
+        borderWidth: 2,
+        order: 1,
+      }};
+      dsNonAdImp._impressionMeta = nonAdSeries.meta;
+      chart.data.datasets.push(dsNonAdImp);
+    }}
     if (adsOn) {{
       chart.data.datasets.push({{
         label: '广告 sessions（全部店铺合计，左轴）',
@@ -987,6 +1219,9 @@ def render_html(payload: dict) -> str:
       ];
       if (impOn && idxImp >= 0) {{
         specs.push({{ key: 'imp', idx: idxImp, shortLabel: 'total impressions · week_no（右轴·周三）', color: '#ffb347' }});
+      }}
+      if (nonAdImpOn && idxNonAdImp >= 0) {{
+        specs.push({{ key: 'imp_no_ad', idx: idxNonAdImp, shortLabel: '去广告 impressions · week_no（右轴·周三）', color: '#60a5fa' }});
       }}
       if (adsOn && idxAdsClicks >= 0) {{
         specs.push({{ key: 'adclk', idx: idxAdsClicks, shortLabel: '广告 sessions（左轴）', color: '#e879f9' }});
@@ -1048,6 +1283,11 @@ def render_html(payload: dict) -> str:
         chart.data.datasets[idxImp].data = is.data;
         chart.data.datasets[idxImp]._impressionMeta = is.meta;
       }}
+      if (nonAdImpOn && idxNonAdImp >= 0) {{
+        var nis = currentNonAdImpressionSeries();
+        chart.data.datasets[idxNonAdImp].data = nis.data;
+        chart.data.datasets[idxNonAdImp]._impressionMeta = nis.meta;
+      }}
       if (adsOn && idxAdsClicks >= 0) {{
         var adData = !v ? adsAll : (adsByStore[v] || labels.map(function () {{ return null; }}));
         var adsDs = chart.data.datasets[idxAdsClicks];
@@ -1090,6 +1330,9 @@ def build_report_html_for_range(start_date: date | None, end_date: date | None) 
     impression_enabled = range_ok
     impression_per_store: dict[int, list[dict]] = {}
     impression_all: list[dict] = []
+    non_ad_impression_enabled = range_ok
+    non_ad_impression_per_store: dict[int, list[dict]] = {}
+    non_ad_impression_all: list[dict] = []
     ads_enabled = range_ok
     ads_dates: list[date] = []
     ads_series_map: dict[int | None, dict[date, int]] = {None: {}}
@@ -1098,13 +1341,21 @@ def build_report_html_for_range(start_date: date | None, end_date: date | None) 
 
     if range_ok:
         t0 = time.time()
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="traffic-report") as ex:
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="traffic-report") as ex:
             fut_traffic = ex.submit(fetch_traffic_daily_by_store, start_date, end_date)
             fut_ads = ex.submit(fetch_ads_daily_metrics_by_store, start_date, end_date)
             fut_imp = ex.submit(fetch_impression_weekly, start_date, end_date)
+            fut_ads_imp_weekly = ex.submit(fetch_ads_impression_weekly_filtered, start_date, end_date)
             sorted_dates, series_map, store_ids = fut_traffic.result()
             ads_dates, ads_series_map, ads_impressions_map, ads_store_ids = fut_ads.result()
             impression_per_store, impression_all = fut_imp.result()
+            ads_imp_weekly_per_store, ads_imp_weekly_all = fut_ads_imp_weekly.result()
+            non_ad_impression_per_store, non_ad_impression_all = _subtract_weekly_impressions(
+                impression_per_store,
+                impression_all,
+                ads_imp_weekly_per_store,
+                ads_imp_weekly_all,
+            )
         logger.info(
             "[Traffic+Impression+Ads] parallel fetch range=%s..%s elapsed_sec=%.2f",
             start_date,
@@ -1133,6 +1384,9 @@ def build_report_html_for_range(start_date: date | None, end_date: date | None) 
         impression_per_store,
         impression_all,
         impression_enabled,
+        non_ad_impression_per_store,
+        non_ad_impression_all,
+        non_ad_impression_enabled,
         ads_series_map,
         ads_impressions_map,
         ads_enabled,

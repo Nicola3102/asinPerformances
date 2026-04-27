@@ -425,7 +425,7 @@ def _fetch_matrix_rows_online(
               AND al.created_at IS NOT NULL
               AND al.open_date IS NOT NULL
               AND av.created_at IS NOT NULL
-              AND DATE(al.created_at) = DATE(av.created_at)
+              AND ABS(TIMESTAMPDIFF(DAY, DATE(al.created_at), DATE(av.created_at))) <= 1
               {extra}
         ) AS nl
         INNER JOIN (
@@ -513,7 +513,7 @@ def _cohort_day_asin_breakdown_online(
               AND al.created_at IS NOT NULL
               AND al.open_date IS NOT NULL
               AND av.created_at IS NOT NULL
-              AND DATE(al.created_at) = DATE(av.created_at)
+              AND ABS(TIMESTAMPDIFF(DAY, DATE(al.created_at), DATE(av.created_at))) <= 1
               AND DATE(al.open_date) IN ({ph})
               {extra_nl}
         ) AS nl
@@ -599,7 +599,7 @@ def _fetch_matrix_rows_online_bulk(
               AND al.created_at IS NOT NULL
               AND al.open_date IS NOT NULL
               AND av.created_at IS NOT NULL
-              AND DATE(al.created_at) = DATE(av.created_at)
+              AND ABS(TIMESTAMPDIFF(DAY, DATE(al.created_at), DATE(av.created_at))) <= 1
               {extra}
         ) AS nl
         INNER JOIN (
@@ -812,7 +812,7 @@ def _fetch_listing_new_refurb_by_day_online(
                    COALESCE(SUM(CASE
                        WHEN al.created_at IS NOT NULL
                         AND av.created_at IS NOT NULL
-                        AND DATE(al.created_at) = DATE(av.created_at)
+                        AND ABS(TIMESTAMPDIFF(DAY, DATE(al.created_at), DATE(av.created_at))) <= 1
                        THEN 1 ELSE 0 END), 0) AS new_n,
                    COALESCE(SUM(CASE
                        WHEN al.created_at IS NULL
@@ -837,7 +837,7 @@ def _fetch_listing_new_refurb_by_day_online(
                    COALESCE(SUM(CASE
                        WHEN al.created_at IS NOT NULL
                         AND av.created_at IS NOT NULL
-                        AND DATE(al.created_at) = DATE(av.created_at)
+                        AND ABS(TIMESTAMPDIFF(DAY, DATE(al.created_at), DATE(av.created_at))) <= 1
                        THEN 1 ELSE 0 END), 0) AS new_n,
                    COALESCE(SUM(CASE
                        WHEN al.created_at IS NULL
@@ -896,7 +896,7 @@ def _fetch_new_listing_keys_online(
           AND al.created_at IS NOT NULL
           AND al.open_date IS NOT NULL
           AND av.created_at IS NOT NULL
-          AND DATE(al.created_at) = DATE(av.created_at)
+          AND ABS(TIMESTAMPDIFF(DAY, DATE(al.created_at), DATE(av.created_at))) <= 1
           AND al.open_date >= :d0 AND al.open_date < :d1x
     """
     params: dict[str, object] = {"d0": d0, "d1x": d1_exclusive}

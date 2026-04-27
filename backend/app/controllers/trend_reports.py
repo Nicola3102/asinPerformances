@@ -136,7 +136,7 @@ _new_listing_sync_report_lock = threading.Lock()
 _new_listing_json_cache_lock = threading.Lock()
 _new_listing_json_cache: "OrderedDict[tuple, tuple[float, dict]]" = OrderedDict()
 # bump when cohort JSON shape changes (e.g. views.*.cohortTable[].daySessionAsins)
-_NEW_LISTING_JSON_CACHE_SCHEMA = "cohort-day-session-asins-v2-online-bd"
+_NEW_LISTING_JSON_CACHE_SCHEMA = "cohort-day-session-asins-v3-online-bd"
 
 
 def _new_listing_json_cache_get(key: tuple) -> dict | None:
