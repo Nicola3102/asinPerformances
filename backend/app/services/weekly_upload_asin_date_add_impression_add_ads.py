@@ -485,7 +485,8 @@ def fetch_ads_impression_weekly_filtered(
     max_day = max(_parse_ymd(x["d_max"]) for x in week_meta.values())
     sql_ads_daily = text(
         """
-        SELECT DATE(aacpr.`current_date`) AS d,
+        SELECT aacpr.store_id AS sid,
+               DATE(aacpr.`current_date`) AS d,
                SUM(COALESCE(aacpr.impressions, 0)) AS imp
         FROM amazon_ads_campaign_placement_report AS aacpr
         WHERE DATE(aacpr.`current_date`) >= :d0
@@ -494,8 +495,8 @@ def fetch_ads_impression_weekly_filtered(
             COALESCE(aacpr.placement_classification, '') LIKE '%Top of Search%'
             OR COALESCE(aacpr.placement_classification, '') LIKE '%Other on%'
           )
-        GROUP BY DATE(aacpr.`current_date`)
-        ORDER BY d ASC
+        GROUP BY aacpr.store_id, DATE(aacpr.`current_date`)
+        ORDER BY d ASC, aacpr.store_id ASC
         """
     )
     with get_online_engine().connect() as conn:
@@ -505,16 +506,39 @@ def fetch_ads_impression_weekly_filtered(
         ).fetchall()
 
     all_sum: dict[str, int] = defaultdict(int)
+    per_sum: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for r in daily_rows:
-        d = _cell_date(r[0])
+        sid = _parse_store_id_or_unassigned(r[0])
+        d = _cell_date(r[1])
         wn = day_to_week.get(d)
         if wn is None:
             continue
-        imp = int(r[1] or 0)
+        imp = int(r[2] or 0)
         all_sum[wn] += imp
+        if sid is None:
+            # store_id 缺失：计入全店但不计入任何单店（避免把“未分配店铺”的广告错扣到某店）
+            continue
+        per_sum[int(sid)][wn] += imp
 
-    # 该表口径默认按全局广告位（未分 store）；保留空 per_store，后续按全局周值回退减法
     per_store: dict[int, list[dict]] = {}
+    for sid, mp in per_sum.items():
+        weeks: list[dict] = []
+        for wn in sorted(mp.keys()):
+            m = week_meta.get(wn)
+            if not m:
+                continue
+            weeks.append(
+                {
+                    "week_no": wn,
+                    "impressions": int(mp[wn]),
+                    "d_min": m["d_min"],
+                    "d_max": m["d_max"],
+                    "mid": m["mid"],
+                    "store_id": int(sid),
+                }
+            )
+        if weeks:
+            per_store[int(sid)] = weeks
 
     all_weeks: list[dict] = []
     for wn in sorted(all_sum.keys()):
@@ -566,8 +590,8 @@ def _subtract_weekly_impressions(
         for w in weeks:
             wn = str(w["week_no"])
             total_imp = int(w.get("impressions") or 0)
-            # placement_report 常见无 store 维度：店铺序列回退使用全局周广告值
-            ad_imp = int(ads_map.get(wn, ads_all_map.get(wn, 0)))
+            # 分店铺视图：只能扣该店铺的广告 impressions；若该店铺在广告源表无数据，则按 0（不允许拿全店广告去扣分店总量）。
+            ad_imp = int(ads_map.get(wn, 0))
             arr.append({**w, "impressions": max(total_imp - ad_imp, 0)})
         out_store[sid] = arr
     return out_store, out_all
