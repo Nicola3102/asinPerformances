@@ -428,10 +428,9 @@ def fetch_ads_impression_weekly_filtered(
     """
     按与 total impressions 相同的 week_no 候选集合，统计「广告 impressions（投放位>0）」的整周值。
 
-    广告来源：
-    - amazon_ads_ad_group_ad_report aaagar.impressions
-    - INNER JOIN amazon_ads_campaign aac
-    - 条件：aac.rest_of_search > 0 OR aac.top_of_search > 0
+    广告来源（按新口径）：
+    - amazon_ads_campaign_placement_report aacpr.impressions
+    - 条件：placement_classification 包含 "Top of Search" 或 "Other on"
 
     周口径：
     - 先取报表区间内 amazon_search_data.start_date 出现过的 week_no
@@ -486,17 +485,17 @@ def fetch_ads_impression_weekly_filtered(
     max_day = max(_parse_ymd(x["d_max"]) for x in week_meta.values())
     sql_ads_daily = text(
         """
-        SELECT aaagar.store_id,
-               DATE(aaagar.`current_date`) AS d,
-               SUM(COALESCE(aaagar.impressions, 0)) AS imp
-        FROM amazon_ads_ad_group_ad_report AS aaagar
-        INNER JOIN amazon_ads_campaign AS aac
-            ON aac.campaign_id = aaagar.campaign_id
-        WHERE DATE(aaagar.`current_date`) >= :d0
-          AND DATE(aaagar.`current_date`) <= :d1
-          AND (COALESCE(aac.rest_of_search, 0) > 0 OR COALESCE(aac.top_of_search, 0) > 0)
-        GROUP BY aaagar.store_id, DATE(aaagar.`current_date`)
-        ORDER BY d ASC, aaagar.store_id ASC
+        SELECT DATE(aacpr.`current_date`) AS d,
+               SUM(COALESCE(aacpr.impressions, 0)) AS imp
+        FROM amazon_ads_campaign_placement_report AS aacpr
+        WHERE DATE(aacpr.`current_date`) >= :d0
+          AND DATE(aacpr.`current_date`) <= :d1
+          AND (
+            COALESCE(aacpr.placement_classification, '') LIKE '%Top of Search%'
+            OR COALESCE(aacpr.placement_classification, '') LIKE '%Other on%'
+          )
+        GROUP BY DATE(aacpr.`current_date`)
+        ORDER BY d ASC
         """
     )
     with get_online_engine().connect() as conn:
@@ -505,37 +504,17 @@ def fetch_ads_impression_weekly_filtered(
             {"d0": min_day.strftime("%Y-%m-%d"), "d1": max_day.strftime("%Y-%m-%d")},
         ).fetchall()
 
-    per_store_sum: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     all_sum: dict[str, int] = defaultdict(int)
     for r in daily_rows:
-        sid = _parse_store_id_or_unassigned(r[0])
-        sid_key = ADS_UNASSIGNED_STORE_ID if sid is None else int(sid)
-        d = _cell_date(r[1])
+        d = _cell_date(r[0])
         wn = day_to_week.get(d)
         if wn is None:
             continue
-        imp = int(r[2] or 0)
-        per_store_sum[sid_key][wn] += imp
+        imp = int(r[1] or 0)
         all_sum[wn] += imp
 
+    # 该表口径默认按全局广告位（未分 store）；保留空 per_store，后续按全局周值回退减法
     per_store: dict[int, list[dict]] = {}
-    for sid, by_week in per_store_sum.items():
-        arr: list[dict] = []
-        for wn in sorted(by_week.keys()):
-            m = week_meta.get(wn)
-            if not m:
-                continue
-            arr.append(
-                {
-                    "week_no": wn,
-                    "impressions": int(by_week[wn]),
-                    "store_id": sid,
-                    "d_min": m["d_min"],
-                    "d_max": m["d_max"],
-                    "mid": m["mid"],
-                }
-            )
-        per_store[sid] = arr
 
     all_weeks: list[dict] = []
     for wn in sorted(all_sum.keys()):
@@ -553,7 +532,7 @@ def fetch_ads_impression_weekly_filtered(
         )
 
     logger.info(
-        "[AdsImpressionWeekly] week_filter=amazon_search_data.start_date range=%s..%s store_groups=%s aggregate_weeks=%s",
+        "[AdsImpressionWeekly] source=amazon_ads_campaign_placement_report range=%s..%s store_groups=%s aggregate_weeks=%s",
         params["d0"],
         params["d1"],
         len(per_store),
@@ -587,7 +566,8 @@ def _subtract_weekly_impressions(
         for w in weeks:
             wn = str(w["week_no"])
             total_imp = int(w.get("impressions") or 0)
-            ad_imp = int(ads_map.get(wn, 0))
+            # placement_report 常见无 store 维度：店铺序列回退使用全局周广告值
+            ad_imp = int(ads_map.get(wn, ads_all_map.get(wn, 0)))
             arr.append({**w, "impressions": max(total_imp - ad_imp, 0)})
         out_store[sid] = arr
     return out_store, out_all
