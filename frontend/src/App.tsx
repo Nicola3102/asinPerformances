@@ -320,11 +320,13 @@ function NlDaySessionPopoverPortal({
   cancelClose,
   scheduleClose,
   onUnpin,
+  hasOrder,
 }: {
   anchor: NlDaySessionPopoverAnchor | null
   cancelClose: () => void
   scheduleClose: () => void
   onUnpin: () => void
+  hasOrder: (asin: string, storeId: number) => boolean
 }) {
   if (anchor == null || typeof document === 'undefined') return null
   const { left, top, items, cellTotal, pinned } = anchor
@@ -379,7 +381,9 @@ function NlDaySessionPopoverPortal({
           <div className="trend-nl-day-popover-body">
             {items.map((x, idx) => (
               <div key={`${x.asin}-${x.storeId}-${idx}`} className="trend-nl-day-popover-row">
-                <span className="trend-nl-day-popover-asin">{x.asin}</span>
+                <span className={`trend-nl-day-popover-asin${hasOrder(x.asin, x.storeId) ? ' is-has-order' : ''}`}>
+                  {x.asin}
+                </span>
                 <span className="trend-nl-day-popover-store">{x.storeId}</span>
                 <span className="trend-nl-day-popover-sessions">{x.sessions.toLocaleString('zh-CN')}</span>
               </div>
@@ -3123,9 +3127,80 @@ function TrendNewListingEmbeddedPage() {
   const [nlDayPopover, setNlDayPopover] = useState<NlDaySessionPopoverAnchor | null>(null)
   const nlPopTimerRef = useRef<number | null>(null)
   const nlDayPopoverRef = useRef<NlDaySessionPopoverAnchor | null>(null)
+  const nlHasOrderRef = useRef<Map<string, boolean>>(new Map())
+  const nlOrderFetchInFlightRef = useRef<AbortController | null>(null)
+  const [nlOrderCacheEpoch, setNlOrderCacheEpoch] = useState(0)
 
   useEffect(() => {
     nlDayPopoverRef.current = nlDayPopover
+  }, [nlDayPopover])
+
+  const nlHasOrder = useCallback(
+    (asin: string, storeId: number) => {
+      const key = `${String(asin || '').trim()}||${Number(storeId)}`
+      return Boolean(nlHasOrderRef.current.get(key))
+    },
+    [nlOrderCacheEpoch],
+  )
+
+  useEffect(() => {
+    const p = nlDayPopover
+    if (!p || !Array.isArray(p.items) || p.items.length === 0) return
+    // 仅在弹层打开后拉取一次缺失项；固定/非固定都需要高亮（复制时也希望看到）
+    // 大区间查询时后端负载高；限制弹层触发的 order-flags 请求规模，避免与主报表请求抢 online pool。
+    if (p.items.length > 450) return
+    const uniq: Array<{ asin: string; store_id: number }> = []
+    const seen = new Set<string>()
+    for (const it of p.items) {
+      const asin = String(it?.asin ?? '').trim()
+      const sid = Number(it?.storeId ?? NaN)
+      if (!asin || !Number.isFinite(sid)) continue
+      const k = `${asin}||${sid}`
+      if (seen.has(k)) continue
+      seen.add(k)
+      if (nlHasOrderRef.current.has(k)) continue
+      uniq.push({ asin, store_id: sid })
+    }
+    if (!uniq.length) return
+    // 限制单次请求大小
+    const batch = uniq.slice(0, 400)
+    // 避免并发打多次（鼠标移动/反复开关弹层）；在上一请求完成前不再发起新请求
+    if (nlOrderFetchInFlightRef.current) return
+    const ac = new AbortController()
+    nlOrderFetchInFlightRef.current = ac
+    fetch('/api/trend/new-listing/order-flags', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: batch }),
+      signal: ac.signal,
+    })
+      .then(async (res) => {
+        const text = await res.text()
+        if (!res.ok) throw new Error(text || `HTTP ${res.status}`)
+        return JSON.parse(text) as { has_orders?: Array<{ asin: string; store_id: number }> }
+      })
+      .then((data) => {
+        const rows = Array.isArray(data?.has_orders) ? data.has_orders : []
+        // 先把请求过的全标记为 false，避免重复打接口
+        for (const it of batch) {
+          nlHasOrderRef.current.set(`${it.asin}||${it.store_id}`, false)
+        }
+        for (const r of rows) {
+          const asin = String(r?.asin ?? '').trim()
+          const sid = Number((r as any)?.store_id ?? NaN)
+          if (!asin || !Number.isFinite(sid)) continue
+          nlHasOrderRef.current.set(`${asin}||${sid}`, true)
+        }
+        setNlOrderCacheEpoch((x) => x + 1)
+      })
+      .catch((e) => {
+        if (typeof e === 'object' && e !== null && (e as any).name === 'AbortError') return
+        // 静默失败：不影响弹层展示
+      })
+      .finally(() => {
+        // 允许下一次触发
+        if (nlOrderFetchInFlightRef.current === ac) nlOrderFetchInFlightRef.current = null
+      })
   }, [nlDayPopover])
 
   const nlPopoverCancelClose = useCallback(() => {
@@ -3407,6 +3482,9 @@ function TrendNewListingEmbeddedPage() {
   /** views.all 就绪后空闲预取各店 json_views=store，合并进 payload / 本地缓存；切换店铺时直接命中 views[id] */
   useEffect(() => {
     if (!payload?.views?.all) return
+    // 自定义起止日期往往区间较大，预取各店会触发多次后端重算/online 查询，容易变慢或把 online pool 打满。
+    // 默认 35 天窗口才做 idle 预取加速「切换店铺」。
+    if (!useDefaultDateRange) return
     const ids = payload.storeIds || []
     if (!ids.length) return
 
@@ -3944,6 +4022,7 @@ function TrendNewListingEmbeddedPage() {
         cancelClose={nlPopoverCancelClose}
         scheduleClose={nlPopoverScheduleClose}
         onUnpin={nlPopoverCloseNow}
+        hasOrder={nlHasOrder}
       />
     </div>
   )

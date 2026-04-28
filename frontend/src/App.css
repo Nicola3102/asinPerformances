@@ -600,6 +600,14 @@
   user-select: text;
 }
 
+.trend-nl-day-popover-asin.is-has-order {
+  background-color: #fff9c4;
+  color: #111827;
+  padding: 0.08rem 0.28rem;
+  border-radius: 4px;
+  font-weight: 650;
+}
+
 .trend-nl-day-popover-store,
 .trend-nl-day-popover-sessions {
   font-variant-numeric: tabular-nums;

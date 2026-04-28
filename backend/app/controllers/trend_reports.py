@@ -17,11 +17,14 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, Query
 from fastapi.responses import HTMLResponse, JSONResponse
-from sqlalchemy import func
+from pydantic import BaseModel
+from sqlalchemy import func, text
+from sqlalchemy.exc import OperationalError, TimeoutError
 
 from app.config import settings
 from app.database import SessionLocal, init_db
 from app.models import DailyUploadAsinData
+from app.online_engine import get_online_reporting_engine
 from app.services.daily_upload_asin_data_ds import sync_range, sync_with_default_date_range
 from app.services.daily_upload_session_report_html_pst import (
     DEFAULT_LISTING_SINCE,
@@ -201,6 +204,96 @@ def _new_listing_json_cache_stats_payload() -> dict:
 
 
 router = APIRouter()
+
+
+class NewListingOrderFlagItem(BaseModel):
+    asin: str
+    store_id: int
+
+
+class NewListingOrderFlagRequest(BaseModel):
+    items: list[NewListingOrderFlagItem]
+
+
+class NewListingOrderFlagResponse(BaseModel):
+    has_orders: list[NewListingOrderFlagItem]
+
+
+@router.post("/new-listing/order-flags", response_model=NewListingOrderFlagResponse)
+def trend_new_listing_order_flags(req: NewListingOrderFlagRequest):
+    """
+    批量判定：给定 (asin, store_id) 列表，检查 online_db.order_item 是否存在订单。
+    """
+    if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
+        return NewListingOrderFlagResponse(has_orders=[])
+
+    raw_items = req.items or []
+    norm: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    for it in raw_items:
+        asin = str(it.asin or "").strip()
+        if not asin:
+            continue
+        try:
+            sid = int(it.store_id)
+        except Exception:
+            continue
+        key = (asin, sid)
+        if key in seen:
+            continue
+        seen.add(key)
+        norm.append(key)
+
+    if not norm:
+        return NewListingOrderFlagResponse(has_orders=[])
+
+    # 防止超大请求；前端会分批/缓存
+    norm = norm[:1200]
+
+    def _query_chunk(pairs: list[tuple[str, int]]) -> list[tuple[str, int]]:
+        ph = ", ".join([f"(:a{i}, :s{i})" for i in range(len(pairs))])
+        params: dict[str, object] = {}
+        for i, (a, s) in enumerate(pairs):
+            params[f"a{i}"] = a
+            params[f"s{i}"] = int(s)
+        sql = text(
+            f"""
+            SELECT TRIM(oi.asin) AS asin_b, oi.store_id AS sid
+            FROM order_item AS oi
+            WHERE (TRIM(oi.asin), oi.store_id) IN ({ph})
+            GROUP BY TRIM(oi.asin), oi.store_id
+            """
+        )
+        try:
+            with get_online_reporting_engine().connect() as conn:
+                rows = conn.execute(sql, params).fetchall()
+        except (TimeoutError, OperationalError) as exc:
+            # 该接口仅用于 UI 高亮；online_reporting 连接池在 heavy report / 并发查询时可能被打满。
+            # 超时则降级为「无订单标记」，避免拖垮主页面加载或连带其它接口 500。
+            logger.warning(
+                "POST /api/trend/new-listing/order-flags degraded: pairs=%s err=%s",
+                len(pairs),
+                exc,
+            )
+            return []
+        out: list[tuple[str, int]] = []
+        for r in rows:
+            a = str(r[0] or "").strip()
+            if not a:
+                continue
+            try:
+                sid = int(r[1])
+            except Exception:
+                continue
+            out.append((a, sid))
+        return out
+
+    has: list[tuple[str, int]] = []
+    for i in range(0, len(norm), 300):
+        has.extend(_query_chunk(norm[i : i + 300]))
+
+    resp_items = [NewListingOrderFlagItem(asin=a, store_id=s) for (a, s) in has]
+    return NewListingOrderFlagResponse(has_orders=resp_items)
 
 
 def _si_cache_headers(body: str) -> dict[str, str]:
@@ -522,7 +615,23 @@ def trend_new_listing_report(
             # 预热单店 views：当首屏只返回 all 视图（json_views=all）时，后台空闲并发构建各店 store payload 并写入进程内短缓存，
             # 使后续切换店铺 json_views=store 更易命中缓存（前端也会在浏览器 idle 预取）。
             if json_views_mode == "all_only":
-                store_ids = list(payload.get("storeIds") or [])
+                # 大区间（用户自定义起止日期）会导致 build_report_payload 与 online matrix 查询非常重；
+                # 此时再并发预热每个 store 容易把 online reporting 连接池打满，触发 QueuePool timeout，表现为「加载失败/非常慢」。
+                # 默认 35 天窗口才值得预热。
+                try:
+                    span_days = (end_d - start_d).days
+                except Exception:
+                    span_days = 999999
+                if span_days > 45:
+                    logger.info(
+                        "New Listing store prewarm skipped: span_days=%s range=%s..%s",
+                        span_days,
+                        start_d,
+                        end_d,
+                    )
+                    store_ids = []
+                else:
+                    store_ids = list(payload.get("storeIds") or [])
                 # 只在 store 数较多时才值得预热；并限制并发，避免抢占请求线程资源
                 if store_ids:
                     cache_keys_to_warm: list[tuple[int, tuple]] = []

@@ -583,8 +583,8 @@ def _fetch_matrix_rows_online_bulk(
         f"""
         SELECT nl.store_id,
                nl.open_day AS cd,
-               td.session_day AS sd,
-               SUM(td.sessions) AS s
+               DATE(d.`current_date`) AS sd,
+               SUM(COALESCE(d.sessions, 0)) AS s
         FROM (
             SELECT DISTINCT
                    TRIM(al.asin) AS asin,
@@ -602,19 +602,12 @@ def _fetch_matrix_rows_online_bulk(
               AND ABS(TIMESTAMPDIFF(DAY, DATE(al.created_at), DATE(av.created_at))) <= 1
               {extra}
         ) AS nl
-        INNER JOIN (
-            SELECT d.asin,
-                   d.store_id,
-                   DATE(d.`current_date`) AS session_day,
-                   SUM(COALESCE(d.sessions, 0)) AS sessions
-            FROM amazon_sales_and_traffic_daily AS d
-            WHERE d.`current_date` >= :d0
-              AND d.`current_date` < :d1x
-            GROUP BY d.asin, d.store_id, DATE(d.`current_date`)
-        ) AS td
-            ON td.asin = nl.asin AND td.store_id = nl.store_id
-        WHERE td.session_day >= nl.open_day
-        GROUP BY nl.store_id, nl.open_day, td.session_day
+        INNER JOIN amazon_sales_and_traffic_daily AS d
+            ON d.asin = nl.asin AND d.store_id = nl.store_id
+        WHERE d.`current_date` >= :d0
+          AND d.`current_date` < :d1x
+          AND DATE(d.`current_date`) >= nl.open_day
+        GROUP BY nl.store_id, nl.open_day, DATE(d.`current_date`)
         """
     )
     rows = conn.execute(q, params).fetchall()
@@ -1809,7 +1802,9 @@ def build_report_payload(
                         + int(settings.ONLINE_REPORT_POOL_OVERFLOW)
                         - 1,
                     )
-                    max_workers = min(len(prefetch_sids), pool_cap)
+                    # 这里并发过高会与其它接口（ads、order-flags、其它 trend）争抢 online_reporting 连接池，
+                    # 造成 QueuePool timeout，表现为“页面加载无反应/偶发 500”。限制在 2 并发更稳。
+                    max_workers = min(len(prefetch_sids), max(1, min(2, pool_cap)))
                     fmap = {}
                     with ThreadPoolExecutor(max_workers=max_workers) as ex:
                         for sid in prefetch_sids:
@@ -1917,61 +1912,15 @@ def build_report_payload(
                     )
                     mat_one = table_mat_one
                 else:
-                    table_mat_by_store_raw: dict[int, dict[tuple[date, date], int]] = {}
-
-                    def _matrix_worker(sid: int):
-                        eng = get_online_reporting_engine()
-                        with eng.connect() as c:
-                            return (
-                                sid,
-                                _fetch_matrix_rows_online(
-                                    c,
-                                    sid,
-                                    matrix_session_start,
-                                    matrix_session_end,
-                                    open_date_start=listing_since,
-                                    open_date_end=listing_through,
-                                ),
-                            )
-
-                    if len(online_prefetch_store_ids) > 1:
-                        pool_cap = max(
-                            1,
-                            int(settings.ONLINE_REPORT_POOL_SIZE)
-                            + int(settings.ONLINE_REPORT_POOL_OVERFLOW)
-                            - 1,
+                        # 单连接 bulk 查询一次拿到全店 + 分店矩阵，避免“每店一查询/一连接”导致耗时放大与连接池超时。
+                        table_mat_all_raw, table_mat_by_store_raw = _fetch_matrix_rows_online_bulk(
+                            listing_conn,
+                            matrix_session_start,
+                            matrix_session_end,
+                            open_date_start=listing_since,
+                            open_date_end=listing_through,
                         )
-                        max_workers = min(len(online_prefetch_store_ids), pool_cap)
-                        fmap = {}
-                        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                            for sid in online_prefetch_store_ids:
-                                fmap[ex.submit(_matrix_worker, sid)] = sid
-                            for fut in as_completed(fmap):
-                                sid = fmap[fut]
-                                try:
-                                    sid2, mat_s = fut.result()
-                                    table_mat_by_store_raw[sid2] = mat_s
-                                except Exception as exc:
-                                    logger.warning(
-                                        "[PST] online matrix store_id=%s failed (degraded to empty): %s",
-                                        sid,
-                                        exc,
-                                    )
-                                    table_mat_by_store_raw[sid] = {}
-                    else:
-                        for sid in online_prefetch_store_ids:
-                            table_mat_by_store_raw[sid] = _fetch_matrix_rows_online(
-                                listing_conn,
-                                sid,
-                                matrix_session_start,
-                                matrix_session_end,
-                                open_date_start=listing_since,
-                                open_date_end=listing_through,
-                            )
-                    table_mat_all_raw = _merge_matrix_maps(
-                        *(table_mat_by_store_raw.get(sid) for sid in online_prefetch_store_ids)
-                    )
-                    mat_all_raw, mat_by_store_raw = table_mat_all_raw, table_mat_by_store_raw
+                        mat_all_raw, mat_by_store_raw = table_mat_all_raw, table_mat_by_store_raw
             else:
                 if json_views_mode == "store" and single_store_id is not None:
                     table_mat_one = _fetch_matrix_rows(
@@ -2167,7 +2116,7 @@ def build_report_payload(
         if profile:
             payload["profileTimingsSec"] = {**timings, "total": round(time.perf_counter() - t0, 4)}
         logger.info(
-            "[PST] build_report_payload done: mode=%s prefer_online=%s online=%s listing_conn=%s stores=%s matrix_range=%s..%s chart_range=%s..%s elapsed_sec=%.2f",
+            "[PST] build_report_payload done: mode=%s prefer_online=%s online=%s listing_conn=%s stores=%s matrix_range=%s..%s chart_range=%s..%s elapsed_sec=%.2f (matrix=online_bulk when online)",
             json_views_mode,
             prefer_online,
             online is not None,

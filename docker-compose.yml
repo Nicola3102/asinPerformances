@@ -32,7 +32,9 @@ services:
       MYSQL_USER: rug_user
       MYSQL_PASSWORD: rug_password
       MYSQL_DATABASE: rug
-    command: uvicorn app.main:app --host 0.0.0.0 --port 9090 --reload
+    # 注意：--reload 会在文件变更时重启进程，长查询（如 New Listing 大区间）会被中断，表现为“查询无结果/无响应”。
+    # 如需后端热重载，可在本机直接运行 uvicorn --reload；docker 默认关闭以保证请求稳定。
+    command: uvicorn app.main:app --host 0.0.0.0 --port 9090
     depends_on:
       mysql:
         condition: service_healthy
