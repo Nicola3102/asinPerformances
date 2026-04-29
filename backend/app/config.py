@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     # GET /api/trend/new-listing?format=json 进程内缓存（本地 session 矩阵会变，不宜过长）
     NEW_LISTING_JSON_CACHE_TTL_SEC: int = Field(default=120, validation_alias="new_listing_json_cache_ttl_sec")
     NEW_LISTING_JSON_CACHE_MAX_KEYS: int = Field(default=32, validation_alias="new_listing_json_cache_max_keys")
+    # New Listing json_views=all/full 与单线程 heavy 构建串行：在此时间内排队等待槽位，避免 0.2s 就 429 导致前端重试风暴
+    NEW_LISTING_HEAVY_ACQUIRE_TIMEOUT_SEC: float = Field(
+        default=240.0,
+        validation_alias="new_listing_heavy_acquire_timeout_sec",
+    )
 
     # 定时同步：东八区每 N 小时执行一次；后端进程需常驻
     ENABLE_SCHEDULED_SYNC: bool = Field(default=True, validation_alias="enable_scheduled_sync")

@@ -599,7 +599,7 @@ def operate_by_parent_week(
     n = (
         db.query(AsinPerformance)
         .filter(
-            func.trim(AsinPerformance.parent_asin) == parent_asin,
+            AsinPerformance.parent_asin == parent_asin,
             AsinPerformance.week_no == week_no,
         )
         .update(
@@ -628,7 +628,7 @@ def ad_check_by_parent_week(
     n = (
         db.query(AsinPerformance)
         .filter(
-            func.trim(AsinPerformance.parent_asin) == parent_asin,
+            AsinPerformance.parent_asin == parent_asin,
             AsinPerformance.week_no == week_no,
         )
         .update(
@@ -914,7 +914,7 @@ def operate_group_a(
     n = (
         db.query(GroupA)
         .filter(
-            func.trim(GroupA.parent_asin) == parent_asin,
+            GroupA.parent_asin == parent_asin,
             GroupA.store_id == body.store_id,
             GroupA.week_no == week_no,
         )

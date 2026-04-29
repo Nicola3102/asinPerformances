@@ -152,7 +152,7 @@ def _fetch_order_item_ad_asin_sales(
         "COALESCE(oi.is_cancel, 0) = 0",
         "oi.purchase_utc_date IS NOT NULL",
         "oi.asin IS NOT NULL",
-        "TRIM(oi.asin) <> ''",
+        "oi.asin <> ''",
     ]
     params: dict[str, object] = {}
     if store_id is not None:
@@ -270,9 +270,9 @@ def list_ad_sales(
     total_ad_asin_count = (
         q.filter(
             DailyAdCostSales.ad_asin.is_not(None),
-            func.trim(DailyAdCostSales.ad_asin) != "",
+            DailyAdCostSales.ad_asin != "",
         )
-        .with_entities(func.count(func.distinct(func.trim(DailyAdCostSales.ad_asin))))
+        .with_entities(func.count(func.distinct(DailyAdCostSales.ad_asin)))
         .scalar()
         or 0
     )
@@ -312,7 +312,7 @@ def list_ad_sales(
             func.coalesce(func.sum(DailyAdCostSales.ad_cost), 0),
             func.coalesce(func.sum(DailyAdCostSales.sales_1d), 0),
             func.coalesce(func.sum(DailyAdCostSales.purchases), 0),
-            func.count(func.distinct(func.trim(DailyAdCostSales.ad_asin))),
+            func.count(func.distinct(DailyAdCostSales.ad_asin)),
         )
         .filter(DailyAdCostSales.purchase_date.is_not(None))
         .group_by(DailyAdCostSales.purchase_date)

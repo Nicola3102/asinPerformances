@@ -167,7 +167,7 @@ def _fetch_listing_kpi_online(conn: Connection, since: date, store_id: int | Non
                 AND DATE(created_at) >= :since
                 AND store_id = :sid
               GROUP BY store_id, asin
-              HAVING SUM(CASE WHEN LOWER(TRIM(COALESCE(status, ''))) = 'active' THEN 1 ELSE 0 END) > 0
+              HAVING SUM(CASE WHEN LOWER(COALESCE(status, '')) = 'active' THEN 1 ELSE 0 END) > 0
             ) t
             """
         )
@@ -186,7 +186,7 @@ def _fetch_listing_kpi_online(conn: Connection, since: date, store_id: int | Non
               WHERE asin IS NOT NULL 
                 AND DATE(created_at) >= :since
               GROUP BY store_id, asin
-              HAVING SUM(CASE WHEN LOWER(TRIM(COALESCE(status, ''))) = 'active' THEN 1 ELSE 0 END) > 0
+              HAVING SUM(CASE WHEN LOWER(COALESCE(status, '')) = 'active' THEN 1 ELSE 0 END) > 0
             ) t
             """
         )
@@ -376,7 +376,7 @@ def _fetch_active_asin_since(db: Session, store_id: int | None, since: date) -> 
               SELECT store_id, asin FROM {TABLE}
               WHERE created_at >= :since AND store_id = :sid
               GROUP BY store_id, asin
-              HAVING SUM(CASE WHEN LOWER(TRIM(COALESCE(status, ''))) = 'active' THEN 1 ELSE 0 END) > 0
+              HAVING SUM(CASE WHEN LOWER(COALESCE(status, '')) = 'active' THEN 1 ELSE 0 END) > 0
             ) t
             """
         )
@@ -388,7 +388,7 @@ def _fetch_active_asin_since(db: Session, store_id: int | None, since: date) -> 
               SELECT store_id, asin FROM {TABLE}
               WHERE created_at >= :since
               GROUP BY store_id, asin
-              HAVING SUM(CASE WHEN LOWER(TRIM(COALESCE(status, ''))) = 'active' THEN 1 ELSE 0 END) > 0
+              HAVING SUM(CASE WHEN LOWER(COALESCE(status, '')) = 'active' THEN 1 ELSE 0 END) > 0
             ) t
             """
         )

@@ -123,7 +123,7 @@ def _fetch_order_totals_by_day_store_asin(
 ) -> dict[tuple[date, int, str], Decimal]:
     """
     order_item：按 purchase_utc_date 的日历日，与报表日对齐的「店铺 + ASIN + 日」SUM(total_amount)，
-    order_status!=Canceled。键 (DATE(purchase_utc_date), store_id, TRIM(asin))。
+    order_status!=Canceled。键 (DATE(purchase_utc_date), store_id, asin)。
     """
     purchase_day_sql = _order_item_purchase_date_sql("oi")
     rows = online_conn.execute(
@@ -199,7 +199,7 @@ def _resolve_report_asin_trim_expr(online_conn) -> str:
                 "[DailyAdCostSales] 线上报表 ASIN 源列=%s → 写入本地 daily_ad_cost_sales.ad_asin",
                 col,
             )
-            return f"TRIM(r.`{col}`)"
+            return f"r.`{col}`"
     raise ValueError(
         "amazon_ads_ad_group_ad_report 未找到 ASIN 相关列，已尝试: "
         + ", ".join(_REPORT_ASIN_COLUMN_CANDIDATES)

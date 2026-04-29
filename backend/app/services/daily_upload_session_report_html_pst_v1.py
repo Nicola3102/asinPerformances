@@ -548,7 +548,7 @@ def _fetch_active_asin_since(db: Session, store_id: int | None, since: date) -> 
               SELECT store_id, asin FROM {TABLE}
               WHERE open_date IS NOT NULL AND open_date >= :since AND store_id = :sid
               GROUP BY store_id, asin
-              HAVING SUM(CASE WHEN LOWER(TRIM(COALESCE(status, ''))) = 'active' THEN 1 ELSE 0 END) > 0
+              HAVING SUM(CASE WHEN LOWER(COALESCE(status, '')) = 'active' THEN 1 ELSE 0 END) > 0
             ) t
             """
         )
@@ -560,7 +560,7 @@ def _fetch_active_asin_since(db: Session, store_id: int | None, since: date) -> 
               SELECT store_id, asin FROM {TABLE}
               WHERE open_date IS NOT NULL AND open_date >= :since
               GROUP BY store_id, asin
-              HAVING SUM(CASE WHEN LOWER(TRIM(COALESCE(status, ''))) = 'active' THEN 1 ELSE 0 END) > 0
+              HAVING SUM(CASE WHEN LOWER(COALESCE(status, '')) = 'active' THEN 1 ELSE 0 END) > 0
             ) t
             """
         )
@@ -686,7 +686,7 @@ def _build_cohort_table_rows(
     prefetched_new_by_day: dict[date, int] | None = None,
 ) -> list[dict]:
     """
-    一行 = 一个上新日：优先 amazon_listing 当日 listing 行数（asin 非空且 TRIM 非空，DATE(open_date)）；
+    一行 = 一个上新日：优先 amazon_listing 当日 listing 行数（asin 非空且  非空，DATE(open_date)）；
     第 1～30 列 = 本地 daily_upload_asin_dates 中该 open_date 批次的各 session_date sessions。
     """
     if prefetched_new_by_day is not None:

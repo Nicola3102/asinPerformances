@@ -1316,6 +1316,9 @@ def render_html(payload: dict) -> str:
       chart.update();
     }}
     sel.addEventListener('change', applyStore);
+    // 关键：浏览器可能会保留上次选择的 store_id（默认不是空）。
+    // 若不主动应用一次，图表仍会用“全部店铺”数据渲染，造成“该店铺明明无广告数据但页面显示有值”的错觉。
+    applyStore();
   </script>
 </body>
 </html>

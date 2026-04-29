@@ -413,19 +413,19 @@ def _fetch_matrix_rows_online(
                SUM(td.sessions) AS s
         FROM (
             SELECT DISTINCT
-                   TRIM(al.asin) AS asin,
+                   al.asin AS asin,
                    al.store_id,
                    DATE(al.open_date) AS open_day
             FROM amazon_listing al
             INNER JOIN amazon_variation av
                 ON av.id = al.variation_id
             WHERE al.asin IS NOT NULL
-              AND TRIM(al.asin) <> ''
+              AND al.asin <> ''
               AND al.store_id IS NOT NULL
               AND al.created_at IS NOT NULL
               AND al.open_date IS NOT NULL
               AND av.created_at IS NOT NULL
-              AND ABS(TIMESTAMPDIFF(DAY, DATE(al.created_at), DATE(av.created_at))) <= 1
+              AND ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
               {extra}
         ) AS nl
         INNER JOIN (
@@ -496,24 +496,24 @@ def _cohort_day_asin_breakdown_online(
         f"""
         SELECT nl.open_day AS cd,
                td.session_day AS sd,
-               TRIM(nl.asin) AS asin_b,
+               nl.asin AS asin_b,
                nl.store_id AS sid_raw,
                SUM(td.sessions) AS s
         FROM (
             SELECT DISTINCT
-                   TRIM(al.asin) AS asin,
+                   al.asin AS asin,
                    al.store_id,
                    DATE(al.open_date) AS open_day
             FROM amazon_listing al
             INNER JOIN amazon_variation av
                 ON av.id = al.variation_id
             WHERE al.asin IS NOT NULL
-              AND TRIM(al.asin) <> ''
+              AND al.asin <> ''
               AND al.store_id IS NOT NULL
               AND al.created_at IS NOT NULL
               AND al.open_date IS NOT NULL
               AND av.created_at IS NOT NULL
-              AND ABS(TIMESTAMPDIFF(DAY, DATE(al.created_at), DATE(av.created_at))) <= 1
+              AND ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
               AND DATE(al.open_date) IN ({ph})
               {extra_nl}
         ) AS nl
@@ -587,19 +587,19 @@ def _fetch_matrix_rows_online_bulk(
                SUM(COALESCE(d.sessions, 0)) AS s
         FROM (
             SELECT DISTINCT
-                   TRIM(al.asin) AS asin,
+                   al.asin AS asin,
                    al.store_id,
                    DATE(al.open_date) AS open_day
             FROM amazon_listing al
             INNER JOIN amazon_variation av
                 ON av.id = al.variation_id
             WHERE al.asin IS NOT NULL
-              AND TRIM(al.asin) <> ''
+              AND al.asin <> ''
               AND al.store_id IS NOT NULL
               AND al.created_at IS NOT NULL
               AND al.open_date IS NOT NULL
               AND av.created_at IS NOT NULL
-              AND ABS(TIMESTAMPDIFF(DAY, DATE(al.created_at), DATE(av.created_at))) <= 1
+              AND ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
               {extra}
         ) AS nl
         INNER JOIN amazon_sales_and_traffic_daily AS d
@@ -791,8 +791,8 @@ def _fetch_listing_new_refurb_by_day_online(
 
     判定规则：
     - 通过 ``amazon_listing.variation_id = amazon_variation.id`` 关联；
-    - 若 ``DATE(amazon_listing.created_at) = DATE(amazon_variation.created_at)``，记为上新；
-    - 若日期不一致（或任一侧为空 / 无关联记录），记为补录。
+    - 若两侧 ``created_at`` 均非空且 ``ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2``（即日历日相差 0 或 1 天），记为上新；
+    - 否则记为补录（含任一侧为空、或日历日相差 ≥2 天）。
     """
     d1_exclusive = d1 + timedelta(days=1)
     day_col = "DATE(al.open_date)"
@@ -805,12 +805,12 @@ def _fetch_listing_new_refurb_by_day_online(
                    COALESCE(SUM(CASE
                        WHEN al.created_at IS NOT NULL
                         AND av.created_at IS NOT NULL
-                        AND ABS(TIMESTAMPDIFF(DAY, DATE(al.created_at), DATE(av.created_at))) <= 1
+                        AND ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
                        THEN 1 ELSE 0 END), 0) AS new_n,
                    COALESCE(SUM(CASE
                        WHEN al.created_at IS NULL
                          OR av.created_at IS NULL
-                         OR DATE(al.created_at) <> DATE(av.created_at)
+                         OR ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) >= 2
                        THEN 1 ELSE 0 END), 0) AS refurb_n
             FROM amazon_listing al
             LEFT JOIN amazon_variation av ON av.id = al.variation_id
@@ -830,12 +830,12 @@ def _fetch_listing_new_refurb_by_day_online(
                    COALESCE(SUM(CASE
                        WHEN al.created_at IS NOT NULL
                         AND av.created_at IS NOT NULL
-                        AND ABS(TIMESTAMPDIFF(DAY, DATE(al.created_at), DATE(av.created_at))) <= 1
+                        AND ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
                        THEN 1 ELSE 0 END), 0) AS new_n,
                    COALESCE(SUM(CASE
                        WHEN al.created_at IS NULL
                          OR av.created_at IS NULL
-                         OR DATE(al.created_at) <> DATE(av.created_at)
+                         OR ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) >= 2
                        THEN 1 ELSE 0 END), 0) AS refurb_n
             FROM amazon_listing al
             LEFT JOIN amazon_variation av ON av.id = al.variation_id
@@ -875,7 +875,7 @@ def _fetch_new_listing_keys_online(
     d1_exclusive = d1 + timedelta(days=1)
     base_sql = """
         SELECT DISTINCT
-               TRIM(al.asin) AS asin,
+               al.asin AS asin,
                COALESCE(al.pid, 0) AS pid_key,
                al.store_id,
                DATE(al.created_at) AS created_day,
@@ -884,12 +884,12 @@ def _fetch_new_listing_keys_online(
         INNER JOIN amazon_variation av
             ON av.id = al.variation_id
         WHERE al.asin IS NOT NULL
-          AND TRIM(al.asin) <> ''
+          AND al.asin <> ''
           AND al.store_id IS NOT NULL
           AND al.created_at IS NOT NULL
           AND al.open_date IS NOT NULL
           AND av.created_at IS NOT NULL
-          AND ABS(TIMESTAMPDIFF(DAY, DATE(al.created_at), DATE(av.created_at))) <= 1
+          AND ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
           AND al.open_date >= :d0 AND al.open_date < :d1x
     """
     params: dict[str, object] = {"d0": d0, "d1x": d1_exclusive}
@@ -1101,7 +1101,7 @@ def _fetch_active_asin_since(db: Session, store_id: int | None, since: date) -> 
               SELECT store_id, asin FROM {TABLE}
               WHERE open_date IS NOT NULL AND open_date >= :since AND store_id = :sid
               GROUP BY store_id, asin
-              HAVING SUM(CASE WHEN LOWER(TRIM(COALESCE(status, ''))) = 'active' THEN 1 ELSE 0 END) > 0
+              HAVING SUM(CASE WHEN LOWER(COALESCE(status, '')) = 'active' THEN 1 ELSE 0 END) > 0
             ) t
             """
         )
@@ -1113,7 +1113,7 @@ def _fetch_active_asin_since(db: Session, store_id: int | None, since: date) -> 
               SELECT store_id, asin FROM {TABLE}
               WHERE open_date IS NOT NULL AND open_date >= :since
               GROUP BY store_id, asin
-              HAVING SUM(CASE WHEN LOWER(TRIM(COALESCE(status, ''))) = 'active' THEN 1 ELSE 0 END) > 0
+              HAVING SUM(CASE WHEN LOWER(COALESCE(status, '')) = 'active' THEN 1 ELSE 0 END) > 0
             ) t
             """
         )
@@ -1305,18 +1305,18 @@ def _cohort_day_asin_breakdown_batch(
     else:
         q = text(
             f"""
-            SELECT TRIM(asin) AS asin_b, store_id, open_date AS cd, session_date AS sd,
+            SELECT asin AS asin_b, store_id, open_date AS cd, session_date AS sd,
                    SUM(COALESCE(sessions, 0)) AS s
             FROM {TABLE}
             WHERE open_date IS NOT NULL
               AND asin IS NOT NULL
-              AND TRIM(asin) <> ''
+              AND asin <> ''
               AND store_id IS NOT NULL
               AND open_date IN ({ph})
               AND session_date >= open_date
               AND session_date <= DATE_ADD(open_date, INTERVAL {nd} DAY)
               {extra}
-            GROUP BY TRIM(asin), store_id, open_date, session_date
+            GROUP BY asin, store_id, open_date, session_date
             HAVING SUM(COALESCE(sessions, 0)) > 0
             """
         )
@@ -2414,7 +2414,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     kpiHint.textContent = '说明：未配置 online_db 时 KPI 来自本地 daily_upload_asin_dates；配置后 KPI 仅来自 amazon_listing。';
   }
   document.getElementById('cohortTableHint').textContent =
-    '上新统计区间：' + P.listingSince + ' ～ ' + P.listingThrough + '（与图表 session 区间无关；listing_through 默认等于本次 session_end）。第二列「上新 ASIN 数」= online amazon_listing 中按 DATE(open_date) 统计的纯上新数量（DATE(amazon_listing.created_at)=DATE(amazon_variation.created_at)）。「第 k 天」= 该批次 sessions 合计；括号内百分比 = sessions / 该批次上新 ASIN 数。图表折线按 session_date 把各批次堆叠相加，与表格某一行的「第几天」口径不同。Online 不可用时第二列回退本地口径估算。';
+    '上新统计区间：' + P.listingSince + ' ～ ' + P.listingThrough + '（与图表 session 区间无关；listing_through 默认等于本次 session_end）。上新/补录：online 时按 amazon_listing.created_at 与 amazon_variation.created_at 的日历日相差小于 2 天（0 或 1 天）为上新，否则为补录；表格 sessions 与「第 k 天」仅统计上新 ASIN。图表折线按 session_date 把各批次堆叠相加，与表格某一行的「第几天」口径不同。Online 不可用时第二列回退本地口径估算。';
 
   sel.innerHTML = '';
   const optAll = document.createElement('option');

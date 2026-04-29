@@ -590,12 +590,31 @@ function writeTrendNewListingCache(data: TrendNewListingJsonPayload): void {
   }
 }
 
+/** 与后端 /api/trend/new-listing 一致：start_date + session_end 表示自定义区间（用于导出脚本 Playwright 带参打开）。 */
+function trendNewListingDateRangeFromSearch(): { start: string | null; end: string | null } {
+  if (typeof window === 'undefined') return { start: null, end: null }
+  try {
+    const sp = new URLSearchParams(window.location.search)
+    const s = (sp.get('start_date') || '').slice(0, 10)
+    const e = (sp.get('session_end') || '').trim().slice(0, 10)
+    if (s && e) return { start: s, end: e }
+  } catch {
+    /* ignore */
+  }
+  return { start: null, end: null }
+}
+
 /** 默认先用缓存首屏展示，同时后台刷新；?refresh=1 或 ?nocache=1 强制走网络且不读本地缓存。 */
 function getTrendNewListingBoot(): { payload: TrendNewListingJsonPayload | null; useCacheOnly: boolean } {
   if (typeof window === 'undefined') return { payload: null, useCacheOnly: false }
   try {
     const sp = new URLSearchParams(window.location.search)
     if (sp.get('refresh') === '1' || sp.get('nocache') === '1') {
+      return { payload: null, useCacheOnly: false }
+    }
+    // 自定义起止与「最近 35 天」缓存策略不同，不走本地默认区间缓存
+    const urlRange = trendNewListingDateRangeFromSearch()
+    if (urlRange.start && urlRange.end) {
       return { payload: null, useCacheOnly: false }
     }
     const cached = readTrendNewListingCache()
@@ -3088,19 +3107,54 @@ function TrendSessionImpressionEmbeddedPage() {
 }
 
 function TrendNewListingEmbeddedPage() {
+  type TrendHttpError = Error & { status?: number; retryAfterSec?: number }
+  const isTrendHttpStatus = (e: unknown, status: number): e is TrendHttpError =>
+    typeof e === 'object' && e !== null && Number((e as { status?: number }).status) === status
+  const waitWithAbort = (ms: number, signal?: AbortSignal): Promise<void> =>
+    new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new DOMException('Aborted', 'AbortError'))
+        return
+      }
+      const timer = window.setTimeout(() => {
+        cleanup()
+        resolve()
+      }, Math.max(0, ms))
+      const onAbort = () => {
+        cleanup()
+        reject(new DOMException('Aborted', 'AbortError'))
+      }
+      const cleanup = () => {
+        window.clearTimeout(timer)
+        if (signal) signal.removeEventListener('abort', onAbort)
+      }
+      if (signal) signal.addEventListener('abort', onAbort, { once: true })
+    })
+
   const boot = useMemo(() => getTrendNewListingBoot(), [])
+  const nlUrlRange = useMemo(() => trendNewListingDateRangeFromSearch(), [])
   const [payload, setPayload] = useState<TrendNewListingJsonPayload | null>(boot.payload)
   const [fromCache, setFromCache] = useState(boot.useCacheOnly)
   const [storeKey, setStoreKey] = useState<string>('all')
   const [displayStoreKey, setDisplayStoreKey] = useState<string>('all')
-  const [startDateInput, setStartDateInput] = useState<string>(boot.payload?.listingSince ?? '')
+  const [startDateInput, setStartDateInput] = useState<string>(
+    nlUrlRange.start ?? boot.payload?.listingSince ?? '',
+  )
   const [endDateInput, setEndDateInput] = useState<string>(
-    boot.payload?.sessionRequestedEnd ?? boot.payload?.sessionChartEnd ?? '',
+    nlUrlRange.end ??
+      boot.payload?.sessionRequestedEnd ??
+      boot.payload?.sessionChartEnd ??
+      '',
   )
   const [useDefaultDateRange, setUseDefaultDateRange] = useState<boolean>(
-    boot.payload ? isTrendNewListingDefaultRange(boot.payload) : true,
+    nlUrlRange.start && nlUrlRange.end
+      ? false
+      : boot.payload
+        ? isTrendNewListingDefaultRange(boot.payload)
+        : true,
   )
   const [err, setErr] = useState<string | null>(null)
+  const [waitingForBuildRetry, setWaitingForBuildRetry] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [storeViewLoading, setStoreViewLoading] = useState<string | null>(null)
   const [chartMountReady, setChartMountReady] = useState(false)
@@ -3355,7 +3409,23 @@ function TrendNewListingEmbeddedPage() {
       const t1 = typeof performance !== 'undefined' ? performance.now() : 0
       const text = await res.text()
       const t2 = typeof performance !== 'undefined' ? performance.now() : 0
-      if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`)
+      if (!res.ok) {
+        let message = `HTTP ${res.status}: ${text.slice(0, 200)}`
+        try {
+          const j = JSON.parse(text) as { detail?: unknown }
+          if (typeof j?.detail === 'string' && j.detail.trim()) message = j.detail.trim()
+        } catch {
+          /* 非 JSON 或结构不符时保留原始摘要 */
+        }
+        const err = new Error(message) as TrendHttpError
+        err.status = res.status
+        const retryAfterRaw = res.headers.get('Retry-After')
+        if (retryAfterRaw) {
+          const retryAfter = Number.parseInt(retryAfterRaw, 10)
+          if (Number.isFinite(retryAfter) && retryAfter > 0) err.retryAfterSec = retryAfter
+        }
+        throw err
+      }
       const data = await parseTrendNewListingJsonText(text)
       const t3 = typeof performance !== 'undefined' ? performance.now() : 0
       if (wantProfile && typeof performance !== 'undefined') {
@@ -3394,6 +3464,52 @@ function TrendNewListingEmbeddedPage() {
     [],
   )
 
+  const fetchNewListingAllWithRetry = useCallback(
+    async (opts: {
+      forceSync: boolean
+      writeCache: boolean
+      startDate?: string | null
+      endDate?: string | null
+      defaultDateRange?: boolean
+      syncFormState?: boolean
+      signal?: AbortSignal
+      mergeIntoExisting?: boolean
+    }) => {
+      // 后端 heavy 构建可能数分钟；与 Retry-After 配合多轮等待（极端：另一请求已排队最久 240s + 本请求构建时间）
+      const maxAttempts = 24
+      let attempt = 0
+      while (true) {
+        try {
+          await fetchNewListingJson({
+            skipSync: opts.forceSync,
+            writeCache: opts.writeCache,
+            jsonViews: 'all',
+            startDate: opts.startDate,
+            endDate: opts.endDate,
+            defaultDateRange: opts.defaultDateRange,
+            syncFormState: opts.syncFormState,
+            signal: opts.signal,
+            mergeIntoExisting: opts.mergeIntoExisting,
+          })
+          setWaitingForBuildRetry(false)
+          return
+        } catch (e) {
+          if (typeof e === 'object' && e !== null && (e as { name?: string }).name === 'AbortError') throw e
+          if (!isTrendHttpStatus(e, 429) || attempt >= maxAttempts - 1) {
+            setWaitingForBuildRetry(false)
+            throw e
+          }
+          const retryAfterSec = Math.max(1, Number((e as TrendHttpError).retryAfterSec ?? 3))
+          setWaitingForBuildRetry(true)
+          setErr(`New Listing 报表正在生成中，约 ${retryAfterSec}s 后自动重试（${attempt + 1}/${maxAttempts}）`)
+          await waitWithAbort(retryAfterSec * 1000, opts.signal)
+          attempt += 1
+        }
+      }
+    },
+    [fetchNewListingJson],
+  )
+
   const runNewListingAllViewFetch = useCallback(
     async (
       forceSync: boolean,
@@ -3416,10 +3532,9 @@ function TrendNewListingEmbeddedPage() {
       setRefreshing(true)
       setErr(null)
       try {
-        await fetchNewListingJson({
-          skipSync: forceSync,
+        await fetchNewListingAllWithRetry({
+          forceSync,
           writeCache: nextUseDefaultDateRange,
-          jsonViews: 'all',
           startDate: requestStartDate,
           endDate: requestEndDate,
           defaultDateRange: nextUseDefaultDateRange,
@@ -3427,14 +3542,17 @@ function TrendNewListingEmbeddedPage() {
           signal: ac.signal,
           mergeIntoExisting: false,
         })
+        setWaitingForBuildRetry(false)
+        setErr(null)
       } catch (e: unknown) {
         if (typeof e === 'object' && e !== null && (e as { name?: string }).name === 'AbortError') return
+        setWaitingForBuildRetry(false)
         setErr(e instanceof Error ? e.message : '请求失败')
       } finally {
         setRefreshing(false)
       }
     },
-    [endDateInput, fetchNewListingJson, startDateInput, useDefaultDateRange],
+    [endDateInput, fetchNewListingAllWithRetry, startDateInput, useDefaultDateRange],
   )
 
   useLayoutEffect(() => {
@@ -3460,24 +3578,32 @@ function TrendNewListingEmbeddedPage() {
     nlShellAbortRef.current?.abort()
     const ac = new AbortController()
     nlShellAbortRef.current = ac
-    fetchNewListingJson({
-      skipSync: false,
-      writeCache: true,
-      jsonViews: 'all',
-      defaultDateRange: true,
+    const custom = Boolean(nlUrlRange.start && nlUrlRange.end)
+    fetchNewListingAllWithRetry({
+      forceSync: false,
+      writeCache: !custom,
+      startDate: custom ? nlUrlRange.start : null,
+      endDate: custom ? nlUrlRange.end : null,
+      defaultDateRange: !custom,
       syncFormState: true,
       signal: ac.signal,
       mergeIntoExisting: false,
-    }).catch((e: unknown) => {
-      if (cancelled || (typeof e === 'object' && e !== null && (e as { name?: string }).name === 'AbortError'))
-        return
-      setErr(e instanceof Error ? e.message : '请求失败')
     })
+      .then(() => {
+        setWaitingForBuildRetry(false)
+        setErr(null)
+      })
+      .catch((e: unknown) => {
+        if (cancelled || (typeof e === 'object' && e !== null && (e as { name?: string }).name === 'AbortError'))
+          return
+        setWaitingForBuildRetry(false)
+        setErr(e instanceof Error ? e.message : '请求失败')
+      })
     return () => {
       cancelled = true
       ac.abort()
     }
-  }, [boot.useCacheOnly, boot.payload, fetchNewListingJson])
+  }, [boot.useCacheOnly, boot.payload, fetchNewListingAllWithRetry, nlUrlRange.end, nlUrlRange.start])
 
   /** views.all 就绪后空闲预取各店 json_views=store，合并进 payload / 本地缓存；切换店铺时直接命中 views[id] */
   useEffect(() => {
@@ -3659,7 +3785,7 @@ function TrendNewListingEmbeddedPage() {
     }
   }, [view, storeKey])
 
-  if (err) {
+  if (err && !waitingForBuildRetry) {
     return (
       <div className="trend-embed-page trend-embed-page--message">
         <h2 className="trend-embed-error-title">页面加载失败</h2>
@@ -3667,10 +3793,11 @@ function TrendNewListingEmbeddedPage() {
       </div>
     )
   }
-  if (payload === null || !payload.views?.all) {
+  if (payload === null || !payload.views?.all || waitingForBuildRetry) {
     return (
       <div className="trend-embed-page trend-embed-page--message">
         <p className="trend-embed-loading">正在加载 New Listing 报表…</p>
+        {err ? <pre className="trend-embed-error-body">{err}</pre> : null}
       </div>
     )
   }

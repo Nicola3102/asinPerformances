@@ -134,6 +134,13 @@ _SESSION_IMPRESSION_STUB_HTML = """<!DOCTYPE html>
 </body>
 </html>"""
 _new_listing_sync_report_lock = threading.Lock()
+# New Listing 的 all_only/full 构建非常重（会占用大量内存与 online_reporting 连接）。
+# 多个并发请求会显著抬高内存峰值，容易触发容器被 SIGKILL（exit code 137），表现为前端 socket hang up / ENOTFOUND backend。
+# 这里用信号量限制同一时间仅允许 1 个 heavy 构建在跑；其余请求快速失败并提示稍后重试。
+_new_listing_heavy_build_sema = threading.Semaphore(1)
+_new_listing_heavy_status_lock = threading.Lock()
+# heavy 槽位被占用时的 monotonic 起点；None 表示当前无正在跑的 heavy build_report_payload
+_new_listing_heavy_busy_since_mono: float | None = None
 
 # format=json 短 TTL 内存缓存（按日期参数 + 是否跳过同步）；本地表变化后最多滞后 TTL
 _new_listing_json_cache_lock = threading.Lock()
@@ -258,10 +265,10 @@ def trend_new_listing_order_flags(req: NewListingOrderFlagRequest):
             params[f"s{i}"] = int(s)
         sql = text(
             f"""
-            SELECT TRIM(oi.asin) AS asin_b, oi.store_id AS sid
+            SELECT oi.asin AS asin_b, oi.store_id AS sid
             FROM order_item AS oi
-            WHERE (TRIM(oi.asin), oi.store_id) IN ({ph})
-            GROUP BY TRIM(oi.asin), oi.store_id
+            WHERE (oi.asin, oi.store_id) IN ({ph})
+            GROUP BY oi.asin, oi.store_id
             """
         )
         try:
@@ -427,6 +434,23 @@ def trend_new_listing_json_cache_stats():
     return JSONResponse(content=_new_listing_json_cache_stats_payload())
 
 
+@router.get("/new-listing/heavy-status")
+def trend_new_listing_heavy_status():
+    """排查 429：当前进程是否在跑 New Listing heavy 构建（json_views=all/full）。"""
+    now = time.monotonic()
+    with _new_listing_heavy_status_lock:
+        since = _new_listing_heavy_busy_since_mono
+    busy = since is not None
+    busy_for_sec = round(now - since, 2) if since is not None else None
+    return JSONResponse(
+        {
+            "heavy_build_busy": busy,
+            "heavy_build_busy_for_sec": busy_for_sec,
+            "heavy_acquire_timeout_sec": float(settings.NEW_LISTING_HEAVY_ACQUIRE_TIMEOUT_SEC),
+        }
+    )
+
+
 @router.get("/new-listing")
 def trend_new_listing_report(
     start_date: Optional[date] = Query(
@@ -482,6 +506,8 @@ def trend_new_listing_report(
     2) 展示：与 ``daily_upload_session_report_html_pst`` 相同——按 ``open_date`` 分批次、每批 30 日内 ``session_date``
        聚合 sessions 堆叠柱 + 合计折线；横轴为区间内**实际有 session 数据**的日期。``format=json`` 返回同构 JSON。
     """
+    global _new_listing_heavy_busy_since_mono
+
     end_d = session_end or _resolve_new_listing_default_session_end()
     default_window_start = end_d - timedelta(days=34)
     effective_listing_since = start_date or listing_since or default_window_start
@@ -592,7 +618,31 @@ def trend_new_listing_report(
 
         init_db()
         db = SessionLocal()
+        heavy_acquired = False
         try:
+            # heavy 构建并发限制：all/full 会构建完整 cohort+matrix，内存与连接消耗大
+            is_heavy = (
+                response_format == "json"
+                and json_views_mode in ("all_only", "full")
+                and single_store is None
+            )
+            if is_heavy:
+                wait_sec = max(0.2, float(settings.NEW_LISTING_HEAVY_ACQUIRE_TIMEOUT_SEC))
+                heavy_acquired = _new_listing_heavy_build_sema.acquire(timeout=wait_sec)
+                if not heavy_acquired:
+                    logger.warning(
+                        "New Listing heavy acquire timeout after %.1fs (another build still running); returning 429",
+                        wait_sec,
+                    )
+                    return JSONResponse(
+                        status_code=429,
+                        content={
+                            "detail": "New Listing 报表正在生成中（并发受限以避免内存/连接池被打满）。请稍后重试。",
+                        },
+                        headers={"Retry-After": "30"},
+                    )
+                with _new_listing_heavy_status_lock:
+                    _new_listing_heavy_busy_since_mono = time.monotonic()
             # KPI / cohort 与 amazon_listing 均须来自 online_db_host；不因 format=json 回退本地 daily_upload KPI。
             prefer_online = True
             prefer_listing_online = True
@@ -610,6 +660,13 @@ def trend_new_listing_report(
                 single_store_id=single_store if response_format == "json" else None,
             )
         finally:
+            if heavy_acquired:
+                try:
+                    with _new_listing_heavy_status_lock:
+                        _new_listing_heavy_busy_since_mono = None
+                    _new_listing_heavy_build_sema.release()
+                except Exception:
+                    pass
             db.close()
         if response_format == "json":
             # 预热单店 views：当首屏只返回 all 视图（json_views=all）时，后台空闲并发构建各店 store payload 并写入进程内短缓存，
@@ -765,6 +822,14 @@ def trend_new_listing_report(
         return HTMLResponse(render_html(payload))
     except Exception as e:
         logger.exception("GET /api/trend/new-listing failed: %s", e)
+        if response_format == "json":
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "detail": str(e),
+                    "error": type(e).__name__,
+                },
+            )
         return HTMLResponse(
             f"<!DOCTYPE html><html><body><pre>New Listing 报表失败: {e!s}</pre></body></html>",
             status_code=500,
