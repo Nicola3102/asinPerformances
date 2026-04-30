@@ -604,7 +604,7 @@ function trendNewListingDateRangeFromSearch(): { start: string | null; end: stri
   return { start: null, end: null }
 }
 
-/** 默认先用缓存首屏展示，同时后台刷新；?refresh=1 或 ?nocache=1 强制走网络且不读本地缓存。 */
+/** 默认先用缓存首屏展示，同时后台刷新；?refresh=1 或 ?nocache=1 强制走网络且不读本地缓存，且会为 all 请求附加 nocache=1（后端全量重算，耗时常达数分钟）。 */
 function getTrendNewListingBoot(): { payload: TrendNewListingJsonPayload | null; useCacheOnly: boolean } {
   if (typeof window === 'undefined') return { payload: null, useCacheOnly: false }
   try {
@@ -3133,6 +3133,16 @@ function TrendNewListingEmbeddedPage() {
 
   const boot = useMemo(() => getTrendNewListingBoot(), [])
   const nlUrlRange = useMemo(() => trendNewListingDateRangeFromSearch(), [])
+  /** 地址栏 ?refresh=1 / ?nocache=1：首屏不走本地缓存，且请求带 nocache=1 触发后端全量重算，耗时常明显变长 */
+  const nlForcedNetwork = useMemo(() => {
+    if (typeof window === 'undefined') return false
+    try {
+      const sp = new URLSearchParams(window.location.search)
+      return sp.get('refresh') === '1' || sp.get('nocache') === '1'
+    } catch {
+      return false
+    }
+  }, [])
   const [payload, setPayload] = useState<TrendNewListingJsonPayload | null>(boot.payload)
   const [fromCache, setFromCache] = useState(boot.useCacheOnly)
   const [storeKey, setStoreKey] = useState<string>('all')
@@ -3173,6 +3183,8 @@ function TrendNewListingEmbeddedPage() {
   const nlPayloadRef = useRef<TrendNewListingJsonPayload | null>(payload)
   /** 单店 JSON 正在请求中（用户切换或预取），避免重复打接口 */
   const nlStoreInFlightRef = useRef<Set<number>>(new Set())
+  /** json_views=all 同 URL in-flight 合并：含后台 merge 刷新，减轻 StrictMode / 双 effect 对 heavy 的重复请求 */
+  const nlJsonAllInflightRef = useRef<Map<string, Promise<void>>>(new Map())
   /** 取消上一轮预取链（idle 回调 + 当前预取请求） */
   const nlPrefetchGenRef = useRef(0)
   const nlPrefetchRicRef = useRef<number | null>(null)
@@ -3403,63 +3415,128 @@ function TrendNewListingEmbeddedPage() {
       if (opts.skipSync) url += '&skip_sync=false'
       if (serverNocache) url += '&nocache=1'
       if (wantProfile) url += '&profile=1'
-      nlProfilePendingRef.current = null
-      const t0 = typeof performance !== 'undefined' ? performance.now() : 0
-      const res = await fetch(url, { signal: opts.signal })
-      const t1 = typeof performance !== 'undefined' ? performance.now() : 0
-      const text = await res.text()
-      const t2 = typeof performance !== 'undefined' ? performance.now() : 0
-      if (!res.ok) {
-        let message = `HTTP ${res.status}: ${text.slice(0, 200)}`
+
+      const runFetch = async () => {
+        nlProfilePendingRef.current = null
+        const t0 = typeof performance !== 'undefined' ? performance.now() : 0
+        let res: Response
         try {
-          const j = JSON.parse(text) as { detail?: unknown }
-          if (typeof j?.detail === 'string' && j.detail.trim()) message = j.detail.trim()
-        } catch {
-          /* 非 JSON 或结构不符时保留原始摘要 */
-        }
-        const err = new Error(message) as TrendHttpError
-        err.status = res.status
-        const retryAfterRaw = res.headers.get('Retry-After')
-        if (retryAfterRaw) {
-          const retryAfter = Number.parseInt(retryAfterRaw, 10)
-          if (Number.isFinite(retryAfter) && retryAfter > 0) err.retryAfterSec = retryAfter
-        }
-        throw err
-      }
-      const data = await parseTrendNewListingJsonText(text)
-      const t3 = typeof performance !== 'undefined' ? performance.now() : 0
-      if (wantProfile && typeof performance !== 'undefined') {
-        nlProfilePendingRef.current = {
-          t0,
-          afterParse: t3,
-          fetchToHeadersMs: t1 - t0,
-          readBodyMs: t2 - t1,
-          parseMs: t3 - t2,
-          server: data.profileTimingsSec,
-        }
-      }
-      if (opts.mergeIntoExisting) {
-        setPayload((prev) => {
-          const next: TrendNewListingJsonPayload = {
-            ...(prev ?? data),
-            ...data,
-            views: { ...(prev?.views ?? {}), ...data.views },
-            viewsPartial: true,
+          res = await fetch(url, { signal: opts.signal })
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e)
+          const low = msg.toLowerCase()
+          if (
+            low.includes('failed to fetch') ||
+            low.includes('networkerror') ||
+            low.includes('load failed')
+          ) {
+            throw new Error(
+              `网络请求中断（${msg}）。大区间报表可能需数十分钟：若长时间 pending 后失败，请确认已用较新的 Vite 代理超时（vite.config.ts /api），或直连后端端口。`,
+            )
           }
-          if (opts.writeCache) writeTrendNewListingCache(next)
-          return next
-        })
-      } else {
-        nlStoreInFlightRef.current.clear()
-        if (opts.writeCache) writeTrendNewListingCache(data)
-        setPayload(data)
+          throw e
+        }
+        const t1 = typeof performance !== 'undefined' ? performance.now() : 0
+        const text = await res.text()
+        const t2 = typeof performance !== 'undefined' ? performance.now() : 0
+        if (!res.ok) {
+          let message = `HTTP ${res.status}: ${text.slice(0, 200)}`
+          try {
+            const j = JSON.parse(text) as { detail?: unknown; error?: unknown }
+            if (typeof j?.detail === 'string' && j.detail.trim()) {
+              message = j.detail.trim()
+            } else if (j?.detail != null) {
+              message = `HTTP ${res.status}: ${JSON.stringify(j.detail)}`
+            }
+            if (typeof j?.error === 'string' && j.error.trim() && !message.includes(j.error.trim())) {
+              message = `${j.error.trim()}: ${message}`
+            }
+          } catch {
+            /* 非 JSON 或结构不符时保留原始摘要 */
+          }
+          const err = new Error(message) as TrendHttpError
+          err.status = res.status
+          const retryAfterRaw = res.headers.get('Retry-After')
+          if (retryAfterRaw) {
+            const retryAfter = Number.parseInt(retryAfterRaw, 10)
+            if (Number.isFinite(retryAfter) && retryAfter > 0) err.retryAfterSec = retryAfter
+          }
+          throw err
+        }
+        const data = await parseTrendNewListingJsonText(text)
+        const t3 = typeof performance !== 'undefined' ? performance.now() : 0
+        if (wantProfile && typeof performance !== 'undefined') {
+          nlProfilePendingRef.current = {
+            t0,
+            afterParse: t3,
+            fetchToHeadersMs: t1 - t0,
+            readBodyMs: t2 - t1,
+            parseMs: t3 - t2,
+            server: data.profileTimingsSec,
+          }
+        }
+        if (opts.mergeIntoExisting) {
+          setPayload((prev) => {
+            const next: TrendNewListingJsonPayload = {
+              ...(prev ?? data),
+              ...data,
+              views: { ...(prev?.views ?? {}), ...data.views },
+              viewsPartial: true,
+            }
+            if (opts.writeCache) writeTrendNewListingCache(next)
+            return next
+          })
+        } else {
+          nlStoreInFlightRef.current.clear()
+          if (opts.writeCache) writeTrendNewListingCache(data)
+          setPayload(data)
+        }
+        if (opts.syncFormState && opts.jsonViews === 'all') {
+          setStartDateInput(String(data.listingSince ?? '').slice(0, 10))
+          setEndDateInput(String(data.sessionRequestedEnd ?? data.sessionChartEnd ?? '').slice(0, 10))
+          setUseDefaultDateRange(Boolean(opts.defaultDateRange) || isTrendNewListingDefaultRange(data))
+        }
+        setFromCache(false)
       }
-      if (opts.syncFormState && opts.jsonViews === 'all') {
-        setStartDateInput(String(data.listingSince ?? '').slice(0, 10))
-        setEndDateInput(String(data.sessionRequestedEnd ?? data.sessionChartEnd ?? '').slice(0, 10))
-        setUseDefaultDateRange(Boolean(opts.defaultDateRange) || isTrendNewListingDefaultRange(data))
+
+      const dedupeAll = opts.jsonViews === 'all'
+      if (dedupeAll) {
+        const inflight = nlJsonAllInflightRef.current.get(url)
+        if (inflight) {
+          if (opts.signal) {
+            await Promise.race([
+              inflight,
+              new Promise<never>((_, rej) => {
+                const s = opts.signal!
+                if (s.aborted) {
+                  rej(s.reason ?? new DOMException('Aborted', 'AbortError'))
+                  return
+                }
+                s.addEventListener(
+                  'abort',
+                  () => rej(s.reason ?? new DOMException('Aborted', 'AbortError')),
+                  { once: true },
+                )
+              }),
+            ])
+          } else {
+            await inflight
+          }
+          return
+        }
+        const p = (async () => {
+          try {
+            await runFetch()
+          } finally {
+            nlJsonAllInflightRef.current.delete(url)
+          }
+        })()
+        nlJsonAllInflightRef.current.set(url, p)
+        await p
+        return
       }
-      setFromCache(false)
+
+      await runFetch()
     },
     [],
   )
@@ -3579,6 +3656,7 @@ function TrendNewListingEmbeddedPage() {
     const ac = new AbortController()
     nlShellAbortRef.current = ac
     const custom = Boolean(nlUrlRange.start && nlUrlRange.end)
+    const hasBootDefaultCache = Boolean(boot.payload?.views?.all && boot.useCacheOnly)
     fetchNewListingAllWithRetry({
       forceSync: false,
       writeCache: !custom,
@@ -3587,7 +3665,8 @@ function TrendNewListingEmbeddedPage() {
       defaultDateRange: !custom,
       syncFormState: true,
       signal: ac.signal,
-      mergeIntoExisting: false,
+      // 有本地默认区间缓存时：后台静默合并刷新，首屏已可交互，避免整包替换闪烁；失败时仍保留图表
+      mergeIntoExisting: hasBootDefaultCache,
     })
       .then(() => {
         setWaitingForBuildRetry(false)
@@ -3597,7 +3676,12 @@ function TrendNewListingEmbeddedPage() {
         if (cancelled || (typeof e === 'object' && e !== null && (e as { name?: string }).name === 'AbortError'))
           return
         setWaitingForBuildRetry(false)
-        setErr(e instanceof Error ? e.message : '请求失败')
+        if (nlPayloadRef.current?.views?.all) {
+          console.warn('[New Listing] 后台刷新失败，仍显示已有数据', e)
+          setErr(e instanceof Error ? `后台更新未成功：${e.message}` : '后台更新未成功')
+        } else {
+          setErr(e instanceof Error ? e.message : '请求失败')
+        }
       })
     return () => {
       cancelled = true
@@ -3785,7 +3869,9 @@ function TrendNewListingEmbeddedPage() {
     }
   }, [view, storeKey])
 
-  if (err && !waitingForBuildRetry) {
+  const nlFatalLoadError = Boolean(err && !waitingForBuildRetry && !(payload?.views?.all))
+
+  if (nlFatalLoadError) {
     return (
       <div className="trend-embed-page trend-embed-page--message">
         <h2 className="trend-embed-error-title">页面加载失败</h2>
@@ -3797,6 +3883,12 @@ function TrendNewListingEmbeddedPage() {
     return (
       <div className="trend-embed-page trend-embed-page--message">
         <p className="trend-embed-loading">正在加载 New Listing 报表…</p>
+        {nlForcedNetwork ? (
+          <p className="trend-embed-loading-hint">
+            已开启强制刷新（跳过本地与服务端短缓存），需全量重算；默认约 35 天窗口 + 多店时单次请求可达数分钟，DevTools
+            里会一直显示 pending，属正常排队/计算，并非页面卡死。
+          </p>
+        ) : null}
         {err ? <pre className="trend-embed-error-body">{err}</pre> : null}
       </div>
     )
@@ -3806,6 +3898,11 @@ function TrendNewListingEmbeddedPage() {
     return (
       <div className="trend-embed-page trend-embed-page--message">
         <p className="trend-embed-loading">正在加载 New Listing 报表…</p>
+        {nlForcedNetwork ? (
+          <p className="trend-embed-loading-hint">
+            已开启强制刷新：全量重算中，大区间可能需数分钟；网络面板 pending 为等待后端响应。
+          </p>
+        ) : null}
       </div>
     )
   }
@@ -3913,6 +4010,11 @@ function TrendNewListingEmbeddedPage() {
         >
           同步 listing 并重载
         </button>
+        {err && payload?.views?.all && !waitingForBuildRetry ? (
+          <span className="trend-new-listing-refresh-banner-warn" role="status">
+            {err.length > 160 ? `${err.slice(0, 160)}…` : err}
+          </span>
+        ) : null}
         {showingFallbackStoreView ? (
           <span className="trend-new-listing-loading-note">
             {storeViewLoading ? `正在加载店铺 ${storeKey} 的图表与明细，当前先保留已加载内容…` : `准备加载店铺 ${storeKey}…`}

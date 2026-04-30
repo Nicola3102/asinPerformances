@@ -15,7 +15,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import func, text
@@ -134,13 +134,100 @@ _SESSION_IMPRESSION_STUB_HTML = """<!DOCTYPE html>
 </body>
 </html>"""
 _new_listing_sync_report_lock = threading.Lock()
-# New Listing 的 all_only/full 构建非常重（会占用大量内存与 online_reporting 连接）。
+# New Listing 的 all_only/full/html 构建非常重（会占用大量内存与 online_reporting 连接）。
 # 多个并发请求会显著抬高内存峰值，容易触发容器被 SIGKILL（exit code 137），表现为前端 socket hang up / ENOTFOUND backend。
 # 这里用信号量限制同一时间仅允许 1 个 heavy 构建在跑；其余请求快速失败并提示稍后重试。
 _new_listing_heavy_build_sema = threading.Semaphore(1)
 _new_listing_heavy_status_lock = threading.Lock()
 # heavy 槽位被占用时的 monotonic 起点；None 表示当前无正在跑的 heavy build_report_payload
 _new_listing_heavy_busy_since_mono: float | None = None
+# json_views=store 与预热线程共享的全局限流（避免多用户 × 多店预热把内存顶满）
+_new_listing_store_build_sema = threading.Semaphore(
+    max(1, min(8, int(settings.NEW_LISTING_STORE_BUILD_CONCURRENCY)))
+)
+# 全站同时只跑一批 store 预热（每批内部仍受 store sem + pool_cap 限制）
+_new_listing_prewarm_slot = threading.Semaphore(1)
+# format=json 时后台 listing 同步：多用户并发时只保留一个同步任务，避免线程风暴
+_new_listing_bg_json_sync_lock = threading.Lock()
+
+
+class _Heavy429Leader(Exception):
+    """Leader 未拿到 heavy 槽位时通知同组等待者一并 429。"""
+
+
+class _HeavyJsonFlightWaitTimeout(Exception):
+    """同组 heavy JSON 等待 leader 完成超时。"""
+
+
+class _HeavyJsonFlight:
+    """同一组查询参数下：leader 负责拿槽位并 build；followers 阻塞等待同一 payload。"""
+
+    _PENDING = "pending"
+    _OK = "ok"
+    _ERR = "err"
+    _RATE = "rate_limited"
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._state = self._PENDING
+        self._payload: dict | None = None
+        self._exc: BaseException | None = None
+
+    def wait_payload(self, *, timeout_sec: float) -> dict:
+        deadline = time.monotonic() + max(30.0, float(timeout_sec))
+        with self._cv:
+            while self._state == self._PENDING:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _HeavyJsonFlightWaitTimeout()
+                self._cv.wait(timeout=min(30.0, remaining))
+            if self._state == self._RATE:
+                raise _Heavy429Leader()
+            if self._state == self._ERR:
+                if self._exc is not None:
+                    raise self._exc
+                raise RuntimeError("New Listing heavy flight unknown error")
+            if self._payload is None:
+                raise RuntimeError("New Listing heavy flight missing payload")
+            return self._payload
+
+    def signal_leader_429(self) -> None:
+        with self._cv:
+            self._state = self._RATE
+            self._cv.notify_all()
+
+    def complete_success(self, payload: dict) -> None:
+        with self._cv:
+            self._payload = payload
+            self._state = self._OK
+            self._cv.notify_all()
+
+    def complete_error(self, exc: BaseException) -> None:
+        with self._cv:
+            self._exc = exc
+            self._state = self._ERR
+            self._cv.notify_all()
+
+
+_new_listing_heavy_json_flight_lock = threading.Lock()
+_new_listing_heavy_json_flight: dict[tuple, _HeavyJsonFlight] = {}
+
+
+def _heavy_json_flight_register(fk: tuple) -> tuple[_HeavyJsonFlight, bool]:
+    with _new_listing_heavy_json_flight_lock:
+        g = _new_listing_heavy_json_flight.get(fk)
+        if g is not None:
+            return g, False
+        g = _HeavyJsonFlight()
+        _new_listing_heavy_json_flight[fk] = g
+        return g, True
+
+
+def _heavy_json_flight_remove(fk: tuple | None) -> None:
+    if fk is None:
+        return
+    with _new_listing_heavy_json_flight_lock:
+        _new_listing_heavy_json_flight.pop(fk, None)
 
 # format=json 短 TTL 内存缓存（按日期参数 + 是否跳过同步）；本地表变化后最多滞后 TTL
 _new_listing_json_cache_lock = threading.Lock()
@@ -436,7 +523,7 @@ def trend_new_listing_json_cache_stats():
 
 @router.get("/new-listing/heavy-status")
 def trend_new_listing_heavy_status():
-    """排查 429：当前进程是否在跑 New Listing heavy 构建（json_views=all/full）。"""
+    """排查 429：当前进程是否在跑 New Listing 全量构建（json_views=all/full 或 format=html，heavy 单槽）。"""
     now = time.monotonic()
     with _new_listing_heavy_status_lock:
         since = _new_listing_heavy_busy_since_mono
@@ -575,7 +662,7 @@ def trend_new_listing_report(
         # 原先整段包在锁里会把「只读 JSON」与耗时的 build_report_payload 串行化，多标签/多用户互相等待。
         # 锁仅用于 HTML 同步路径，避免并发 sync 写库重叠。
         if not effective_skip_sync and response_format == "json":
-            # JSON：后台同步，不阻塞本次响应
+            # JSON：后台同步，不阻塞本次响应；多用户并发时只跑一个 listing 同步，避免线程/DB 压力叠加
             def _bg_sync():
                 try:
                     if sync_start is not None and sync_end is not None:
@@ -592,11 +679,25 @@ def trend_new_listing_report(
                         "GET /api/trend/new-listing bg online sync failed (showing local data only): %s",
                         e,
                     )
+                finally:
+                    try:
+                        _new_listing_bg_json_sync_lock.release()
+                    except Exception:
+                        pass
 
-            try:
-                threading.Thread(target=_bg_sync, daemon=True).start()
-            except Exception as e:
-                logger.warning("GET /api/trend/new-listing bg sync start failed: %s", e)
+            if _new_listing_bg_json_sync_lock.acquire(blocking=False):
+                try:
+                    threading.Thread(target=_bg_sync, daemon=True).start()
+                except Exception as e:
+                    logger.warning("GET /api/trend/new-listing bg sync start failed: %s", e)
+                    try:
+                        _new_listing_bg_json_sync_lock.release()
+                    except Exception:
+                        pass
+            else:
+                logger.info(
+                    "GET /api/trend/new-listing bg sync skipped: another background listing sync is in progress"
+                )
         elif not effective_skip_sync:
             with _new_listing_sync_report_lock:
                 init_db()
@@ -616,24 +717,37 @@ def trend_new_listing_report(
                         e,
                     )
 
-        init_db()
-        db = SessionLocal()
-        heavy_acquired = False
-        try:
-            # heavy 构建并发限制：all/full 会构建完整 cohort+matrix，内存与连接消耗大
-            is_heavy = (
-                response_format == "json"
-                and json_views_mode in ("all_only", "full")
-                and single_store is None
+        heavy_json_follower = False
+        heavy_json_fk: tuple | None = None
+        heavy_json_gate: _HeavyJsonFlight | None = None
+        heavy_json_leader = False
+        is_heavy_json = (
+            response_format == "json"
+            and single_store is None
+            and json_views_mode in ("all_only", "full")
+        )
+        if is_heavy_json:
+            heavy_json_fk = (
+                _NEW_LISTING_JSON_CACHE_SCHEMA,
+                listing_since.isoformat(),
+                start_d.isoformat(),
+                end_d.isoformat(),
+                effective_skip_sync,
+                json_views_mode,
+                single_store,
+                bool(profile),
+                bool(nocache),
             )
-            if is_heavy:
-                wait_sec = max(0.2, float(settings.NEW_LISTING_HEAVY_ACQUIRE_TIMEOUT_SEC))
-                heavy_acquired = _new_listing_heavy_build_sema.acquire(timeout=wait_sec)
-                if not heavy_acquired:
-                    logger.warning(
-                        "New Listing heavy acquire timeout after %.1fs (another build still running); returning 429",
-                        wait_sec,
-                    )
+            heavy_json_gate, heavy_json_leader = _heavy_json_flight_register(heavy_json_fk)
+            if not heavy_json_leader:
+                heavy_json_follower = True
+                flight_wait = max(
+                    900.0,
+                    float(settings.NEW_LISTING_HEAVY_ACQUIRE_TIMEOUT_SEC) + 7200.0,
+                )
+                try:
+                    payload = heavy_json_gate.wait_payload(timeout_sec=flight_wait)
+                except _Heavy429Leader:
                     return JSONResponse(
                         status_code=429,
                         content={
@@ -641,37 +755,105 @@ def trend_new_listing_report(
                         },
                         headers={"Retry-After": "30"},
                     )
-                with _new_listing_heavy_status_lock:
-                    _new_listing_heavy_busy_since_mono = time.monotonic()
-            # KPI / cohort 与 amazon_listing 均须来自 online_db_host；不因 format=json 回退本地 daily_upload KPI。
-            prefer_online = True
-            prefer_listing_online = True
-            payload = build_report_payload(
-                db,
-                listing_since,
-                start_d,
-                end_d,
-                prefer_online=prefer_online,
-                prefer_listing_online=prefer_listing_online,
-                profile=profile,
-                json_views_mode=json_views_mode
-                if response_format == "json"
-                else "full",
-                single_store_id=single_store if response_format == "json" else None,
-            )
-        finally:
-            if heavy_acquired:
-                try:
+                except _HeavyJsonFlightWaitTimeout:
+                    return JSONResponse(
+                        status_code=504,
+                        content={"detail": "等待同组 New Listing 报表构建超时，请刷新重试。"},
+                    )
+
+        if not heavy_json_follower:
+            init_db()
+            db = SessionLocal()
+            heavy_acquired = False
+            store_slot_acquired = False
+            try:
+                # heavy：json all/full 与 format=html 走全量 cohort+matrix，内存峰值高；单槽避免多用户 OOM（exit 137）
+                is_heavy = single_store is None and (
+                    (response_format == "json" and json_views_mode in ("all_only", "full"))
+                    or (response_format == "html")
+                )
+                if is_heavy:
+                    wait_sec = max(0.2, float(settings.NEW_LISTING_HEAVY_ACQUIRE_TIMEOUT_SEC))
+                    heavy_acquired = _new_listing_heavy_build_sema.acquire(timeout=wait_sec)
+                    if not heavy_acquired:
+                        if heavy_json_gate is not None:
+                            heavy_json_gate.signal_leader_429()
+                            _heavy_json_flight_remove(heavy_json_fk)
+                        logger.warning(
+                            "New Listing heavy acquire timeout after %.1fs (another build still running); returning 429",
+                            wait_sec,
+                        )
+                        return JSONResponse(
+                            status_code=429,
+                            content={
+                                "detail": "New Listing 报表正在生成中（并发受限以避免内存/连接池被打满）。请稍后重试。",
+                            },
+                            headers={"Retry-After": "30"},
+                        )
                     with _new_listing_heavy_status_lock:
-                        _new_listing_heavy_busy_since_mono = None
-                    _new_listing_heavy_build_sema.release()
-                except Exception:
-                    pass
-            db.close()
+                        _new_listing_heavy_busy_since_mono = time.monotonic()
+                elif response_format == "json" and json_views_mode == "store":
+                    wait_store = max(1.0, float(settings.NEW_LISTING_STORE_BUILD_ACQUIRE_TIMEOUT_SEC))
+                    store_slot_acquired = _new_listing_store_build_sema.acquire(timeout=wait_store)
+                    if not store_slot_acquired:
+                        logger.warning(
+                            "New Listing store build acquire timeout after %.1fs; returning 429",
+                            wait_store,
+                        )
+                        return JSONResponse(
+                            status_code=429,
+                            content={
+                                "detail": "单店报表生成排队已满（全局限流以避免多用户并发时内存被打满）。请稍后重试。",
+                            },
+                            headers={"Retry-After": "15"},
+                        )
+                # KPI / cohort 与 amazon_listing 均须来自 online_db_host；不因 format=json 回退本地 daily_upload KPI。
+                prefer_online = True
+                prefer_listing_online = True
+                try:
+                    payload = build_report_payload(
+                        db,
+                        listing_since,
+                        start_d,
+                        end_d,
+                        prefer_online=prefer_online,
+                        prefer_listing_online=prefer_listing_online,
+                        profile=profile,
+                        json_views_mode=json_views_mode
+                        if response_format == "json"
+                        else "full",
+                        single_store_id=single_store if response_format == "json" else None,
+                    )
+                except BaseException as build_exc:
+                    if heavy_json_gate is not None:
+                        heavy_json_gate.complete_error(build_exc)
+                    raise
+                if heavy_json_gate is not None:
+                    heavy_json_gate.complete_success(payload)
+            finally:
+                if heavy_acquired:
+                    try:
+                        with _new_listing_heavy_status_lock:
+                            _new_listing_heavy_busy_since_mono = None
+                        _new_listing_heavy_build_sema.release()
+                    except Exception:
+                        pass
+                if store_slot_acquired:
+                    try:
+                        _new_listing_store_build_sema.release()
+                    except Exception:
+                        pass
+                db.close()
+            if heavy_json_fk is not None and heavy_json_leader:
+                _heavy_json_flight_remove(heavy_json_fk)
+        else:
+            # follower 已拿到与 leader 相同的 payload，不占 heavy 槽位与 DB 会话
+            pass
+
         if response_format == "json":
             # 预热单店 views：当首屏只返回 all 视图（json_views=all）时，后台空闲并发构建各店 store payload 并写入进程内短缓存，
             # 使后续切换店铺 json_views=store 更易命中缓存（前端也会在浏览器 idle 预取）。
-            if json_views_mode == "all_only":
+            if json_views_mode == "all_only" and not heavy_json_follower:
                 # 大区间（用户自定义起止日期）会导致 build_report_payload 与 online matrix 查询非常重；
                 # 此时再并发预热每个 store 容易把 online reporting 连接池打满，触发 QueuePool timeout，表现为「加载失败/非常慢」。
                 # 默认 35 天窗口才值得预热。
@@ -716,7 +898,9 @@ def trend_new_listing_report(
                         sid_i: int,
                         profile_flag: bool,
                     ) -> dict | None:
-                        # 独立 session，避免与请求线程共享
+                        # 与在线请求共享 store 构建全局限流，避免预热与用户查询叠满内存
+                        if not _new_listing_store_build_sema.acquire(timeout=600.0):
+                            return None
                         init_db()
                         sdb = SessionLocal()
                         try:
@@ -736,63 +920,81 @@ def trend_new_listing_report(
                                 sdb.close()
                             except Exception:
                                 pass
+                            try:
+                                _new_listing_store_build_sema.release()
+                            except Exception:
+                                pass
 
                     def _bg_prewarm():
                         if not cache_keys_to_warm:
                             return
-                        t0w = time.perf_counter()
-                        # all_only 已在主线程做过 bulk GROUP BY；这里等 bulk cache 就绪再预热 store payload，
-                        # 使 store 构建路径可直接复用 bulk 的 by_store 切片，避免重复打本地 GROUP BY。
-                        matrix_bulk_cache_wait_ready(start_d, end_d, timeout_sec=2.0)
-                        # 依据 online reporting pool 容量限制并发；默认最多 3
-                        try:
-                            pool_cap = max(
-                                1,
-                                int(settings.ONLINE_REPORT_POOL_SIZE)
-                                + int(settings.ONLINE_REPORT_POOL_OVERFLOW)
-                                - 1,
-                            )
-                        except Exception:
-                            pool_cap = 2
-                        max_workers = max(1, min(3, pool_cap, len(cache_keys_to_warm)))
-                        warmed = 0
-                        failed = 0
-                        try:
-                            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                                futs = {}
-                                for sid_i, key in cache_keys_to_warm:
-                                    futs[
-                                        ex.submit(
-                                            _build_store_payload_for_cache,
-                                            listing_since,
-                                            start_d,
-                                            end_d,
-                                            sid_i,
-                                            profile,
-                                        )
-                                    ] = (sid_i, key)
-                                for fut in as_completed(futs):
-                                    sid_i, key = futs[fut]
-                                    try:
-                                        out = fut.result()
-                                        if out is not None:
-                                            _new_listing_json_cache_set(key, out)
-                                            warmed += 1
-                                    except Exception as exc:
-                                        failed += 1
-                                        logger.debug(
-                                            "New Listing store prewarm failed sid=%s: %s",
-                                            sid_i,
-                                            exc,
-                                        )
-                        finally:
+                        if not _new_listing_prewarm_slot.acquire(blocking=False):
                             logger.info(
-                                "New Listing store prewarm done: warmed=%s failed=%s stores=%s elapsed_sec=%.2f",
-                                warmed,
-                                failed,
-                                len(cache_keys_to_warm),
-                                time.perf_counter() - t0w,
+                                "New Listing store prewarm skipped: global prewarm slot busy (another range warming)"
                             )
+                            return
+                        t0w = time.perf_counter()
+                        try:
+                            # all_only 已在主线程做过 bulk GROUP BY；这里等 bulk cache 就绪再预热 store payload，
+                            # 使 store 构建路径可直接复用 bulk 的 by_store 切片，避免重复打本地 GROUP BY。
+                            matrix_bulk_cache_wait_ready(start_d, end_d, timeout_sec=2.0)
+                            try:
+                                pool_cap = max(
+                                    1,
+                                    int(settings.ONLINE_REPORT_POOL_SIZE)
+                                    + int(settings.ONLINE_REPORT_POOL_OVERFLOW)
+                                    - 1,
+                                )
+                            except Exception:
+                                pool_cap = 2
+                            try:
+                                store_cap = max(1, int(settings.NEW_LISTING_STORE_BUILD_CONCURRENCY))
+                            except Exception:
+                                store_cap = 2
+                            max_workers = max(1, min(store_cap, pool_cap, len(cache_keys_to_warm)))
+                            warmed = 0
+                            failed = 0
+                            try:
+                                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                                    futs = {}
+                                    for sid_i, key in cache_keys_to_warm:
+                                        futs[
+                                            ex.submit(
+                                                _build_store_payload_for_cache,
+                                                listing_since,
+                                                start_d,
+                                                end_d,
+                                                sid_i,
+                                                profile,
+                                            )
+                                        ] = (sid_i, key)
+                                    for fut in as_completed(futs):
+                                        sid_i, key = futs[fut]
+                                        try:
+                                            out = fut.result()
+                                            if out is not None:
+                                                _new_listing_json_cache_set(key, out)
+                                                warmed += 1
+                                        except Exception as exc:
+                                            failed += 1
+                                            logger.debug(
+                                                "New Listing store prewarm failed sid=%s: %s",
+                                                sid_i,
+                                                exc,
+                                            )
+                            finally:
+                                logger.info(
+                                    "New Listing store prewarm done: warmed=%s failed=%s stores=%s elapsed_sec=%.2f",
+                                    warmed,
+                                    failed,
+                                    len(cache_keys_to_warm),
+                                    time.perf_counter() - t0w,
+                                )
+                        finally:
+                            try:
+                                _new_listing_prewarm_slot.release()
+                            except Exception:
+                                pass
 
                     try:
                         threading.Thread(target=_bg_prewarm, daemon=True).start()

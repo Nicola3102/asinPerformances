@@ -24,6 +24,7 @@ services:
       - ./backend:/app
     ports:
       - "9090:9090"
+    # 多用户同时开大区间 New Listing 若 backend 反复 exit 137，多为 Docker 内存上限触发 OOM killer；请调高 Docker Desktop 内存或为该服务增加 mem_limit。
     env_file:
       - ./backend/.env
     environment:

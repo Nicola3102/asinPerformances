@@ -16,9 +16,9 @@ export default defineConfig({
       '/api': {
         target: apiTarget,
         changeOrigin: true,
-        // Group F / traffic 报表等可能数分钟；timeout=客户端 socket，proxyTimeout=等后端首包/全程（过短会红字失败且 Response 空）
-        timeout: 900000,
-        proxyTimeout: 900000,
+        // New Listing json_views=all 大区间冷算可达数十分钟；过短会中断连接 → 浏览器 Failed to fetch、Response 头为空
+        timeout: 3_600_000,
+        proxyTimeout: 3_600_000,
       },
     },
   },

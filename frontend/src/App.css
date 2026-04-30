@@ -148,6 +148,14 @@
   color: #a8b8cc;
 }
 
+.trend-embed-loading-hint {
+  margin: 0.75rem 0 0;
+  max-width: 36rem;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: #7c8ca0;
+}
+
 .trend-embed-error-title {
   margin: 0 0 0.75rem;
   font-size: 1.15rem;
@@ -250,6 +258,15 @@
   font-size: 0.8rem;
   color: #fbbf24;
   white-space: nowrap;
+}
+
+.trend-new-listing-refresh-banner-warn {
+  flex: 1 1 12rem;
+  min-width: 0;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  color: #fcd34d;
+  white-space: normal;
 }
 
 .trend-new-listing-kpi {

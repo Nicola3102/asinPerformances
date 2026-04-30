@@ -31,13 +31,24 @@ class Settings(BaseSettings):
     ONLINE_REPORT_POOL_OVERFLOW: int = Field(default=4, validation_alias="online_report_pool_overflow")
     ONLINE_REPORT_POOL_TIMEOUT: int = Field(default=5, validation_alias="online_report_pool_timeout")
 
-    # GET /api/trend/new-listing?format=json 进程内缓存（本地 session 矩阵会变，不宜过长）
-    NEW_LISTING_JSON_CACHE_TTL_SEC: int = Field(default=120, validation_alias="new_listing_json_cache_ttl_sec")
+    # GET /api/trend/new-listing?format=json 进程内缓存（本地 session 矩阵会变，不宜过长；略长可减少默认 35 天窗口的重复 heavy）
+    NEW_LISTING_JSON_CACHE_TTL_SEC: int = Field(default=240, validation_alias="new_listing_json_cache_ttl_sec")
     NEW_LISTING_JSON_CACHE_MAX_KEYS: int = Field(default=32, validation_alias="new_listing_json_cache_max_keys")
-    # New Listing json_views=all/full 与单线程 heavy 构建串行：在此时间内排队等待槽位，避免 0.2s 就 429 导致前端重试风暴
+    # New Listing json_views=all/full 与单线程 heavy 构建串行：在此时间内排队等待槽位；过短易在构建数分钟时大量 429，过长会堆积等待线程
     NEW_LISTING_HEAVY_ACQUIRE_TIMEOUT_SEC: float = Field(
-        default=240.0,
+        default=900.0,
         validation_alias="new_listing_heavy_acquire_timeout_sec",
+    )
+    # json_views=store 全局限流：多用户不同日期并发时，store 构建与 all 叠加易占满内存/online 池，容器常见 exit 137（OOM SIGKILL）
+    NEW_LISTING_STORE_BUILD_CONCURRENCY: int = Field(
+        default=4,
+        ge=1,
+        le=8,
+        validation_alias="new_listing_store_build_concurrency",
+    )
+    NEW_LISTING_STORE_BUILD_ACQUIRE_TIMEOUT_SEC: float = Field(
+        default=120.0,
+        validation_alias="new_listing_store_build_acquire_timeout_sec",
     )
 
     # 定时同步：东八区每 N 小时执行一次；后端进程需常驻
