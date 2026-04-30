@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func, literal_column, or_, text, tuple_
+from sqlalchemy.exc import OperationalError
 
 from app.online_engine import get_online_reporting_engine
 
@@ -979,6 +980,47 @@ def refresh_query_status(
     completed_groups = 0
     skipped_completed = 0
     skipped_by_interval = 0
+    write_batches = 0
+    pending_writes = 0
+
+    def _is_lock_wait_timeout(exc: OperationalError) -> bool:
+        # PyMySQL: args[0] = 1205
+        orig = getattr(exc, "orig", None)
+        args = getattr(orig, "args", ()) if orig is not None else ()
+        try:
+            return bool(args) and int(args[0]) == 1205
+        except Exception:
+            return False
+
+    def _update_checked_status_with_retry(parent_asin: str, sid: int, new_status: str) -> bool:
+        nonlocal pending_writes
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # 仅在需要时更新，减少无意义写入和行锁竞争
+                db.query(AsinPerformance).filter(
+                    AsinPerformance.week_no == week_no,
+                    AsinPerformance.parent_asin == parent_asin,
+                    AsinPerformance.store_id == sid,
+                    or_(
+                        AsinPerformance.checked_status != new_status,
+                        AsinPerformance.checked_at.is_(None),
+                        AsinPerformance.checked_at <= threshold,
+                    ),
+                ).update(
+                    {"checked_status": new_status, "checked_at": now},
+                    synchronize_session=False,
+                )
+                pending_writes += 1
+                return True
+            except OperationalError as exc:
+                db.rollback()
+                if _is_lock_wait_timeout(exc) and attempt < (max_retries - 1):
+                    # 轻量退避重试，避免瞬时锁冲突导致整个接口失败
+                    time.sleep(0.15 * (attempt + 1))
+                    continue
+                raise
+        return False
     lock_acquired = _query_refresh_lock.acquire(blocking=False)
     if not lock_acquired:
         return {
@@ -1007,41 +1049,38 @@ def refresh_query_status(
                 done, child_count = check_parent_store_week_completed(conn, str(pa or ""), int(sid), week_no)
                 if child_count == 0:
                     # 无子 ASIN，保持 pending，只记录检查时间
-                    db.query(AsinPerformance).filter(
-                        AsinPerformance.week_no == week_no,
-                        AsinPerformance.parent_asin == pa,
-                        AsinPerformance.store_id == sid,
-                    ).update(
-                        {"checked_status": "pending", "checked_at": now},
-                        synchronize_session=False,
-                    )
+                    _update_checked_status_with_retry(str(pa or ""), int(sid), "pending")
                     checked_groups += 1
+                    if pending_writes >= 50:
+                        db.commit()
+                        write_batches += 1
+                        pending_writes = 0
                     continue
                 new_status = "completed" if done else "pending"
-                db.query(AsinPerformance).filter(
-                    AsinPerformance.week_no == week_no,
-                    AsinPerformance.parent_asin == pa,
-                    AsinPerformance.store_id == sid,
-                ).update(
-                    {"checked_status": new_status, "checked_at": now},
-                    synchronize_session=False,
-                )
+                _update_checked_status_with_retry(str(pa or ""), int(sid), new_status)
                 checked_groups += 1
                 if done:
                     completed_groups += 1
-        db.commit()
+                if pending_writes >= 50:
+                    db.commit()
+                    write_batches += 1
+                    pending_writes = 0
+        if pending_writes > 0:
+            db.commit()
+            write_batches += 1
     finally:
         if lock_acquired:
             _query_refresh_lock.release()
 
     logger.info(
-        "[QueryStatusRefresh] week_no=%s checked_groups=%s completed_groups=%s skipped_completed=%s skipped_by_interval=%s groups_total=%s",
+        "[QueryStatusRefresh] week_no=%s checked_groups=%s completed_groups=%s skipped_completed=%s skipped_by_interval=%s groups_total=%s write_batches=%s",
         week_no,
         checked_groups,
         completed_groups,
         skipped_completed,
         skipped_by_interval,
         len(groups),
+        write_batches,
     )
     return {
         "week_no": week_no,
