@@ -504,6 +504,10 @@ export type AdsProfitWeeklyPoint = {
   gross_margin_rate: number
   gross_margin_after_return_rate: number
   return_rate: number
+  return_rate_actual?: number
+  return_rate_predicted?: number | null
+  return_rate_curve_type?: 'actual' | 'predicted'
+  return_rate_curve_color?: string
 }
 
 export type AdsProfitResponse = {

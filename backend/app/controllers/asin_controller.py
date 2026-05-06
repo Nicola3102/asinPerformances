@@ -980,6 +980,7 @@ def refresh_query_status(
     completed_groups = 0
     skipped_completed = 0
     skipped_by_interval = 0
+    skipped_lock_conflicts = 0
     write_batches = 0
     pending_writes = 0
 
@@ -993,7 +994,7 @@ def refresh_query_status(
             return False
 
     def _update_checked_status_with_retry(parent_asin: str, sid: int, new_status: str) -> bool:
-        nonlocal pending_writes
+        nonlocal pending_writes, skipped_lock_conflicts
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -1019,6 +1020,18 @@ def refresh_query_status(
                     # 轻量退避重试，避免瞬时锁冲突导致整个接口失败
                     time.sleep(0.15 * (attempt + 1))
                     continue
+                if _is_lock_wait_timeout(exc):
+                    skipped_lock_conflicts += 1
+                    logger.warning(
+                        "[QueryStatusRefresh] lock-timeout skip: week_no=%s parent_asin=%s store_id=%s target_status=%s attempt=%s/%s",
+                        week_no,
+                        parent_asin,
+                        sid,
+                        new_status,
+                        attempt + 1,
+                        max_retries,
+                    )
+                    return False
                 raise
         return False
     lock_acquired = _query_refresh_lock.acquire(blocking=False)
@@ -1049,18 +1062,20 @@ def refresh_query_status(
                 done, child_count = check_parent_store_week_completed(conn, str(pa or ""), int(sid), week_no)
                 if child_count == 0:
                     # 无子 ASIN，保持 pending，只记录检查时间
-                    _update_checked_status_with_retry(str(pa or ""), int(sid), "pending")
-                    checked_groups += 1
+                    ok = _update_checked_status_with_retry(str(pa or ""), int(sid), "pending")
+                    if ok:
+                        checked_groups += 1
                     if pending_writes >= 50:
                         db.commit()
                         write_batches += 1
                         pending_writes = 0
                     continue
                 new_status = "completed" if done else "pending"
-                _update_checked_status_with_retry(str(pa or ""), int(sid), new_status)
-                checked_groups += 1
-                if done:
-                    completed_groups += 1
+                ok = _update_checked_status_with_retry(str(pa or ""), int(sid), new_status)
+                if ok:
+                    checked_groups += 1
+                    if done:
+                        completed_groups += 1
                 if pending_writes >= 50:
                     db.commit()
                     write_batches += 1
@@ -1073,12 +1088,13 @@ def refresh_query_status(
             _query_refresh_lock.release()
 
     logger.info(
-        "[QueryStatusRefresh] week_no=%s checked_groups=%s completed_groups=%s skipped_completed=%s skipped_by_interval=%s groups_total=%s write_batches=%s",
+        "[QueryStatusRefresh] week_no=%s checked_groups=%s completed_groups=%s skipped_completed=%s skipped_by_interval=%s skipped_lock_conflicts=%s groups_total=%s write_batches=%s",
         week_no,
         checked_groups,
         completed_groups,
         skipped_completed,
         skipped_by_interval,
+        skipped_lock_conflicts,
         len(groups),
         write_batches,
     )
@@ -1088,6 +1104,7 @@ def refresh_query_status(
         "completed_groups": completed_groups,
         "skipped_completed": skipped_completed,
         "skipped_by_interval": skipped_by_interval,
+        "skipped_lock_conflicts": skipped_lock_conflicts,
         "checked_at": now.isoformat(),
     }
 

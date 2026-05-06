@@ -2997,6 +2997,8 @@ function TrendSessionImpressionEmbeddedPage() {
 
         const lsHtml = readSessionImpressionHtmlLs()
         let display = t1
+        /** 无本地 HTML 且服务端 miss 时不在 iframe 里塞 stub，避免 srcDoc 先 stub 再正式报表的整页闪烁；用外层加载态直到 rebuild 完成 */
+        let skipIframeUntilRebuild = false
         if (embedCacheHdr === 'miss') {
           if (lsHtml) {
             display = lsHtml
@@ -3004,13 +3006,19 @@ function TrendSessionImpressionEmbeddedPage() {
               setBgNotice('展示浏览器本地缓存，正在向服务器同步最新报表…')
             }
           } else {
+            skipIframeUntilRebuild = true
             display = SESSION_IMPRESSION_FIRST_BUILD_STUB
           }
         }
 
         if (!cancelled) {
-          sessionImpressionCachedHtml = display
-          setHtml(display)
+          if (skipIframeUntilRebuild) {
+            sessionImpressionCachedHtml = null
+            setHtml(null)
+          } else {
+            sessionImpressionCachedHtml = display
+            setHtml(display)
+          }
         }
 
         if (embedCacheHdr === 'hit' && t1.length > 200) {
@@ -3033,6 +3041,10 @@ function TrendSessionImpressionEmbeddedPage() {
                 ? '报表生成失败，请稍后刷新页面重试，或新标签打开 /api/trend/session-impression?rebuild=1'
                 : '刷新后后台同步失败，仍显示缓存内容。可再次刷新重试。',
             )
+            if (skipIframeUntilRebuild) {
+              setHtml(SESSION_IMPRESSION_FIRST_BUILD_STUB)
+              sessionImpressionCachedHtml = SESSION_IMPRESSION_FIRST_BUILD_STUB
+            }
           }
           return
         }
@@ -3080,8 +3092,16 @@ function TrendSessionImpressionEmbeddedPage() {
     )
   }
   if (html === null) {
+    const showBar = bgRefreshing || Boolean(bgNotice)
     return (
-      <div className="trend-embed-page trend-embed-page--message">
+      <div
+        className={`trend-embed-page trend-embed-page--message${showBar ? ' trend-embed-page--with-bar' : ''}`}
+      >
+        {showBar ? (
+          <div className="trend-embed-bgbar" role="status">
+            {bgRefreshing ? '正在后台与线上库同步最新报表…' : bgNotice}
+          </div>
+        ) : null}
         <p className="trend-embed-loading">正在加载 session &amp; impression 报表…</p>
         <p className="trend-embed-hint">
           正在请求报表。服务端有内存缓存时较快；无缓存时会自动全量生成并写入浏览器本地缓存，下次进入可秒开。
@@ -3879,7 +3899,7 @@ function TrendNewListingEmbeddedPage() {
       </div>
     )
   }
-  if (payload === null || !payload.views?.all || waitingForBuildRetry) {
+  if (payload === null || !payload.views?.all) {
     return (
       <div className="trend-embed-page trend-embed-page--message">
         <p className="trend-embed-loading">正在加载 New Listing 报表…</p>
@@ -4010,7 +4030,11 @@ function TrendNewListingEmbeddedPage() {
         >
           同步 listing 并重载
         </button>
-        {err && payload?.views?.all && !waitingForBuildRetry ? (
+        {waitingForBuildRetry ? (
+          <span className="trend-new-listing-refresh-banner-warn" role="status">
+            {err ?? '报表排队生成中，请稍候…'}
+          </span>
+        ) : err && payload?.views?.all ? (
           <span className="trend-new-listing-refresh-banner-warn" role="status">
             {err.length > 160 ? `${err.slice(0, 160)}…` : err}
           </span>
@@ -4046,23 +4070,7 @@ function TrendNewListingEmbeddedPage() {
           <strong>{Number(view.kpi?.activeAsin ?? 0).toLocaleString()}</strong>
         </div>
       </div>
-      <p className="trend-new-listing-hint">
-        支持按开始日期与结束日期查询；若两个日期都不传，则默认按当前最新 session_date 自动展示最近 35 天数据。
-        柱形为各上新批次（open_date）贡献的 sessions 堆叠；黑色折线为每日合计。横坐标仅包含有 session 数据的日期。
-        悬停提示中各批次仅显示相对该横轴日最近 {NL_STACK_TOOLTIP_COHORT_LOOKBACK_DAYS} 个日历日内的 open_date，并固定展示当日 sessions 合计。
-        全店数据就绪后会在浏览器空闲时用 <code className="trend-new-listing-code">json_views=store</code> 预取各店并写入本地缓存，切换店铺时优先直接用已合并的{' '}
-        <code className="trend-new-listing-code">views[store_id]</code>。
-        首次进入若无缓存会自动请求一次；之后默认展示浏览器本地缓存，不自动打接口。地址栏加{' '}
-        <code className="trend-new-listing-code">?refresh=1</code> 可强制重新拉取；加{' '}
-        <code className="trend-new-listing-code">?profile=1</code> 可在控制台查看各阶段耗时（含服务端 profileTimingsSec）。
-        {payload.kpiSource === 'amazon_listing'
-          ? ' 顶部 KPI：online_db amazon_listing，COUNT(*) 且 DATE(open_date) > listing_since；Active 另加 status = Active。'
-          : payload.kpiSource === 'amazon_listing_unreachable'
-            ? ' 已配置 online_db 但当前无法连接，KPI 显示为 0（未用本地表代替）；请检查网络与账号权限。'
-            : payload.kpiSource === 'daily_upload_asin_dates_fallback'
-              ? ' 未配置 online_db：KPI 来自本地 daily_upload_asin_dates。'
-              : ''}
-      </p>
+     
       <div className="trend-new-listing-chart-wrap">
         {view.labels.length === 0 || barDatasets.length === 0 ? (
           <p className="trend-new-listing-empty">暂无图表数据（请确认已同步 daily_upload_asin_dates 且 open_date 非空）。</p>
@@ -5397,12 +5405,55 @@ function AdsProfitPage() {
     void load()
   }, [])
 
+  const returnCurveCutoffMs = useMemo(() => {
+    const asOf = (endDate || latestInvoiceDate || '').trim()
+    if (!asOf) return Number.NaN
+    const d = new Date(asOf)
+    if (Number.isNaN(d.getTime())) return Number.NaN
+    return d.getTime() - (45 * 24 * 60 * 60 * 1000)
+  }, [endDate, latestInvoiceDate])
+
+  const deriveReturnCurveValue = useCallback((row: AdsProfitWeeklyPoint) => {
+    const actualRaw = (typeof row.return_rate_actual === 'number' && Number.isFinite(row.return_rate_actual))
+      ? row.return_rate_actual
+      : null
+    const predRaw = (typeof row.return_rate_predicted === 'number' && Number.isFinite(row.return_rate_predicted))
+      ? row.return_rate_predicted
+      : null
+    if (actualRaw != null || predRaw != null) {
+      // 后端明确标记为 predicted 的周，不展示真实曲线（避免 0% 贴地线）
+      if (row.return_rate_curve_type === 'predicted') {
+        return { actual: null, predicted: predRaw }
+      }
+      if (row.return_rate_curve_type === 'actual') {
+        return { actual: actualRaw, predicted: null }
+      }
+      return { actual: actualRaw, predicted: predRaw }
+    }
+    if (!Number.isFinite(row.return_rate)) {
+      return { actual: null, predicted: null }
+    }
+    // 兼容旧后端：未返回 actual/predicted 字段时，按 45 天分界拆分曲线
+    const weekEnd = row.week_end ? new Date(row.week_end) : null
+    if (!weekEnd || Number.isNaN(weekEnd.getTime()) || !Number.isFinite(returnCurveCutoffMs)) {
+      return { actual: row.return_rate, predicted: null }
+    }
+    if (weekEnd.getTime() <= returnCurveCutoffMs) {
+      return { actual: row.return_rate, predicted: null }
+    }
+    return { actual: null, predicted: row.return_rate }
+  }, [returnCurveCutoffMs])
+
   const profitChartData = useMemo(() => {
     const labels = weeklySeries.map((row) => row.week_start || '–')
     const grossMarginAfterReturnData = weeklySeries.map((row) => (
       row.gross_margin_after_return_rate === 0 ? null : row.gross_margin_after_return_rate
     ))
     const hasGrossMarginAfterReturnData = grossMarginAfterReturnData.some((value) => value != null && Number.isFinite(value))
+    const returnRateActualData = weeklySeries.map((row) => deriveReturnCurveValue(row).actual)
+    const returnRatePredictedData = weeklySeries.map((row) => deriveReturnCurveValue(row).predicted)
+    const hasReturnRateActualData = returnRateActualData.some((value) => value != null && Number.isFinite(value))
+    const hasReturnRatePredictedData = returnRatePredictedData.some((value) => value != null && Number.isFinite(value))
     return {
       labels,
       datasets: [
@@ -5448,9 +5499,38 @@ function AdsProfitPage() {
               order: 0,
             }]
           : []),
+        ...(hasReturnRateActualData
+          ? [{
+              type: 'line' as const,
+              label: '退货率（真实）',
+              data: returnRateActualData,
+              borderColor: '#a855f7',
+              backgroundColor: 'rgba(168, 85, 247, 0.12)',
+              yAxisID: 'yReturnRate',
+              tension: 0.25,
+              pointRadius: 4,
+              pointHoverRadius: 5,
+              order: 0,
+            }]
+          : []),
+        ...(hasReturnRatePredictedData
+          ? [{
+              type: 'line' as const,
+              label: '退货率（预测）',
+              data: returnRatePredictedData,
+              borderColor: '#f59e0b',
+              backgroundColor: 'rgba(245, 158, 11, 0.12)',
+              yAxisID: 'yReturnRate',
+              tension: 0.25,
+              pointRadius: 4,
+              pointHoverRadius: 5,
+              borderDash: [6, 4],
+              order: 0,
+            }]
+          : []),
       ],
     } as any
-  }, [weeklySeries])
+  }, [deriveReturnCurveValue, weeklySeries])
 
   const moneyMax = useMemo(() => {
     const vals = weeklySeries.map((row) => row.sales_amount + row.refund_amount).filter((v) => Number.isFinite(v))
@@ -5462,6 +5542,8 @@ function AdsProfitPage() {
     const vals = weeklySeries.flatMap((row) => [
       row.gross_margin_rate,
       ...(row.gross_margin_after_return_rate === 0 ? [] : [row.gross_margin_after_return_rate]),
+      ...(deriveReturnCurveValue(row).actual != null ? [Number(deriveReturnCurveValue(row).actual)] : []),
+      ...(deriveReturnCurveValue(row).predicted != null ? [Number(deriveReturnCurveValue(row).predicted)] : []),
     ]).filter((v) => Number.isFinite(v))
     if (!vals.length) return { min: -10, max: 20 }
     const min = Math.min(...vals, 0)
@@ -5470,7 +5552,21 @@ function AdsProfitPage() {
       min: Math.floor(min / 5) * 5,
       max: Math.max(5, Math.ceil(max / 5) * 5),
     }
-  }, [weeklySeries])
+  }, [deriveReturnCurveValue, weeklySeries])
+
+  const returnRateMinMax = useMemo(() => {
+    const vals = weeklySeries.flatMap((row) => [
+      ...(deriveReturnCurveValue(row).actual != null ? [Number(deriveReturnCurveValue(row).actual)] : []),
+      ...(deriveReturnCurveValue(row).predicted != null ? [Number(deriveReturnCurveValue(row).predicted)] : []),
+    ]).filter((v) => Number.isFinite(v))
+    if (!vals.length) return { min: 0, max: 20 }
+    const min = Math.min(...vals, 0)
+    const max = Math.max(...vals, 5)
+    return {
+      min: Math.floor(min / 2) * 2,
+      max: Math.max(6, Math.ceil(max / 2) * 2),
+    }
+  }, [deriveReturnCurveValue, weeklySeries])
 
   const profitChartOptions = useMemo<ChartOptions<'bar'>>(() => ({
     responsive: true,
@@ -5483,7 +5579,7 @@ function AdsProfitPage() {
           label: (ctx: TooltipItem<'bar'>) => {
             const label = ctx.dataset.label || ''
             const value = Number(ctx.parsed.y ?? 0)
-            if (label.includes('毛利率')) return `${label}: ${value.toFixed(2)}%`
+            if (label.includes('毛利率') || label.includes('退货率')) return `${label}: ${value.toFixed(2)}%`
             return `${label}: ${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
           },
           afterBody: (items) => {
@@ -5493,7 +5589,9 @@ function AdsProfitPage() {
             return [
               `订单数: ${row.order_count.toLocaleString()}`,
               `退货订单数: ${row.returned_order_count.toLocaleString()}`,
-              `退货率: ${row.return_rate.toFixed(2)}%`,
+              `退货率(展示): ${row.return_rate.toFixed(2)}%`,
+              `退货率(真实): ${deriveReturnCurveValue(row).actual != null ? `${Number(deriveReturnCurveValue(row).actual).toFixed(2)}%` : '–'}`,
+              `退货率(预测): ${deriveReturnCurveValue(row).predicted != null ? `${Number(deriveReturnCurveValue(row).predicted).toFixed(2)}%` : '–'}`,
             ]
           },
         },
@@ -5523,8 +5621,20 @@ function AdsProfitPage() {
           callback: (value) => `${value}%`,
         },
       },
+      yReturnRate: {
+        type: 'linear' as const,
+        position: 'right',
+        offset: true,
+        min: returnRateMinMax.min,
+        max: returnRateMinMax.max,
+        grid: { drawOnChartArea: false },
+        title: { display: true, text: '退货率 (%)' },
+        ticks: {
+          callback: (value) => `${value}%`,
+        },
+      },
     },
-  }), [moneyMax, rateMinMax.max, rateMinMax.min, weeklySeries])
+  }), [moneyMax, rateMinMax.max, rateMinMax.min, returnRateMinMax.max, returnRateMinMax.min, weeklySeries])
 
   const metricCards = [
     {
@@ -5540,7 +5650,6 @@ function AdsProfitPage() {
     { label: '毛利', value: summary.gross_profit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }), accent: 'green' },
     { label: '毛利率（不含退货）', value: `${summary.gross_margin_rate.toFixed(2)}%`, accent: 'teal' },
     { label: '毛利率（含退货）', value: `${summary.gross_margin_after_return_rate.toFixed(2)}%`, accent: 'red' },
-    { label: '退货率', value: `${summary.return_rate.toFixed(2)}%`, accent: 'purple' },
   ]
 
   return (
@@ -5588,7 +5697,7 @@ function AdsProfitPage() {
         <div className="trend-chart-header">
           <div>
             <h3>周利润趋势</h3>
-            <p className="trend-chart-hint">柱状图为销售额 + 退货金额堆叠，折线为不含退货 / 含退货毛利率</p>
+            <p className="trend-chart-hint">柱状图为销售额 + 退货金额堆叠，折线为毛利率与每周退货率（真实/预测）</p>
           </div>
         </div>
         <div className="ads-line-chart-wrap">
@@ -5608,6 +5717,8 @@ function AdsProfitPage() {
               <th>gross_margin_rate</th>
               <th>gross_margin_after_return_rate</th>
               <th>return_rate</th>
+              <th>return_rate_actual</th>
+              <th>return_rate_predicted</th>
             </tr>
           </thead>
           <tbody>
@@ -5621,11 +5732,13 @@ function AdsProfitPage() {
                 <td>{row.gross_margin_rate.toFixed(2)}%</td>
                 <td>{row.gross_margin_after_return_rate.toFixed(2)}%</td>
                 <td>{row.return_rate.toFixed(2)}%</td>
+                <td>{deriveReturnCurveValue(row).actual != null ? `${Number(deriveReturnCurveValue(row).actual).toFixed(2)}%` : '–'}</td>
+                <td>{deriveReturnCurveValue(row).predicted != null ? `${Number(deriveReturnCurveValue(row).predicted).toFixed(2)}%` : '–'}</td>
               </tr>
             ))}
             {!loading && weeklySeries.length === 0 && (
               <tr>
-                <td colSpan={8} className="empty-hint">No data.</td>
+                <td colSpan={10} className="empty-hint">No data.</td>
               </tr>
             )}
           </tbody>

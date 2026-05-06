@@ -28,13 +28,14 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import text
 
 from app.config import settings
 from app.online_engine import get_online_reporting_engine
+from app.services.predict_return_rate import predict_recent_return_rate
 
 DEFAULT_PROFIT_START = date(2026, 2, 23)
 
@@ -67,7 +68,40 @@ def _quantize_pct(val: Decimal) -> float:
 
 def _mature_return_end(end_date: date) -> date:
     """退货相关指标只统计当前日期前 45 天的成熟区间。"""
-    return min(end_date, date.today() - timedelta(days=45))
+    return min(end_date, _today_pst_date() - timedelta(days=45))
+
+
+def _today_pst_date() -> date:
+    """以 PST（固定 -07:00，与本模块 SQL 口径一致）计算当前日历日。"""
+    pst_tz = timezone(timedelta(hours=-7))
+    return datetime.now(timezone.utc).astimezone(pst_tz).date()
+
+
+def _fetch_recent_predicted_return_rate_by_week(
+    *,
+    as_of_date: date,
+    store_id: int | None,
+    lookback_days: int = 45,
+) -> dict[str, float]:
+    """
+    拉取 predict_return_rate 的周预测退货率（金额口径，百分比）。
+    """
+    pred = predict_recent_return_rate(
+        lookback_days=int(lookback_days),
+        store_id=store_id,
+        as_of_date=as_of_date,
+    )
+    out: dict[str, float] = {}
+    for row in pred.get("weekly_series", []) if isinstance(pred, dict) else []:
+        wk = row.get("request_week_start")
+        rt = row.get("predicted_return_rate")
+        if wk is None or rt is None:
+            continue
+        try:
+            out[str(wk)] = float(rt)
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def _build_scoped_profit_parts(
@@ -246,6 +280,19 @@ def fetch_profit_weekly_series(
 ) -> list[dict]:
     params, store_filter = _build_scoped_profit_parts(start_date, end_date, store_id)
     params["mature_end_date"] = _mature_return_end(end_date).strftime("%Y-%m-%d")
+    as_of_pst = _today_pst_date()
+    # 业务分界：当前日期前 45 天截止到前一日（例如 2026-04-30 -> 2026-03-15 为真实截止）
+    mature_curve_end = as_of_pst - timedelta(days=46)
+    predicted_by_week: dict[str, float] = {}
+    try:
+        predicted_by_week = _fetch_recent_predicted_return_rate_by_week(
+            as_of_date=as_of_pst,
+            store_id=store_id,
+            lookback_days=45,
+        )
+    except Exception:
+        # 预测失败不影响主报表：降级为全真实曲线
+        predicted_by_week = {}
     sql = text(
         f"""
         WITH scoped_profit AS (
@@ -345,9 +392,18 @@ def fetch_profit_weekly_series(
         gross_profit = _to_decimal(r["gross_profit"])
         mature_gross_profit = _to_decimal(r["mature_gross_profit"])
         gross_profit_after_return = mature_gross_profit - refund_amount
+        week_start_obj = r["week_start"]
+        week_start_str = week_start_obj.isoformat() if week_start_obj is not None else None
+        actual_rate = _quantize_pct(_pct(refund_amount, mature_sales_amount))
+        predicted_rate = predicted_by_week.get(week_start_str or "") if week_start_str else None
+        week_end_obj = r["week_end"]
+        use_predicted = bool(week_end_obj is not None and week_end_obj > mature_curve_end and predicted_rate is not None)
+        display_rate = float(predicted_rate) if use_predicted else float(actual_rate)
+        curve_type = "predicted" if use_predicted else "actual"
+        curve_color = "#f59e0b" if use_predicted else "#8b5cf6"
         out.append(
             {
-                "week_start": r["week_start"].isoformat() if r["week_start"] is not None else None,
+                "week_start": week_start_str,
                 "week_end": r["week_end"].isoformat() if r["week_end"] is not None else None,
                 "order_count": int(r["order_count"] or 0),
                 "returned_order_count": int(r["returned_order_count"] or 0),
@@ -358,7 +414,11 @@ def fetch_profit_weekly_series(
                 "gross_profit_after_return": _quantize_money(gross_profit_after_return),
                 "gross_margin_rate": _quantize_pct(_pct(gross_profit, sales_amount)),
                 "gross_margin_after_return_rate": _quantize_pct(_pct(gross_profit_after_return, mature_sales_amount)),
-                "return_rate": _quantize_pct(_pct(refund_amount, mature_sales_amount)),
+                "return_rate_actual": float(actual_rate),
+                "return_rate_predicted": float(predicted_rate) if predicted_rate is not None else None,
+                "return_rate_curve_type": curve_type,
+                "return_rate_curve_color": curve_color,
+                "return_rate": display_rate,
             }
         )
     return out
