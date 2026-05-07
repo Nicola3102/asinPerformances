@@ -695,6 +695,33 @@ def _try_online_conn() -> Connection | None:
         return None
 
 
+def fetch_amazon_listing_max_open_date_online() -> date | None:
+    """
+    online_db.amazon_listing 中最新上新的日历日（与 ``SELECT MAX(DATE(al.open_date))`` 一致）。
+    供默认 New Listing 的 session 窗口上界与 cohort 批次对齐；连接失败返回 None。
+    """
+    conn = _try_online_conn()
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            text(
+                "SELECT MAX(DATE(al.open_date)) AS mx FROM amazon_listing al WHERE al.open_date IS NOT NULL"
+            )
+        ).scalar()
+        if row is None:
+            return None
+        return _coerce_listing_calendar_day(row)
+    except Exception as exc:
+        logger.warning("读取 amazon_listing MAX(DATE(open_date)) 失败: %s", exc)
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _fetch_listing_kpi_online(conn: Connection, since: date, store_id: int | None) -> tuple[int, int]:
     """
     amazon_listing KPI（与线上一致对账 SQL）：

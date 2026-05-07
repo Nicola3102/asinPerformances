@@ -1,25 +1,40 @@
+# mysql 仅加载 backend/docker-mysql.env（MySQL 镜像初始化变量）；backend 加载 backend/.env（应用含 online_db 等）。
+# 首次：cp backend/.env.example backend/.env && cp backend/docker-mysql.env.example backend/docker-mysql.env
+#
+# 启动顺序（无周期性 Docker healthcheck，避免 /health 刷日志）：
+# - backend 使用 backend/docker-entrypoint.sh 在启动 uvicorn 前一次性等待 MySQL TCP（最多约 120s）。
+# - frontend 在 backend 容器启动后再启动（depends_on）；若 API 尚未监听，浏览器刷新即可。
+#
+# 重启与日志：
+# - restart: unless-stopped：进程退出后由 Docker 自动拉起（OOM、panic、kill 等）。
+# - 查看是否重启过：docker compose ps（STATUS 含 restarting）、docker inspect <容器名> --format '{{.RestartCount}}'
+# - 崩溃原因请看退出前日志：docker compose logs backend --tail=200（或 mysql / frontend）
+# - logging 使用 json-file 轮转，避免日志撑满磁盘
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   mysql:
     image: mysql:8.0
-    environment:
-      MYSQL_DATABASE: rug
-      MYSQL_USER: rug_user
-      MYSQL_PASSWORD: rug_password
-      MYSQL_ROOT_PASSWORD: root_password
+    restart: unless-stopped
+    logging: *default-logging
+    env_file:
+      - ./backend/docker-mysql.env
     ports:
       - "3307:3306"
     volumes:
       - mysql_data:/var/lib/mysql
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot_password"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
 
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    restart: unless-stopped
+    logging: *default-logging
     volumes:
       - ./backend:/app
     ports:
@@ -27,23 +42,23 @@ services:
     # 多用户同时开大区间 New Listing 若 backend 反复 exit 137，多为 Docker 内存上限触发 OOM killer；请调高 Docker Desktop 内存或为该服务增加 mem_limit。
     env_file:
       - ./backend/.env
+    # 覆盖 .env 里面向「宿主机连库」的配置：容器内必须用服务名 mysql、容器内端口 3306（勿用 localhost / 宿主机映射端口 3307）
     environment:
       MYSQL_HOST: mysql
-      MYSQL_PORT: 3306
-      MYSQL_USER: rug_user
-      MYSQL_PASSWORD: rug_password
-      MYSQL_DATABASE: rug
+      MYSQL_PORT: "3306"
     # 注意：--reload 会在文件变更时重启进程，长查询（如 New Listing 大区间）会被中断，表现为“查询无结果/无响应”。
     # 如需后端热重载，可在本机直接运行 uvicorn --reload；docker 默认关闭以保证请求稳定。
-    command: uvicorn app.main:app --host 0.0.0.0 --port 9090
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9090"]
     depends_on:
       mysql:
-        condition: service_healthy
+        condition: service_started
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+    restart: unless-stopped
+    logging: *default-logging
     volumes:
       - ./frontend:/app
       - frontend_node_modules:/app/node_modules
@@ -53,7 +68,8 @@ services:
       - VITE_API_HOST=backend
       - VITE_API_PROXY_TARGET=http://backend:9090
     depends_on:
-      - backend
+      backend:
+        condition: service_started
 
 volumes:
   mysql_data:

@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -29,6 +30,7 @@ from app.services.daily_upload_asin_data_ds import sync_range, sync_with_default
 from app.services.daily_upload_session_report_html_pst import (
     DEFAULT_LISTING_SINCE,
     build_report_payload,
+    fetch_amazon_listing_max_open_date_online,
     matrix_bulk_cache_wait_ready,
     render_html,
 )
@@ -40,6 +42,16 @@ from app.services.weekly_upload_asin_date_add_impression_add_ads import (
 logger = logging.getLogger(__name__)
 
 UTC8 = timezone(timedelta(hours=8))
+_PST_TZ = ZoneInfo("America/Los_Angeles")
+
+
+def _pst_calendar_today() -> date:
+    """报表 cohort 使用 PST 日历日；默认 session 窗口上界不超过 PST 昨日（当日 session 常不完整）。"""
+    return datetime.now(_PST_TZ).date()
+
+
+def _pst_calendar_yesterday() -> date:
+    return _pst_calendar_today() - timedelta(days=1)
 
 # 进程内内存缓存（比读盘快）；配合 Cache-Control / ETag 让浏览器可缓存 GET 响应
 _report_build_lock = threading.Lock()
@@ -74,16 +86,31 @@ def _session_impression_cache_path(end_d: date) -> Path:
 
 
 def _resolve_new_listing_default_session_end() -> date:
-    """未显式传 session_end 时，默认使用本地最新 session_date；无数据再回退今天。"""
+    """未显式传 session_end 时：max(本地最新 session_date, online amazon_listing 最新 open_date 日)，再与 PST 昨日取 min。"""
+    cap = _pst_calendar_yesterday()
     init_db()
     db = SessionLocal()
     try:
         latest = db.query(func.max(DailyUploadAsinData.session_date)).scalar()
+        latest_d: date | None
         if latest is None:
-            return date.today()
-        if isinstance(latest, datetime):
-            return latest.date()
-        return latest
+            latest_d = None
+        elif isinstance(latest, datetime):
+            latest_d = latest.date()
+        else:
+            latest_d = latest
+
+        online_open_max = fetch_amazon_listing_max_open_date_online()
+
+        ends: list[date] = []
+        if latest_d is not None:
+            ends.append(latest_d)
+        if online_open_max is not None:
+            ends.append(online_open_max)
+        if not ends:
+            return cap
+        raw_end = max(ends)
+        return min(raw_end, cap)
     finally:
         db.close()
 
@@ -554,7 +581,7 @@ def trend_new_listing_report(
     ),
     session_end: Optional[date] = Query(
         None,
-        description="图表横轴 session_date 结束；默认本地最新 session_date（无数据时回退今天）",
+        description="图表横轴 session_date 结束；默认 max(本地最新 session_date, online amazon_listing 最新 open_date) 再与 PST 昨日取小",
     ),
     sync_start: Optional[date] = Query(
         None,

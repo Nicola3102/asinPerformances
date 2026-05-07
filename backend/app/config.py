@@ -9,11 +9,12 @@ _ENV_FILE = _BACKEND_DIR / ".env"
 
 
 class Settings(BaseSettings):
-    MYSQL_HOST: str = "mysql"
+    """优先从 backend/.env 读取（见 Config.env_file）；勿在代码中写死账号口令。"""
+    MYSQL_HOST: str = Field(default="", description="MySQL 主机；Docker 内一般为服务名 mysql")
     MYSQL_PORT: int = 3306
-    MYSQL_USER: str = "rug_user"
-    MYSQL_PASSWORD: str = "rug_password"
-    MYSQL_DATABASE: str = "rug"
+    MYSQL_USER: str = ""
+    MYSQL_PASSWORD: str = ""
+    MYSQL_DATABASE: str = ""
     MYSQL_DB_NAME: str = Field(default="asin_performances", validation_alias="MYSQL_DB_NAME")
 
     ONLINE_DB_HOST: str = Field(default="", validation_alias="online_db_host")
