@@ -1,4 +1,5 @@
 app/log/
 *.log
-backend/charts/
+# 相对本文件所在目录（backend/），须写 charts/ 不能写 backend/charts/
+charts/
 *.html
