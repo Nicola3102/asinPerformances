@@ -25,13 +25,38 @@ function viteHealthPlugin() {
   }
 }
 
+/**
+ * Dockerfile / shell 脚本在项目根目录时，若浏览器或某请求命中 `/Dockerfile`（无扩展名），
+ * Vite 会走模块转换链并把内容当 JS 解析 → import-analysis 报错。开发服务器不应对外暴露这些路径。
+ */
+function viteIgnoreDockerArtifactsPlugin() {
+  const denyPath = new Set(['/Dockerfile', '/docker-entrypoint.sh'])
+  return {
+    name: 'vite-ignore-docker-artifacts',
+    configureServer(server: ViteDevServer) {
+      server.middlewares.use((req: IncomingMessage, res: ServerResponse, next: () => void) => {
+        const pathOnly = req.url?.split('?')[0] ?? ''
+        if (denyPath.has(pathOnly)) {
+          res.statusCode = 404
+          res.end()
+          return
+        }
+        next()
+      })
+    },
+  }
+}
+
 // https://vite.dev/config/
 export default defineConfig({
-  plugins: [react(), viteHealthPlugin()],
+  plugins: [viteIgnoreDockerArtifactsPlugin(), react(), viteHealthPlugin()],
   server: {
     host: '0.0.0.0',
     port: 5173,
-    watch: { usePolling: true },
+    watch: {
+      usePolling: true,
+      ignored: ['**/Dockerfile', '**/docker-entrypoint.sh'],
+    },
     proxy: {
       '/api': {
         target: apiTarget,
