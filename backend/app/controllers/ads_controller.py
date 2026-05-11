@@ -271,6 +271,7 @@ def _merge_weekly_ad_cost_into_report(
         mature_sum += ms0
         gp0 = float(row.get("gross_profit") or 0)
         gpar0 = float(row.get("gross_profit_after_return") or 0)
+        refund_total = float(row.get("refund_amount") or 0)
 
         row["ad_cost_to_sales_pct"] = round((ac / sa0 * 100.0), 2) if sa0 > 0 else 0.0
 
@@ -283,6 +284,11 @@ def _merge_weekly_ad_cost_into_report(
         row["gross_margin_after_return_rate"] = (
             round((float(row["gross_profit_after_return"]) / ms0 * 100.0), 2) if ms0 > 0 else 0.0
         )
+
+        # 展示用含退货毛利率：按「真实+预估」退货金额口径计算，分母为当周净收益额（sales_amount）。
+        gpar_display = float(row["gross_profit"]) - refund_total
+        row["gross_profit_after_return_display"] = round(gpar_display, 2)
+        row["gross_margin_after_return_rate_display"] = round((gpar_display / sa0 * 100.0), 2) if sa0 > 0 else 0.0
 
     if weekly:
         s_sales = sum(float(r.get("sales_amount") or 0) for r in weekly)

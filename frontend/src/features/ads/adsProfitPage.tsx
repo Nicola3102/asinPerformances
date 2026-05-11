@@ -23,6 +23,23 @@ function mapNullablePctForChart(value: number | null): number | null {
   return pctForSharedReturnAxisChart(value)
 }
 
+function deriveRefundParts(row: AdsProfitWeeklyPoint): { actual: number; predicted: number } {
+  const actual = Number(row.refund_amount_actual ?? row.refund_amount ?? 0)
+  const predictedFromApi = Number(row.refund_amount_predicted ?? 0)
+  if (Number.isFinite(predictedFromApi) && predictedFromApi > 0) {
+    return { actual: Number.isFinite(actual) ? actual : 0, predicted: predictedFromApi }
+  }
+  // 兼容旧后端：未返回 refund_amount_predicted 时，在“预测周”用 退货率(展示)*净收益额 - 真实退货额 估算
+  const rate = Number(row.return_rate)
+  const sales = Number(row.sales_amount)
+  const actualSafe = Number.isFinite(actual) ? actual : 0
+  if (row.return_rate_curve_type === 'predicted' && Number.isFinite(rate) && Number.isFinite(sales) && sales > 0) {
+    const estTotal = (rate / 100) * sales
+    return { actual: actualSafe, predicted: Math.max(0, estTotal - actualSafe) }
+  }
+  return { actual: actualSafe, predicted: 0 }
+}
+
 export function AdsProfitPage() {
   const emptySummary: AdsProfitSummary = {
     start_date: '2026-02-23',
@@ -120,9 +137,19 @@ export function AdsProfitPage() {
 
   const profitChartData = useMemo(() => {
     const labels = weeklySeries.map((row) => row.week_start || '–')
-    const grossMarginAfterReturnData = weeklySeries.map((row) => (
-      row.gross_margin_after_return_rate === 0 ? null : row.gross_margin_after_return_rate
-    ))
+    const grossMarginAfterReturnData = weeklySeries.map((row) => {
+      if (typeof row.gross_margin_after_return_rate_display === 'number' && Number.isFinite(row.gross_margin_after_return_rate_display)) {
+        return row.gross_margin_after_return_rate_display
+      }
+      // 兼容：后端未返回 display 字段时，用当前口径即时计算：
+      // (当周毛利(已扣广告) - (真实+预估退货金额)) / 当周净收益额
+      const refund = deriveRefundParts(row)
+      const sales = Number(row.sales_amount)
+      const gp = Number(row.gross_profit)
+      if (!Number.isFinite(sales) || sales <= 0 || !Number.isFinite(gp)) return null
+      return ((gp - (refund.actual + refund.predicted)) / sales) * 100
+    })
+    const hasPredictedRefundByWeek = weeklySeries.map((row) => (deriveRefundParts(row).predicted ?? 0) > 0)
     const hasGrossMarginAfterReturnData = grossMarginAfterReturnData.some((value) => value != null && Number.isFinite(value))
     const returnRateActualData = weeklySeries.map((row) => mapNullablePctForChart(deriveReturnCurveValue(row).actual))
     const returnRatePredictedData = weeklySeries.map((row) => mapNullablePctForChart(deriveReturnCurveValue(row).predicted))
@@ -142,9 +169,18 @@ export function AdsProfitPage() {
         },
         {
           type: 'bar' as const,
-          label: '退货金额',
-          data: weeklySeries.map((row) => row.refund_amount),
+          label: '退货金额（真实）',
+          data: weeklySeries.map((row) => deriveRefundParts(row).actual),
           backgroundColor: '#fde047',
+          stack: 'money',
+          yAxisID: 'yMoney',
+          order: 2,
+        },
+        {
+          type: 'bar' as const,
+          label: '退货金额（预估）',
+          data: weeklySeries.map((row) => deriveRefundParts(row).predicted),
+          backgroundColor: '#fb923c',
           stack: 'money',
           yAxisID: 'yMoney',
           order: 2,
@@ -170,6 +206,15 @@ export function AdsProfitPage() {
               yAxisID: 'yRate',
               tension: 0.25,
               pointRadius: 3,
+              // 任一端点周存在「预估退货金额」时，该线段用虚线
+              segment: {
+                borderDash: (ctx: any) => {
+                  const i0 = Number(ctx?.p0DataIndex ?? -1)
+                  const i1 = Number(ctx?.p1DataIndex ?? -1)
+                  const dashed = (hasPredictedRefundByWeek[i0] || hasPredictedRefundByWeek[i1]) === true
+                  return dashed ? [6, 4] : undefined
+                },
+              },
               order: 0,
             }]
           : []),
@@ -203,8 +248,8 @@ export function AdsProfitPage() {
               type: 'line' as const,
               label: '退货率（预测）',
               data: returnRatePredictedData,
-              borderColor: '#f59e0b',
-              backgroundColor: 'rgba(245, 158, 11, 0.12)',
+              borderColor: '#a855f7',
+              backgroundColor: 'rgba(168, 85, 247, 0.12)',
               yAxisID: 'yReturnRate',
               tension: 0.25,
               pointRadius: 4,
@@ -221,7 +266,10 @@ export function AdsProfitPage() {
 
   const moneyMax = useMemo(() => {
     const vals = weeklySeries
-      .map((row) => row.sales_amount + row.refund_amount)
+      .map((row) => {
+        const r = deriveRefundParts(row)
+        return row.sales_amount + r.actual + r.predicted
+      })
       .filter((v) => Number.isFinite(v))
     const max = vals.length ? Math.max(...vals) : 0
     return Math.max(1000, Math.ceil(max / 50000) * 50000)
@@ -275,9 +323,12 @@ export function AdsProfitPage() {
             const idx = Number(items?.[0]?.dataIndex ?? -1)
             const row = idx >= 0 ? weeklySeries[idx] : null
             if (!row) return []
+            const refundParts = deriveRefundParts(row)
             return [
               `订单数: ${row.order_count.toLocaleString()}`,
               `退货订单数: ${row.returned_order_count.toLocaleString()}`,
+              `退货金额(真实): ${refundParts.actual.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+              `退货金额(预估): ${refundParts.predicted.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
               `毛利金额(本币，已扣当周广告): ${row.gross_profit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
               `广告费用(本币): ${(row.ad_cost ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
               `广告费用(USD): ${(row.ad_cost_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,

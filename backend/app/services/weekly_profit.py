@@ -388,16 +388,36 @@ def fetch_profit_weekly_series(
     for r in rows:
         sales_amount = _to_decimal(r["sales_amount"])
         mature_sales_amount = _to_decimal(r["mature_sales_amount"])
-        refund_amount = _to_decimal(r["refund_amount"])
+        refund_amount_actual = _to_decimal(r["refund_amount"])
         gross_profit = _to_decimal(r["gross_profit"])
         mature_gross_profit = _to_decimal(r["mature_gross_profit"])
-        gross_profit_after_return = mature_gross_profit - refund_amount
+        gross_profit_after_return = mature_gross_profit - refund_amount_actual
         week_start_obj = r["week_start"]
         week_start_str = week_start_obj.isoformat() if week_start_obj is not None else None
-        actual_rate = _quantize_pct(_pct(refund_amount, mature_sales_amount))
+        actual_rate = _quantize_pct(_pct(refund_amount_actual, mature_sales_amount))
         predicted_rate = predicted_by_week.get(week_start_str or "") if week_start_str else None
         week_end_obj = r["week_end"]
         use_predicted = bool(week_end_obj is not None and week_end_obj > mature_curve_end and predicted_rate is not None)
+
+        # 退货金额：45 天前用真实退货额；45 天后按预测退货率估算整周退货额，并拆成「真实 + 预估补足」两段。
+        # 若一周跨越成熟分界，refund_amount_actual 仅包含成熟部分，预估部分 = 预测整周退货额 - 真实退货额。
+        refund_amount_predicted = Decimal("0")
+        if use_predicted and predicted_rate is not None:
+            try:
+                pr = Decimal(str(predicted_rate)) / Decimal("100")
+            except Exception:
+                pr = Decimal("0")
+            predicted_total = pr * sales_amount if sales_amount > 0 else Decimal("0")
+            refund_amount_predicted = predicted_total - refund_amount_actual
+            if refund_amount_predicted < 0:
+                refund_amount_predicted = Decimal("0")
+        refund_amount_total = refund_amount_actual + refund_amount_predicted
+
+        # 展示用「含退货毛利率」：以当周净收益额为分母，退货金额使用真实+预估总额，
+        # 用于前端在存在预估退货金额时仍能绘制曲线（不依赖 mature_* 字段）。
+        gross_profit_after_return_display = gross_profit - refund_amount_total
+        gross_margin_after_return_rate_display = _quantize_pct(_pct(gross_profit_after_return_display, sales_amount))
+
         display_rate = float(predicted_rate) if use_predicted else float(actual_rate)
         curve_type = "predicted" if use_predicted else "actual"
         curve_color = "#f59e0b" if use_predicted else "#8b5cf6"
@@ -410,11 +430,16 @@ def fetch_profit_weekly_series(
                 "return_row_count": int(r["return_row_count"] or 0),
                 "sales_amount": _quantize_money(sales_amount),
                 "mature_sales_amount": _quantize_money(mature_sales_amount),
-                "refund_amount": _quantize_money(refund_amount),
+                # 兼容：refund_amount 为总退货金额（真实+预估）；另附带拆分字段用于前端堆叠展示
+                "refund_amount": _quantize_money(refund_amount_total),
+                "refund_amount_actual": _quantize_money(refund_amount_actual),
+                "refund_amount_predicted": _quantize_money(refund_amount_predicted),
                 "gross_profit": _quantize_money(gross_profit),
                 "gross_profit_after_return": _quantize_money(gross_profit_after_return),
+                "gross_profit_after_return_display": _quantize_money(gross_profit_after_return_display),
                 "gross_margin_rate": _quantize_pct(_pct(gross_profit, sales_amount)),
                 "gross_margin_after_return_rate": _quantize_pct(_pct(gross_profit_after_return, mature_sales_amount)),
+                "gross_margin_after_return_rate_display": gross_margin_after_return_rate_display,
                 "return_rate_actual": float(actual_rate),
                 "return_rate_predicted": float(predicted_rate) if predicted_rate is not None else None,
                 "return_rate_curve_type": curve_type,

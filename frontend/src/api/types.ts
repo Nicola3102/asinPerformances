@@ -378,13 +378,22 @@ export type AdsProfitWeeklyPoint = {
   sales_amount: number
   /** 成熟区间销售额（45 天口径），未扣广告；含退货毛利率分母 */
   mature_sales_amount?: number
+  /** 退货金额（真实+预估） */
   refund_amount: number
+  /** 45 天前真实退货金额（或跨周成熟部分真实退货金额） */
+  refund_amount_actual?: number
+  /** 45 天后预估退货金额（跨周为：预测整周退货额 - 真实退货额） */
+  refund_amount_predicted?: number
   /** 当周毛利，已减本币广告费 */
   gross_profit: number
   /** 当周毛利（已减退货金额口径），已减本币广告费 */
   gross_profit_after_return: number
+  /** 展示用：当周毛利（按 真实+预估 退货金额口径），已减本币广告费 */
+  gross_profit_after_return_display?: number
   gross_margin_rate: number
   gross_margin_after_return_rate: number
+  /** 展示用：含退货毛利率（按 真实+预估 退货金额口径） */
+  gross_margin_after_return_rate_display?: number
   return_rate: number
   return_rate_actual?: number
   return_rate_predicted?: number | null
