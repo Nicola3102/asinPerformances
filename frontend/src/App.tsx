@@ -22,23 +22,23 @@ function RouteFallback() {
 export default function App() {
   return (
     <Suspense fallback={<RouteFallback />}>
-      <Routes>
-        <Route element={<AppLayout />}>
-          <Route path="/" element={<AsinHomePage />} />
-          <Route path="/group/A" element={<GroupAPage />} />
+    <Routes>
+      <Route element={<AppLayout />}>
+        <Route path="/" element={<AsinHomePage />} />
+        <Route path="/group/A" element={<GroupAPage />} />
           <Route path="/group/B" element={<GroupBPageRoute />} />
-          <Route path="/group/F" element={<GroupFPage />} />
-          <Route path="/grpup/A" element={<Navigate to="/group/A" replace />} />
+        <Route path="/group/F" element={<GroupFPage />} />
+        <Route path="/grpup/A" element={<Navigate to="/group/A" replace />} />
           <Route path="/tasks" element={<TasksPageRoute />} />
-          <Route path="/monitor" element={<MonitorPage />} />
-          <Route path="/ads/ad-sales" element={<AdSalesPage />} />
-          <Route path="/ads/profit" element={<AdsProfitPage />} />
-          <Route path="/trend" element={<TrendPage />} />
-          <Route path="/trend/session-impression" element={<TrendSessionImpressionEmbeddedPage />} />
-          <Route path="/trend/session&impression" element={<Navigate to="/trend/session-impression" replace />} />
-          <Route path="/trend/New Listing" element={<TrendNewListingEmbeddedPage />} />
-        </Route>
-      </Routes>
+        <Route path="/monitor" element={<MonitorPage />} />
+        <Route path="/ads/ad-sales" element={<AdSalesPage />} />
+        <Route path="/ads/profit" element={<AdsProfitPage />} />
+        <Route path="/trend" element={<TrendPage />} />
+        <Route path="/trend/session-impression" element={<TrendSessionImpressionEmbeddedPage />} />
+        <Route path="/trend/session&impression" element={<Navigate to="/trend/session-impression" replace />} />
+        <Route path="/trend/New Listing" element={<TrendNewListingEmbeddedPage />} />
+      </Route>
+    </Routes>
     </Suspense>
   )
 }

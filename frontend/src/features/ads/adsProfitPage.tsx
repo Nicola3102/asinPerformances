@@ -9,6 +9,20 @@ import {
 import { Chart } from "../../lib/chartRegister"
 import "./adsRoutes.css"
 
+/** 退货率与广告费销比共用纵轴：按 0–100% 显示，避免费销比异常值把刻度拉到数千 */
+const SHARED_RETURN_AXIS_PCT_CAP = 100
+
+function pctForSharedReturnAxisChart(raw: number | null | undefined): number {
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return 0
+  return Math.max(0, Math.min(n, SHARED_RETURN_AXIS_PCT_CAP))
+}
+
+function mapNullablePctForChart(value: number | null): number | null {
+  if (value == null || !Number.isFinite(value)) return null
+  return pctForSharedReturnAxisChart(value)
+}
+
 export function AdsProfitPage() {
   const emptySummary: AdsProfitSummary = {
     start_date: '2026-02-23',
@@ -24,6 +38,9 @@ export function AdsProfitPage() {
     gross_margin_rate: 0,
     gross_margin_after_return_rate: 0,
     return_rate: 0,
+    ad_cost: 0,
+    ad_cost_to_sales_pct: 0,
+    ad_cost_usd: 0,
   }
   const [storeId, setStoreId] = useState<string>('all')
   const [storeIds, setStoreIds] = useState<number[]>([])
@@ -107,8 +124,8 @@ export function AdsProfitPage() {
       row.gross_margin_after_return_rate === 0 ? null : row.gross_margin_after_return_rate
     ))
     const hasGrossMarginAfterReturnData = grossMarginAfterReturnData.some((value) => value != null && Number.isFinite(value))
-    const returnRateActualData = weeklySeries.map((row) => deriveReturnCurveValue(row).actual)
-    const returnRatePredictedData = weeklySeries.map((row) => deriveReturnCurveValue(row).predicted)
+    const returnRateActualData = weeklySeries.map((row) => mapNullablePctForChart(deriveReturnCurveValue(row).actual))
+    const returnRatePredictedData = weeklySeries.map((row) => mapNullablePctForChart(deriveReturnCurveValue(row).predicted))
     const hasReturnRateActualData = returnRateActualData.some((value) => value != null && Number.isFinite(value))
     const hasReturnRatePredictedData = returnRatePredictedData.some((value) => value != null && Number.isFinite(value))
     return {
@@ -116,7 +133,7 @@ export function AdsProfitPage() {
       datasets: [
         {
           type: 'bar' as const,
-          label: '销售额',
+          label: '净收益额',
           data: weeklySeries.map((row) => row.sales_amount),
           backgroundColor: '#60a5fa',
           stack: 'money',
@@ -156,6 +173,17 @@ export function AdsProfitPage() {
               order: 0,
             }]
           : []),
+        {
+          type: 'line' as const,
+          label: '广告费销比',
+          data: weeklySeries.map((row) => pctForSharedReturnAxisChart(row.ad_cost_to_sales_pct)),
+          borderColor: '#ec4899',
+          backgroundColor: 'rgba(236, 72, 153, 0.12)',
+          yAxisID: 'yReturnRate',
+          tension: 0.2,
+          pointRadius: 3,
+          order: 0,
+        },
         ...(hasReturnRateActualData
           ? [{
               type: 'line' as const,
@@ -186,11 +214,15 @@ export function AdsProfitPage() {
             }]
           : []),
       ],
+      // Mixed bar/line：Chart.js 泛型过窄，用断言生成选项对象
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- ChartConfiguration 混合数据集
     } as any
   }, [deriveReturnCurveValue, weeklySeries])
 
   const moneyMax = useMemo(() => {
-    const vals = weeklySeries.map((row) => row.sales_amount + row.refund_amount).filter((v) => Number.isFinite(v))
+    const vals = weeklySeries
+      .map((row) => row.sales_amount + row.refund_amount)
+      .filter((v) => Number.isFinite(v))
     const max = vals.length ? Math.max(...vals) : 0
     return Math.max(1000, Math.ceil(max / 50000) * 50000)
   }, [weeklySeries])
@@ -199,8 +231,6 @@ export function AdsProfitPage() {
     const vals = weeklySeries.flatMap((row) => [
       row.gross_margin_rate,
       ...(row.gross_margin_after_return_rate === 0 ? [] : [row.gross_margin_after_return_rate]),
-      ...(deriveReturnCurveValue(row).actual != null ? [Number(deriveReturnCurveValue(row).actual)] : []),
-      ...(deriveReturnCurveValue(row).predicted != null ? [Number(deriveReturnCurveValue(row).predicted)] : []),
     ]).filter((v) => Number.isFinite(v))
     if (!vals.length) return { min: -10, max: 20 }
     const min = Math.min(...vals, 0)
@@ -209,20 +239,22 @@ export function AdsProfitPage() {
       min: Math.floor(min / 5) * 5,
       max: Math.max(5, Math.ceil(max / 5) * 5),
     }
-  }, [deriveReturnCurveValue, weeklySeries])
+  }, [weeklySeries])
 
+  /** 与折线图一致（已封顶）：共用轴固定从 0% 起，步长 5% */
   const returnRateMinMax = useMemo(() => {
-    const vals = weeklySeries.flatMap((row) => [
-      ...(deriveReturnCurveValue(row).actual != null ? [Number(deriveReturnCurveValue(row).actual)] : []),
-      ...(deriveReturnCurveValue(row).predicted != null ? [Number(deriveReturnCurveValue(row).predicted)] : []),
-    ]).filter((v) => Number.isFinite(v))
-    if (!vals.length) return { min: 0, max: 20 }
-    const min = Math.min(...vals, 0)
-    const max = Math.max(...vals, 5)
-    return {
-      min: Math.floor(min / 2) * 2,
-      max: Math.max(6, Math.ceil(max / 2) * 2),
+    const vals: number[] = []
+    for (const row of weeklySeries) {
+      vals.push(pctForSharedReturnAxisChart(row.ad_cost_to_sales_pct))
+      const { actual, predicted } = deriveReturnCurveValue(row)
+      if (actual != null && Number.isFinite(actual)) vals.push(pctForSharedReturnAxisChart(actual))
+      if (predicted != null && Number.isFinite(predicted)) vals.push(pctForSharedReturnAxisChart(predicted))
     }
+    if (!vals.length) return { min: 0, max: 20 }
+    const maxData = Math.max(...vals, 0)
+    let maxSnap = Math.max(5, Math.ceil(maxData / 5) * 5)
+    maxSnap = Math.min(SHARED_RETURN_AXIS_PCT_CAP, maxSnap)
+    return { min: 0, max: maxSnap }
   }, [deriveReturnCurveValue, weeklySeries])
 
   const profitChartOptions = useMemo<ChartOptions<'bar'>>(() => ({
@@ -236,7 +268,7 @@ export function AdsProfitPage() {
           label: (ctx: TooltipItem<'bar'>) => {
             const label = ctx.dataset.label || ''
             const value = Number(ctx.parsed.y ?? 0)
-            if (label.includes('毛利率') || label.includes('退货率')) return `${label}: ${value.toFixed(2)}%`
+            if (label.includes('毛利率') || label.includes('退货率') || label.includes('费销比')) return `${label}: ${value.toFixed(2)}%`
             return `${label}: ${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
           },
           afterBody: (items) => {
@@ -246,6 +278,15 @@ export function AdsProfitPage() {
             return [
               `订单数: ${row.order_count.toLocaleString()}`,
               `退货订单数: ${row.returned_order_count.toLocaleString()}`,
+              `毛利金额(本币，已扣当周广告): ${row.gross_profit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+              `广告费用(本币): ${(row.ad_cost ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+              `广告费用(USD): ${(row.ad_cost_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+              `当周加权汇率: ${(row.ad_fx_rate ?? 1).toFixed(6)}`,
+              `广告费销比: ${(row.ad_cost_to_sales_pct ?? 0).toFixed(2)}%${
+                (row.ad_cost_to_sales_pct ?? 0) > SHARED_RETURN_AXIS_PCT_CAP
+                  ? `（图中纵轴以 ${SHARED_RETURN_AXIS_PCT_CAP}% 封顶）`
+                  : ''
+              }`,
               `退货率(展示): ${row.return_rate.toFixed(2)}%`,
               `退货率(真实): ${deriveReturnCurveValue(row).actual != null ? `${Number(deriveReturnCurveValue(row).actual).toFixed(2)}%` : '–'}`,
               `退货率(预测): ${deriveReturnCurveValue(row).predicted != null ? `${Number(deriveReturnCurveValue(row).predicted).toFixed(2)}%` : '–'}`,
@@ -265,7 +306,7 @@ export function AdsProfitPage() {
         stacked: true,
         beginAtZero: true,
         max: moneyMax,
-        title: { display: true, text: '销售额 / 退货金额' },
+        title: { display: true, text: '净收益额 / 退货金额（堆叠）' },
       },
       yRate: {
         type: 'linear' as const,
@@ -282,20 +323,27 @@ export function AdsProfitPage() {
         type: 'linear' as const,
         position: 'right',
         offset: true,
-        min: returnRateMinMax.min,
+        min: 0,
         max: returnRateMinMax.max,
+        grace: 0,
         grid: { drawOnChartArea: false },
-        title: { display: true, text: '退货率 (%)' },
+        title: {
+          display: true,
+          text: '退货率与广告费销比（同一纵轴，%）',
+        },
         ticks: {
-          callback: (value) => `${value}%`,
+          stepSize: 5,
+          precision: 0,
+          maxRotation: 0,
+          callback: (raw) => `${Math.round(Number(raw))}%`,
         },
       },
     },
-  }), [moneyMax, rateMinMax.max, rateMinMax.min, returnRateMinMax.max, returnRateMinMax.min, weeklySeries])
+  }), [deriveReturnCurveValue, moneyMax, rateMinMax.max, rateMinMax.min, returnRateMinMax.max, returnRateMinMax.min, weeklySeries])
 
   const metricCards = [
     {
-      label: '销售额',
+      label: '净收益额',
       value: summary.sales_amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
       accent: 'blue',
     },
@@ -307,13 +355,28 @@ export function AdsProfitPage() {
     { label: '毛利', value: summary.gross_profit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }), accent: 'green' },
     { label: '毛利率（不含退货）', value: `${summary.gross_margin_rate.toFixed(2)}%`, accent: 'teal' },
     { label: '毛利率（含退货）', value: `${summary.gross_margin_after_return_rate.toFixed(2)}%`, accent: 'red' },
+    {
+      label: '广告费用',
+      value: (summary.ad_cost ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+      accent: 'purple',
+    },
+    {
+      label: '广告费用（USD）',
+      value: (summary.ad_cost_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+      accent: 'purple',
+    },
+    {
+      label: '广告费销比',
+      value: `${(summary.ad_cost_to_sales_pct ?? 0).toFixed(2)}%`,
+      accent: 'sky',
+    },
   ]
 
   return (
     <div className="app">
       <h1>Total Profit</h1>
       <p className="monitor-desc">
-        按 <code>order_profit.invoice_date</code> 从 2026-02-23 起按周聚合销售额、退货金额与毛利率；默认展示全部店铺，可按 <code>store_id</code> 切换。
+        <strong>净收益额</strong>为当周 <code>order_profit</code> 的 <code>net_revenue</code> 汇总（不扣广告）；<strong>毛利</strong>与<strong>含退货毛利</strong>仅在毛利上减去当周本币广告费；毛利率分母仍为未扣广告的净收益额 / 成熟销售额。<strong>费销比</strong> = 本币广告费 ÷ 当周净收益额。
         当前最新 invoice_date：<code>{latestInvoiceDate || '–'}</code>
       </p>
 
@@ -354,7 +417,6 @@ export function AdsProfitPage() {
         <div className="trend-chart-header">
           <div>
             <h3>周利润趋势</h3>
-            <p className="trend-chart-hint">柱状图为销售额 + 退货金额堆叠，折线为毛利率与每周退货率（真实/预测）</p>
           </div>
         </div>
         <div className="ads-line-chart-wrap">
@@ -368,11 +430,15 @@ export function AdsProfitPage() {
             <tr>
               <th>week_start</th>
               <th>week_end</th>
-              <th>sales_amount</th>
+              <th>net_revenue</th>
               <th>refund_amount</th>
               <th>gross_profit</th>
               <th>gross_margin_rate</th>
               <th>gross_margin_after_return_rate</th>
+              <th>ad_cost</th>
+              <th>ad_cost_usd</th>
+              <th>ad_fx_rate</th>
+              <th>ad_cost_to_sales_pct</th>
               <th>return_rate</th>
               <th>return_rate_actual</th>
               <th>return_rate_predicted</th>
@@ -388,6 +454,10 @@ export function AdsProfitPage() {
                 <td>{row.gross_profit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                 <td>{row.gross_margin_rate.toFixed(2)}%</td>
                 <td>{row.gross_margin_after_return_rate.toFixed(2)}%</td>
+                <td>{(row.ad_cost ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                <td>{(row.ad_cost_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                <td>{(row.ad_fx_rate ?? 1).toFixed(6)}</td>
+                <td>{(row.ad_cost_to_sales_pct ?? 0).toFixed(2)}%</td>
                 <td>{row.return_rate.toFixed(2)}%</td>
                 <td>{deriveReturnCurveValue(row).actual != null ? `${Number(deriveReturnCurveValue(row).actual).toFixed(2)}%` : '–'}</td>
                 <td>{deriveReturnCurveValue(row).predicted != null ? `${Number(deriveReturnCurveValue(row).predicted).toFixed(2)}%` : '–'}</td>
@@ -395,7 +465,7 @@ export function AdsProfitPage() {
             ))}
             {!loading && weeklySeries.length === 0 && (
               <tr>
-                <td colSpan={10} className="empty-hint">No data.</td>
+                <td colSpan={14} className="empty-hint">No data.</td>
               </tr>
             )}
           </tbody>

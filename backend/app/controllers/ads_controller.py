@@ -26,6 +26,24 @@ from app.services.daily_ad_cost_sales import ensure_latest_ad_cost_sales_data
 router = APIRouter(prefix="/api/ads", tags=["ads"])
 logger = logging.getLogger(__name__)
 
+
+def _normalize_week_start_key(ws: object) -> str:
+    """
+    统一周键为 YYYY-MM-DD。
+
+    线上/本地 MySQL 驱动可能对 DATE_SUB 返回 date 或 datetime，isoformat() 分别为
+    「2026-03-02」与「2026-03-02T00:00:00」，直接用作 dict 键会导致广告合并失败（显示 0）。
+    """
+    if ws is None:
+        return ""
+    if isinstance(ws, str):
+        s = ws.strip()
+        return s[:10] if len(s) >= 10 else s
+    if hasattr(ws, "isoformat"):
+        return ws.isoformat()[:10]
+    return str(ws)[:10]
+
+
 _SORT_FIELDS = {
     "ad_cost": DailyAdCostSales.ad_cost,
     "sales_1d": DailyAdCostSales.sales_1d,
@@ -83,6 +101,199 @@ def _parse_sort_or_400(raw: str | None) -> list:
         else:
             raise HTTPException(status_code=400, detail=f"sort direction 不支持: {direction}")
     return out
+
+
+def _fetch_weekly_weighted_fx_order_profit_online(
+    start_date: date,
+    end_date: date,
+    store_id: Optional[int],
+) -> dict[str, float]:
+    """
+    线上 order_profit：按 invoice_date 所在自然周（周一）汇总，
+    销售额加权汇率 = SUM(net_revenue*qty*exchange_rate) / SUM(net_revenue*qty)，
+    用于将广告美元花费换算到与订单一致的本币口径。
+    """
+    if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
+        raise ValueError("Online DB 未配置")
+    store_clause = " AND op.store_id = :store_id" if store_id is not None else ""
+    sql = text(
+        f"""
+        SELECT
+            DATE_SUB(op.invoice_date, INTERVAL WEEKDAY(op.invoice_date) DAY) AS week_start,
+            SUM(COALESCE(op.net_revenue, 0) * COALESCE(op.qty, 0)) AS rev_sum,
+            SUM(
+                COALESCE(op.net_revenue, 0) * COALESCE(op.qty, 0) * COALESCE(op.exchange_rate, 1)
+            ) AS rev_fx_sum
+        FROM order_profit op
+        WHERE op.invoice_date >= :start_date
+          AND op.invoice_date <= :end_date
+          AND op.order_id IS NOT NULL
+          AND op.order_id <> ''
+          {store_clause}
+        GROUP BY DATE_SUB(op.invoice_date, INTERVAL WEEKDAY(op.invoice_date) DAY)
+        """
+    )
+    params: dict[str, object] = {
+        "start_date": start_date.strftime("%Y-%m-%d"),
+        "end_date": end_date.strftime("%Y-%m-%d"),
+    }
+    if store_id is not None:
+        params["store_id"] = int(store_id)
+    out: dict[str, float] = {}
+    with get_online_reporting_engine().connect() as conn:
+        for row in conn.execute(sql, params).mappings().all():
+            ws = row["week_start"]
+            key = _normalize_week_start_key(ws)
+            if not key:
+                continue
+            rev_sum = float(row["rev_sum"] or 0)
+            rev_fx_sum = float(row["rev_fx_sum"] or 0)
+            if rev_sum > 0:
+                out[key] = rev_fx_sum / rev_sum
+            else:
+                out[key] = 1.0
+    return out
+
+
+def _fetch_weekly_ads_cost_usd_online(
+    start_date: date,
+    end_date: date,
+    store_id: Optional[int],
+) -> dict[str, float]:
+    """
+    线上 amazon_ads_ad_group_ad_report：cost 为美元；按 DATE(current_date) 落入的周（周一）汇总 SUM(cost)。
+    """
+    if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
+        raise ValueError("Online DB 未配置")
+    store_clause = " AND r.store_id = :store_id" if store_id is not None else ""
+    sql = text(
+        f"""
+        SELECT
+            DATE_SUB(DATE(r.current_date), INTERVAL WEEKDAY(DATE(r.current_date)) DAY) AS week_start,
+            COALESCE(SUM(COALESCE(r.cost, 0)), 0) AS cost_usd
+        FROM amazon_ads_ad_group_ad_report r
+        WHERE r.current_date IS NOT NULL
+          AND DATE(r.current_date) >= :start_date
+          AND DATE(r.current_date) <= :end_date
+          {store_clause}
+        GROUP BY DATE_SUB(DATE(r.current_date), INTERVAL WEEKDAY(DATE(r.current_date)) DAY)
+        """
+    )
+    params: dict[str, object] = {
+        "start_date": start_date.strftime("%Y-%m-%d"),
+        "end_date": end_date.strftime("%Y-%m-%d"),
+    }
+    if store_id is not None:
+        params["store_id"] = int(store_id)
+    out: dict[str, float] = {}
+    with get_online_reporting_engine().connect() as conn:
+        for row in conn.execute(sql, params).mappings().all():
+            ws = row["week_start"]
+            key = _normalize_week_start_key(ws)
+            if not key:
+                continue
+            out[key] = float(row["cost_usd"] or 0)
+    return out
+
+
+def _weekly_ad_cost_local_usd_fx(
+    start_date: date,
+    end_date: date,
+    store_id: Optional[int],
+) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+    """
+    返回 (本币广告费按周, 美元广告费按周, 当周加权汇率)。
+    本币 = cost_usd * fx_week；fx_week 无订单数据时为 1.0。
+    """
+    usd_map = _fetch_weekly_ads_cost_usd_online(start_date, end_date, store_id)
+    fx_map = _fetch_weekly_weighted_fx_order_profit_online(start_date, end_date, store_id)
+    local: dict[str, float] = {}
+    all_keys = set(usd_map.keys()) | set(fx_map.keys())
+    for key in all_keys:
+        usd = float(usd_map.get(key, 0.0))
+        fx = float(fx_map.get(key, 1.0))
+        if fx <= 0:
+            fx = 1.0
+        local[key] = usd * fx
+    return local, usd_map, fx_map
+
+
+def _merge_weekly_ad_cost_into_report(
+    report: dict,
+    ad_local_by_week: dict[str, float],
+    *,
+    ad_usd_by_week: Optional[dict[str, float]] = None,
+    fx_by_week: Optional[dict[str, float]] = None,
+) -> None:
+    """写入 summary 与 weekly_series：ad_cost 为本币；附带 ad_cost_usd、ad_fx_rate。
+
+    净收益额（sales_amount）保持 order_profit 周汇总 net_revenue，不扣广告。
+    仅毛利 gross_profit、gross_profit_after_return 减去当周本币广告费；毛利率分母仍为未扣广告的销售额 / mature_sales。
+    费销比 = 当周广告 ÷ 当周净收益额（未扣广告）。
+    """
+    summary = report.setdefault("summary", {})
+    weekly = report.get("weekly_series") or []
+
+    total_local = 0.0
+    total_usd = 0.0
+    for row in weekly:
+        ws = row.get("week_start")
+        key = _normalize_week_start_key(ws)
+        loc = float(ad_local_by_week.get(key, 0.0))
+        usd = float(ad_usd_by_week.get(key, 0.0)) if ad_usd_by_week else 0.0
+        total_local += loc
+        total_usd += usd
+
+    summary["ad_cost"] = round(float(total_local), 2)
+    summary["ad_cost_usd"] = round(float(total_usd), 2)
+    sales_orig_summary = float(summary.get("sales_amount") or 0)
+    summary["ad_cost_to_sales_pct"] = (
+        round((total_local / sales_orig_summary * 100.0), 2) if sales_orig_summary > 0 else 0.0
+    )
+
+    mature_sum = 0.0
+    for row in weekly:
+        ws = row.get("week_start")
+        key = _normalize_week_start_key(ws)
+        ac = float(ad_local_by_week.get(key, 0.0))
+        row["ad_cost"] = round(ac, 2)
+        if ad_usd_by_week is not None:
+            row["ad_cost_usd"] = round(float(ad_usd_by_week.get(key, 0.0)), 2)
+        else:
+            row["ad_cost_usd"] = 0.0
+        if fx_by_week is not None:
+            row["ad_fx_rate"] = round(float(fx_by_week.get(key, 1.0)), 6)
+        else:
+            row["ad_fx_rate"] = 1.0
+
+        sa0 = float(row.get("sales_amount") or 0)
+        ms0 = float(row.get("mature_sales_amount") or 0)
+        mature_sum += ms0
+        gp0 = float(row.get("gross_profit") or 0)
+        gpar0 = float(row.get("gross_profit_after_return") or 0)
+
+        row["ad_cost_to_sales_pct"] = round((ac / sa0 * 100.0), 2) if sa0 > 0 else 0.0
+
+        row["gross_profit"] = round(gp0 - ac, 2)
+        row["gross_profit_after_return"] = round(gpar0 - ac, 2)
+
+        row["gross_margin_rate"] = (
+            round((float(row["gross_profit"]) / sa0 * 100.0), 2) if sa0 > 0 else 0.0
+        )
+        row["gross_margin_after_return_rate"] = (
+            round((float(row["gross_profit_after_return"]) / ms0 * 100.0), 2) if ms0 > 0 else 0.0
+        )
+
+    if weekly:
+        s_sales = sum(float(r.get("sales_amount") or 0) for r in weekly)
+        s_gp = sum(float(r.get("gross_profit") or 0) for r in weekly)
+        s_gpar = sum(float(r.get("gross_profit_after_return") or 0) for r in weekly)
+        summary["gross_profit"] = round(s_gp, 2)
+        summary["gross_profit_after_return"] = round(s_gpar, 2)
+        summary["gross_margin_rate"] = round((s_gp / s_sales * 100.0), 2) if s_sales > 0 else 0.0
+        summary["gross_margin_after_return_rate"] = (
+            round((s_gpar / mature_sum * 100.0), 2) if mature_sum > 0 else 0.0
+        )
 
 
 def _parse_ymd_or_400(raw: str | None, field: str) -> date | None:
@@ -469,7 +680,7 @@ def export_ad_sales(
 
 @router.get("/profit")
 def get_ads_profit(
-    store_id: Optional[int] = Query(None, description="按 order_profit.store_id 过滤"),
+    store_id: Optional[int] = Query(None, description="按 order_profit.store_id / 线上广告报表 store_id 过滤"),
     start_date: Optional[str] = Query(None, description="invoice_date 起始 YYYY-MM-DD（含），默认 2026-02-23"),
     end_date: Optional[str] = Query(None, description="invoice_date 结束 YYYY-MM-DD（含），默认最新 invoice_date"),
 ):
@@ -477,5 +688,17 @@ def get_ads_profit(
     ed = _parse_ymd_or_400(end_date, "end_date") or fetch_profit_latest_invoice_date()
     if sd > ed:
         raise HTTPException(status_code=400, detail="start_date 不能晚于 end_date")
-    return fetch_profit_report(sd, ed, store_id)
+    report = fetch_profit_report(sd, ed, store_id)
+    try:
+        local_map, usd_map, fx_map = _weekly_ad_cost_local_usd_fx(sd, ed, store_id)
+        _merge_weekly_ad_cost_into_report(
+            report,
+            local_map,
+            ad_usd_by_week=usd_map,
+            fx_by_week=fx_map,
+        )
+    except Exception as exc:
+        logger.warning("[Ads] weekly ad_cost (online USD × FX) merge failed: %s", exc)
+        _merge_weekly_ad_cost_into_report(report, {}, ad_usd_by_week=None, fx_by_week=None)
+    return report
 

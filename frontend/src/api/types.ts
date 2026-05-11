@@ -350,13 +350,22 @@ export type AdsProfitSummary = {
   order_count: number
   returned_order_count: number
   return_row_count: number
+  /** 区间内净收益额合计（order_profit net_revenue，不扣广告） */
   sales_amount: number
   refund_amount: number
+  /** 区间内毛利合计（已按周扣本币广告费） */
   gross_profit: number
+  /** 区间内毛利（已减退货金额口径）合计，已按周扣本币广告费 */
   gross_profit_after_return: number
   gross_margin_rate: number
   gross_margin_after_return_rate: number
   return_rate: number
+  /** 广告本币花费（线上报表美元 × 当周 order_profit 加权汇率），区间内按周汇总合计 */
+  ad_cost?: number
+  /** ad_cost ÷ 净收益额 × 100 */
+  ad_cost_to_sales_pct?: number
+  /** 线上报表广告花费美元合计（与 weekly 行汇总一致） */
+  ad_cost_usd?: number
 }
 
 export type AdsProfitWeeklyPoint = {
@@ -365,9 +374,14 @@ export type AdsProfitWeeklyPoint = {
   order_count: number
   returned_order_count: number
   return_row_count: number
+  /** 当周净收益额（order_profit net_revenue 汇总，不扣广告） */
   sales_amount: number
+  /** 成熟区间销售额（45 天口径），未扣广告；含退货毛利率分母 */
+  mature_sales_amount?: number
   refund_amount: number
+  /** 当周毛利，已减本币广告费 */
   gross_profit: number
+  /** 当周毛利（已减退货金额口径），已减本币广告费 */
   gross_profit_after_return: number
   gross_margin_rate: number
   gross_margin_after_return_rate: number
@@ -376,6 +390,14 @@ export type AdsProfitWeeklyPoint = {
   return_rate_predicted?: number | null
   return_rate_curve_type?: 'actual' | 'predicted'
   return_rate_curve_color?: string
+  /** 该周广告本币花费（美元 × 当周 order_profit 加权汇率） */
+  ad_cost?: number
+  /** ad_cost ÷ 净收益额 × 100 */
+  ad_cost_to_sales_pct?: number
+  /** 该周线上 amazon_ads_ad_group_ad_report.cost 美元合计 */
+  ad_cost_usd?: number
+  /** 当周 order_profit 销售额加权 exchange_rate */
+  ad_fx_rate?: number
 }
 
 export type AdsProfitResponse = {

@@ -148,12 +148,31 @@ export function nlGetOrCreateExternalTooltipEl(): HTMLDivElement | null {
   return el
 }
 
+/** Chart.js 外部 tooltip 回调，仅取所需字段。 */
+type NlExternalTooltipContext = {
+  chart: { canvas: HTMLCanvasElement }
+  tooltip?: {
+    opacity?: number
+    title?: string[]
+    dataPoints?: Array<{
+      dataIndex?: number
+      dataset?: { label?: string; backgroundColor?: string }
+      raw?: unknown
+      parsed?: { y?: number }
+    }>
+    labelColors?: Array<{ backgroundColor?: string }>
+    caretX?: number
+    caretY?: number
+  }
+}
+
 export function nlRenderExternalTooltip(
-  context: any,
+  context: unknown,
   labels: string[],
   lineTotals: number[],
 ) {
-  const tooltip = context?.tooltip
+  const c = context as NlExternalTooltipContext
+  const tooltip = c.tooltip
   const tooltipEl = nlGetOrCreateExternalTooltipEl()
   if (!tooltip || !tooltipEl) return
 
@@ -168,12 +187,14 @@ export function nlRenderExternalTooltip(
   const total = dataIndex >= 0 ? Number(lineTotals[dataIndex] ?? 0) : 0
   const bodyItems = Array.isArray(tooltip.dataPoints)
     ? tooltip.dataPoints
-        .map((point: any, idx: number) => ({ point, idx }))
-        .filter((entry: { point: any; idx: number }) => String(entry.point?.dataset?.label ?? '') !== '当日 sessions 合计')
+        .map((point, idx: number) => ({ point, idx }))
+        .filter(
+          (entry) => String(entry.point?.dataset?.label ?? '') !== '当日 sessions 合计',
+        )
     : []
 
   const rowsHtml = bodyItems
-    .map(({ point, idx }: any) => {
+    .map(({ point, idx }) => {
       const label = String(point?.dataset?.label ?? '')
       const value = Number(point?.raw ?? point?.parsed?.y ?? 0).toLocaleString('zh-CN')
       const color = String(tooltip.labelColors?.[idx]?.backgroundColor ?? point?.dataset?.backgroundColor ?? '#94a3b8')
@@ -197,7 +218,7 @@ export function nlRenderExternalTooltip(
 
   const caretX = Number(tooltip.caretX ?? 0)
   const caretY = Number(tooltip.caretY ?? 0)
-  const canvasRect = context.chart.canvas.getBoundingClientRect()
+  const canvasRect = c.chart.canvas.getBoundingClientRect()
   const left = Math.min(window.innerWidth - 320, Math.max(12, canvasRect.left + caretX + 18))
   const top = Math.min(window.innerHeight - 24, Math.max(12, canvasRect.top + caretY - 12))
 
@@ -353,7 +374,7 @@ const TrendNlCohortVirtualRow = memo(function TrendNlCohortVirtualRow({
   const listingCounts = useMemo(() => nlResolveListingCounts(row), [row])
   const daySessions = useMemo(
     () => (Array.isArray(row?.daySessions) ? row.daySessions.map((x) => Number(x ?? 0)) : []),
-    [row?.daySessions],
+    [row],
   )
   const totalSessions = useMemo(
     () => nlSumCohortDaySessions(daySessions, cohortTrackDays),
@@ -1002,6 +1023,19 @@ export function TrendChartFigure({
   lines: TrendLineDef[]
   expanded?: boolean
 }) {
+  const [hoveredPoint, setHoveredPoint] = useState<null | {
+    x: number
+    y: number
+    week_no: number
+    label: string
+    value: number
+    color: string
+    formatter: (value: number) => string
+    total_asin_count: number
+    active_asin_count: number
+    impression_asin_count: number
+  }>(null)
+
   const showRelatedClickFormula =
     lines.some((l) => l.key === 'related_click') && lines.some((l) => l.key === 'total_clicks')
 
@@ -1021,19 +1055,6 @@ export function TrendChartFigure({
     return <p className="empty-hint">暂无数据</p>
   }
   const showImpressionAsinCount = lines.some((line) => line.key === 'total_impression')
-
-  const [hoveredPoint, setHoveredPoint] = useState<null | {
-    x: number
-    y: number
-    week_no: number
-    label: string
-    value: number
-    color: string
-    formatter: (value: number) => string
-    total_asin_count: number
-    active_asin_count: number
-    impression_asin_count: number
-  }>(null)
 
   const width = expanded ? 1040 : 760
   const height = expanded ? 520 : 360
@@ -1334,7 +1355,8 @@ export function TrendNewListingEmbeddedPage() {
         const positiveKeys: string[] = []
         for (const r of rows) {
           const asin = String(r?.asin ?? '').trim()
-          const sid = Number((r as any)?.store_id ?? NaN)
+          const sidRaw = r && typeof r === 'object' && 'store_id' in r ? (r as { store_id?: unknown }).store_id : undefined
+          const sid = Number(sidRaw ?? NaN)
           if (!asin || !Number.isFinite(sid)) continue
           const kk = `${asin}||${sid}`
           nlHasOrderRef.current.set(kk, true)
@@ -1344,8 +1366,8 @@ export function TrendNewListingEmbeddedPage() {
         incrementNlOrderFlagsDailyCount()
         setNlOrderCacheEpoch((x) => x + 1)
       })
-      .catch((e) => {
-        if (typeof e === 'object' && e !== null && (e as any).name === 'AbortError') return
+      .catch((e: unknown) => {
+        if (e instanceof Error && e.name === 'AbortError') return
         // 静默失败：不影响弹层展示
       })
       .finally(() => {

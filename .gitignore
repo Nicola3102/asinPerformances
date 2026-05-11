@@ -22,6 +22,12 @@ backend/app/.last_sync_run
 # Trend HTML disk cache (GET /api/trend/session-impression)
 backend/charts/.cache/
 
+# Backend docs (local / generated notes; do not track)
+backend/docs/
+
+# Backend tests (do not track)
+backend/tests/
+
 # Node / frontend (keep in sync with frontend/.gitignore)
 node_modules/
 frontend/dist/

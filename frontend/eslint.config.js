@@ -20,4 +20,17 @@ export default defineConfig([
       globals: globals.browser,
     },
   },
+  // 大型模块同时导出组件与工具函数；effect 内同步 setState 见 React Router / 数据加载惯用法
+  {
+    files: ['src/features/trend/trendShared.tsx'],
+    rules: {
+      'react-refresh/only-export-components': 'off',
+    },
+  },
+  {
+    files: ['src/features/trend/TrendWeeklyPage.tsx', 'src/pages/monitor.tsx'],
+    rules: {
+      'react-hooks/set-state-in-effect': 'off',
+    },
+  },
 ])

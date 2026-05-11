@@ -7,8 +7,8 @@
 - ``order_return``：对筛出的订单，统计 ``is_refund = 1`` 或 ``track_status = '-'`` 的退货金额。
 
 口径：
-- 销售金额 = SUM(order_profit.net_revenue * qty)
-- 毛利 = SUM(order_profit.gross_profit * qty)
+- 销售金额 = SUM(order_profit.net_revenue )
+- 毛利 = SUM(order_profit.gross_profit )
 - 毛利率（不含退货） = 毛利 / 销售金额
 - 退货金额 = SUM(order_return.refund_amount * 对应订单 exchange_rate)
 - 退货率 = 退货金额 / 销售金额
@@ -172,8 +172,8 @@ def fetch_profit_summary(
         f"""
         SELECT
             COUNT(DISTINCT op.order_id) AS order_count,
-            COALESCE(SUM(COALESCE(op.net_revenue, 0) * COALESCE(op.qty, 0)), 0) AS sales_amount,
-            COALESCE(SUM(COALESCE(op.gross_profit, 0) * COALESCE(op.qty, 0)), 0) AS gross_profit
+            COALESCE(SUM(COALESCE(op.net_revenue, 0) ), 0) AS sales_amount,
+            COALESCE(SUM(COALESCE(op.gross_profit, 0) ), 0) AS gross_profit
         FROM order_profit op
         WHERE op.invoice_date >= :start_date
           AND op.invoice_date <= :end_date
@@ -190,8 +190,8 @@ def fetch_profit_summary(
             mature_profit_sql_run = text(
                 f"""
                 SELECT
-                    COALESCE(SUM(COALESCE(op.net_revenue, 0) * COALESCE(op.qty, 0)), 0) AS sales_amount,
-                    COALESCE(SUM(COALESCE(op.gross_profit, 0) * COALESCE(op.qty, 0)), 0) AS gross_profit
+                    COALESCE(SUM(COALESCE(op.net_revenue, 0)), 0) AS sales_amount,
+                    COALESCE(SUM(COALESCE(op.gross_profit, 0)), 0) AS gross_profit
                 FROM order_profit op
                 WHERE op.invoice_date >= :start_date
                   AND op.invoice_date <= :end_date
@@ -301,8 +301,8 @@ def fetch_profit_weekly_series(
                 op.order_id,
                 op.invoice_date,
                 DATE_SUB(op.invoice_date, INTERVAL WEEKDAY(op.invoice_date) DAY) AS week_start,
-                COALESCE(op.net_revenue, 0) * COALESCE(op.qty, 0) AS net_revenue,
-                COALESCE(op.gross_profit, 0) * COALESCE(op.qty, 0) AS gross_profit,
+                COALESCE(op.net_revenue, 0)  AS net_revenue,
+                COALESCE(op.gross_profit, 0) AS gross_profit,
                 COALESCE(op.exchange_rate, 1) AS exchange_rate
             FROM order_profit op
             WHERE op.invoice_date >= :start_date
@@ -409,6 +409,7 @@ def fetch_profit_weekly_series(
                 "returned_order_count": int(r["returned_order_count"] or 0),
                 "return_row_count": int(r["return_row_count"] or 0),
                 "sales_amount": _quantize_money(sales_amount),
+                "mature_sales_amount": _quantize_money(mature_sales_amount),
                 "refund_amount": _quantize_money(refund_amount),
                 "gross_profit": _quantize_money(gross_profit),
                 "gross_profit_after_return": _quantize_money(gross_profit_after_return),

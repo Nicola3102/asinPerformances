@@ -1,5 +1,4 @@
-# CI：前端 TypeScript + Vite 构建（必过）；ESLint 仅作提醒（ continue-on-error ）
-# 后端：依赖安装 + Python 编译校验
+# CI：前端 build + ESLint（必过）；后端：依赖 + compileall + pytest
 name: CI
 
 on:
@@ -38,11 +37,10 @@ jobs:
         run: npm run build
 
       - name: ESLint
-        continue-on-error: true
         run: npm run lint
 
   backend:
-    name: Backend (install & compile)
+    name: Backend (install, compile & test)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -66,3 +64,6 @@ jobs:
 
       - name: Compile Python packages
         run: python -m compileall -q app
+
+      - name: Pytest
+        run: pytest -q
