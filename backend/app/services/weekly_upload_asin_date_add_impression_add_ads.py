@@ -7,7 +7,9 @@
   「全部店铺」为各店按日加总。
 - 广告：amazon_ads_ad_group_ad_report，SUM(clicks)、SUM(impressions)，store_id, DATE(current_date)；
   起止与命令行 / API 日期区间一致。
-- 自然周 impressions：候选 ``week_no`` 由 ``amazon_search_data`` 中 ``DATE(start_date)`` 落在报表区间内的行去重得到（与线上一致）；
+- 自然周 impressions：候选 ``week_no`` = ``amazon_search`` 在区间内 ``DATE(start_date)`` 出现过的编码，
+  **并上** 与报表区间日历相交的周编码（由 ``_week_no_to_week_range`` 解析周日–周六），避免仅有 ``amazon_search``
+  整周汇总、而 ``search_data.start_date`` 未落入区间时整周漏画（如 202619）。
   再对 ``amazon_search`` 同 ``week_no`` 做**整表** ``SUM(impression_count)``（整周全量）。
   页面与 JSON 中的 ``week_no`` 为**数据表原样**；横轴周三由本模块 ``_week_no_to_week_range`` 按线上 ``week_no`` 编码解析（与 groupA 周定义不同）。
 
@@ -97,7 +99,7 @@ def _iter_dates(start: date, end: date) -> list[date]:
 def _week_no_to_week_start(week_no: str) -> date:
     """
     与 groupA / ``weekly_upload_asin_date_add_impression`` 一致：周日为一周开始。
-    ``amazon_search_data.week_no`` 相对 groupA 周序号有 +1 偏移，故 groupA_week_num = week_num - 1。
+    ``amazon_search.week_no`` 相对 groupA 周序号有 +1 偏移，故 groupA_week_num = week_num - 1。
     """
     wn = str(week_no).strip()
     if not wn.isdigit() or len(wn) < 6:
@@ -131,6 +133,93 @@ def _week_no_to_week_range(week_no: str) -> tuple[date, date, date]:
     we = ws + timedelta(days=6)
     mid = ws + timedelta(days=3)
     return ws, we, mid
+
+
+def _normalize_week_no_key(v: object) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, int):
+        return str(v)
+    s = str(v).strip()
+    return s
+
+
+def _week_no_strings_calendar_overlapping(start_date: date, end_date: date) -> set[str]:
+    """
+    所有与报表区间 [start_date, end_date]（含）在日历上相交的线上 week_no 字符串（YYYY + 周序号两位）。
+    与 ``_week_no_to_week_range`` 使用同一套周日起点解析。
+    """
+    if start_date > end_date:
+        return set()
+    y_lo = start_date.year - 1
+    y_hi = end_date.year + 1
+    out: set[str] = set()
+    for y in range(y_lo, y_hi + 1):
+        for week_num in range(1, 54):
+            wn = f"{y}{week_num:02d}"
+            try:
+                d_min, d_max, _ = _week_no_to_week_range(wn)
+            except ValueError:
+                continue
+            if d_max >= start_date and d_min <= end_date:
+                out.add(wn)
+    return out
+
+
+def _session_impression_report_week_no_candidates(
+    conn,
+    start_date: date,
+    end_date: date,
+) -> list[str]:
+    """
+    Session/Impression 报表用的 week_no 全集：search_data 区间内去重 ∪ 日历与区间相交的周。
+    仅保留能被 ``_week_no_to_week_range`` 解析的编码。
+    """
+    params = {
+        "d0": start_date.strftime("%Y-%m-%d"),
+        "d1": end_date.strftime("%Y-%m-%d"),
+    }
+    sql_from_sd = text(
+        """
+        SELECT DISTINCT asd2.week_no
+        FROM amazon_search AS asd2
+        WHERE asd2.week_no IS NOT NULL
+          AND DATE(asd2.start_date) >= :d0
+          AND DATE(asd2.start_date) <= :d1
+        """
+    )
+    from_sd: set[str] = set()
+    for r in conn.execute(sql_from_sd, params).fetchall():
+        wn = _normalize_week_no_key(r[0])
+        if wn:
+            from_sd.add(wn)
+    cal = _week_no_strings_calendar_overlapping(start_date, end_date)
+    merged = from_sd | cal
+    extra = sorted(cal - from_sd)
+    if extra:
+        logger.info(
+            "[ImpressionWeekly] calendar overlap added week_nos (sample): %s",
+            extra[:25],
+        )
+    ok: list[str] = []
+    for wn in sorted(merged):
+        try:
+            _week_no_to_week_range(wn)
+        except ValueError:
+            logger.warning("[ImpressionWeekly] skip invalid candidate week_no=%r", wn)
+            continue
+        ok.append(wn)
+    return ok
+
+
+def _sql_in_named_placeholders(prefix: str, values: list[str]) -> tuple[str, dict[str, str]]:
+    parts: list[str] = []
+    bind: dict[str, str] = {}
+    for i, w in enumerate(values):
+        key = f"{prefix}{i}"
+        parts.append(f":{key}")
+        bind[key] = w
+    return ", ".join(parts), bind
 
 
 def _label_index_of_date(date_to_idx: dict[date, int], labels: list[date], target: date) -> int:
@@ -322,12 +411,12 @@ def fetch_impression_weekly(
     end_date: date,
 ) -> tuple[dict[int, list[dict]], list[dict]]:
     """
-    候选 ``week_no``：``amazon_search_data`` 在报表区间内 ``DATE(start_date)`` 出现过的值（子查询，与线上一致）。
-    汇总：``amazon_search`` 上同 ``week_no`` **全表** ``SUM(impression_count)``。
-    返回的 ``week_no`` 字符串为查询结果原样（表内存储）；``d_min``/``mid``/``d_max`` 由 ``_week_no_to_week_range`` 解析该编码（非 groupA）。
+    候选 ``week_no``：``amazon_search`` 在报表区间内 ``DATE(start_date)`` 出现过的值，
+    **并上** 与区间日历相交的周编码（见 ``_session_impression_report_week_no_candidates``），
+    避免 search_data 的 start_date 未落入区间时整周漏画。
 
-    返回 (per_store_weeks, all_stores_weeks)。
-    每项: week_no, impressions, d_min, d_max, mid (iso), store_id(单店时)。
+    汇总：``amazon_search`` 上同 ``week_no`` **全表** ``SUM(impression_count)``。
+    返回的 ``week_no`` 字符串为查询结果原样；``d_min``/``mid``/``d_max`` 由 ``_week_no_to_week_range`` 解析。
     """
     if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
         raise ValueError("Online DB 未配置")
@@ -337,42 +426,33 @@ def fetch_impression_weekly(
         "d1": end_date.strftime("%Y-%m-%d"),
     }
 
-    sql_by_store = text(
-        """
-        SELECT s.store_id,
-               s.week_no,
-               SUM(COALESCE(s.impression_count, 0)) AS total_impression
-        FROM amazon_search AS s
-        WHERE s.week_no IN (
-            SELECT DISTINCT asd2.week_no
-            FROM amazon_search_data AS asd2
-            WHERE asd2.week_no IS NOT NULL
-              AND DATE(asd2.start_date) >= :d0 AND DATE(asd2.start_date) <= :d1
-        )
-          AND s.week_no IS NOT NULL
-        GROUP BY s.store_id, s.week_no
-        ORDER BY s.week_no ASC, s.store_id ASC
-        """
-    )
-
     per_store: dict[int, list[dict]] = {}
     all_weeks: list[dict] = []
-    # 全店按周合计：由单次 GROUP BY store_id, week_no 的结果累加，避免对同一批 week_no 再扫全表
     week_totals: dict[str, int] = defaultdict(int)
 
     with get_online_engine().connect() as conn:
-        rows = conn.execute(sql_by_store, params).fetchall()
-
-    def _wn_str(v) -> str:
-        if v is None:
-            return ""
-        if isinstance(v, int):
-            return str(v)
-        return str(v).strip()
+        candidates = _session_impression_report_week_no_candidates(conn, start_date, end_date)
+        if not candidates:
+            logger.info("[ImpressionWeekly] no week_no candidates range=%s..%s", params["d0"], params["d1"])
+            return {}, []
+        in_sql, in_bind = _sql_in_named_placeholders("wzn", candidates)
+        sql_by_store = text(
+            f"""
+            SELECT s.store_id,
+                   s.week_no,
+                   SUM(COALESCE(s.impression_count, 0)) AS total_impression
+            FROM amazon_search AS s
+            WHERE s.week_no IN ({in_sql})
+              AND s.week_no IS NOT NULL
+            GROUP BY s.store_id, s.week_no
+            ORDER BY s.week_no ASC, s.store_id ASC
+            """
+        )
+        rows = conn.execute(sql_by_store, in_bind).fetchall()
 
     for r in rows:
         sid = int(r[0]) if r[0] is not None else None
-        wn = _wn_str(r[1])
+        wn = _normalize_week_no_key(r[1])
         if not wn:
             continue
         imp = int(r[2] or 0)
@@ -412,7 +492,8 @@ def fetch_impression_weekly(
         )
 
     logger.info(
-        "[ImpressionWeekly] source=amazon_search sum, week_filter=amazon_search_data.start_date range=%s..%s store_groups=%s aggregate_weeks=%s",
+        "[ImpressionWeekly] source=amazon_search sum, week_candidates=%s (search_data∪calendar) range=%s..%s store_groups=%s aggregate_weeks=%s",
+        len(candidates),
         params["d0"],
         params["d1"],
         len(per_store),
@@ -433,7 +514,7 @@ def fetch_ads_impression_weekly_filtered(
     - 条件：placement_classification 包含 "Top of Search" 或 "Other on"
 
     周口径：
-    - 先取报表区间内 amazon_search_data.start_date 出现过的 week_no
+    - week_no 候选与 ``fetch_impression_weekly`` 一致（search_data 区间内 ∪ 日历与报表区间相交）。
     - week_no -> (周日~周六) 后，把广告日数据映射回该 week_no 汇总
     """
     if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
@@ -443,46 +524,9 @@ def fetch_ads_impression_weekly_filtered(
         "d0": start_date.strftime("%Y-%m-%d"),
         "d1": end_date.strftime("%Y-%m-%d"),
     }
-    sql_week_no = text(
-        """
-        SELECT DISTINCT asd2.week_no
-        FROM amazon_search_data AS asd2
-        WHERE asd2.week_no IS NOT NULL
-          AND DATE(asd2.start_date) >= :d0
-          AND DATE(asd2.start_date) <= :d1
-        ORDER BY asd2.week_no ASC
-        """
-    )
-    with get_online_engine().connect() as conn:
-        wn_rows = conn.execute(sql_week_no, params).fetchall()
 
     week_meta: dict[str, dict] = {}
     day_to_week: dict[date, str] = {}
-    for r in wn_rows:
-        wn = str(r[0]).strip() if r and r[0] is not None else ""
-        if not wn:
-            continue
-        try:
-            d_min, d_max, mid = _week_no_to_week_range(wn)
-        except ValueError:
-            logger.warning("[AdsImpressionWeekly] skip invalid week_no=%r", wn)
-            continue
-        week_meta[wn] = {
-            "week_no": wn,
-            "d_min": d_min.isoformat(),
-            "d_max": d_max.isoformat(),
-            "mid": mid.isoformat(),
-        }
-        cur = d_min
-        while cur <= d_max:
-            day_to_week[cur] = wn
-            cur += timedelta(days=1)
-
-    if not week_meta:
-        return {}, []
-
-    min_day = min(_parse_ymd(x["d_min"]) for x in week_meta.values())
-    max_day = max(_parse_ymd(x["d_max"]) for x in week_meta.values())
     sql_ads_daily = text(
         """
         SELECT aacpr.store_id AS sid,
@@ -499,7 +543,31 @@ def fetch_ads_impression_weekly_filtered(
         ORDER BY d ASC, aacpr.store_id ASC
         """
     )
+
     with get_online_engine().connect() as conn:
+        candidates = _session_impression_report_week_no_candidates(conn, start_date, end_date)
+        for wn in candidates:
+            try:
+                d_min, d_max, mid = _week_no_to_week_range(wn)
+            except ValueError:
+                logger.warning("[AdsImpressionWeekly] skip invalid week_no=%r", wn)
+                continue
+            week_meta[wn] = {
+                "week_no": wn,
+                "d_min": d_min.isoformat(),
+                "d_max": d_max.isoformat(),
+                "mid": mid.isoformat(),
+            }
+            cur = d_min
+            while cur <= d_max:
+                day_to_week[cur] = wn
+                cur += timedelta(days=1)
+
+        if not week_meta:
+            return {}, []
+
+        min_day = min(_parse_ymd(x["d_min"]) for x in week_meta.values())
+        max_day = max(_parse_ymd(x["d_max"]) for x in week_meta.values())
         daily_rows = conn.execute(
             sql_ads_daily,
             {"d0": min_day.strftime("%Y-%m-%d"), "d1": max_day.strftime("%Y-%m-%d")},

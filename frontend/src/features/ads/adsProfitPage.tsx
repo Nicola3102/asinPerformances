@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
-import type { ChartOptions, TooltipItem } from "chart.js"
+import type { ChartOptions, Plugin, TooltipItem } from "chart.js"
 import {
   getAdsProfit,
   type AdsProfitResponse,
@@ -38,6 +38,33 @@ function deriveRefundParts(row: AdsProfitWeeklyPoint): { actual: number; predict
     return { actual: actualSafe, predicted: Math.max(0, estTotal - actualSafe) }
   }
   return { actual: actualSafe, predicted: 0 }
+}
+
+const salesTopBorderPlugin: Plugin<'bar'> = {
+  id: 'ads-profit-sales-top-border',
+  afterDatasetsDraw(chart) {
+    const dsIndex = chart.data.datasets.findIndex((ds) => ds.label === '销售收入(不含退货)')
+    if (dsIndex < 0) return
+    const meta = chart.getDatasetMeta(dsIndex)
+    if (!meta?.data?.length) return
+    const ctx = chart.ctx
+    ctx.save()
+    ctx.strokeStyle = '#1d4ed8'
+    ctx.lineWidth = 4
+    ctx.lineCap = 'round'
+    for (const el of meta.data as Array<{ x: number; y: number; width?: number }>) {
+      const width = Number(el?.width ?? 0)
+      const x = Number(el?.x ?? 0)
+      const y = Number(el?.y ?? 0)
+      if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(x) || !Number.isFinite(y)) continue
+      const half = width / 2
+      ctx.beginPath()
+      ctx.moveTo(x - half, y)
+      ctx.lineTo(x + half, y)
+      ctx.stroke()
+    }
+    ctx.restore()
+  },
 }
 
 export function AdsProfitPage() {
@@ -137,12 +164,31 @@ export function AdsProfitPage() {
 
   const profitChartData = useMemo(() => {
     const labels = weeklySeries.map((row) => row.week_start || '–')
+    const salesBarData = weeklySeries.map((row) => {
+      const sales = Number(row.sales_amount)
+      return Number.isFinite(sales) && sales > 0 ? sales : 0
+    })
+    const refundActualBarData = weeklySeries.map((row) => {
+      const sales = Number(row.sales_amount)
+      const salesSafe = Number.isFinite(sales) && sales > 0 ? sales : 0
+      const actual = Math.max(0, Math.min(deriveRefundParts(row).actual, salesSafe))
+      return [salesSafe - actual, salesSafe]
+    })
+    const refundPredictedBarData = weeklySeries.map((row) => {
+      const sales = Number(row.sales_amount)
+      const salesSafe = Number.isFinite(sales) && sales > 0 ? sales : 0
+      const refund = deriveRefundParts(row)
+      const actual = Math.max(0, Math.min(refund.actual, salesSafe))
+      const predicted = Math.max(0, Math.min(refund.predicted, Math.max(0, salesSafe - actual)))
+      const actualStart = salesSafe - actual
+      return [actualStart - predicted, actualStart]
+    })
     const grossMarginAfterReturnData = weeklySeries.map((row) => {
       if (typeof row.gross_margin_after_return_rate_display === 'number' && Number.isFinite(row.gross_margin_after_return_rate_display)) {
         return row.gross_margin_after_return_rate_display
       }
       // 兼容：后端未返回 display 字段时，用当前口径即时计算：
-      // (当周毛利(已扣广告) - (真实+预估退货金额)) / 当周净收益额
+      // (当周毛利(已扣广告) - (真实+预估退货金额)) / 销售收入(不含退货)
       const refund = deriveRefundParts(row)
       const sales = Number(row.sales_amount)
       const gp = Number(row.gross_profit)
@@ -160,30 +206,36 @@ export function AdsProfitPage() {
       datasets: [
         {
           type: 'bar' as const,
-          label: '净收益额',
-          data: weeklySeries.map((row) => row.sales_amount),
-          backgroundColor: '#60a5fa',
-          stack: 'money',
+          label: '销售收入(不含退货)',
+          data: salesBarData,
+          backgroundColor: 'rgba(96, 165, 250, 0.85)',
+          grouped: false,
+          barPercentage: 0.72,
+          categoryPercentage: 0.72,
+          yAxisID: 'yMoney',
+          order: 10,
+        },
+        {
+          type: 'bar' as const,
+          label: '退货金额（真实）',
+          data: refundActualBarData,
+          backgroundColor: '#fde047',
+          grouped: false,
+          barPercentage: 0.72,
+          categoryPercentage: 0.72,
           yAxisID: 'yMoney',
           order: 1,
         },
         {
           type: 'bar' as const,
-          label: '退货金额（真实）',
-          data: weeklySeries.map((row) => deriveRefundParts(row).actual),
-          backgroundColor: '#fde047',
-          stack: 'money',
-          yAxisID: 'yMoney',
-          order: 2,
-        },
-        {
-          type: 'bar' as const,
           label: '退货金额（预估）',
-          data: weeklySeries.map((row) => deriveRefundParts(row).predicted),
+          data: refundPredictedBarData,
           backgroundColor: '#fb923c',
-          stack: 'money',
+          grouped: false,
+          barPercentage: 0.72,
+          categoryPercentage: 0.72,
           yAxisID: 'yMoney',
-          order: 2,
+          order: 1,
         },
         {
           type: 'line' as const,
@@ -266,10 +318,7 @@ export function AdsProfitPage() {
 
   const moneyMax = useMemo(() => {
     const vals = weeklySeries
-      .map((row) => {
-        const r = deriveRefundParts(row)
-        return row.sales_amount + r.actual + r.predicted
-      })
+      .map((row) => row.sales_amount)
       .filter((v) => Number.isFinite(v))
     const max = vals.length ? Math.max(...vals) : 0
     return Math.max(1000, Math.ceil(max / 50000) * 50000)
@@ -310,14 +359,33 @@ export function AdsProfitPage() {
     maintainAspectRatio: false,
     interaction: { mode: 'index' as const, intersect: false },
     plugins: {
-      legend: { position: 'top' as const },
+      legend: {
+        position: 'top' as const,
+      },
       tooltip: {
         callbacks: {
           label: (ctx: TooltipItem<'bar'>) => {
             const label = ctx.dataset.label || ''
+            const idx = Number(ctx.dataIndex ?? -1)
+            const row = idx >= 0 ? weeklySeries[idx] : null
             const value = Number(ctx.parsed.y ?? 0)
             if (label.includes('毛利率') || label.includes('退货率') || label.includes('费销比')) return `${label}: ${value.toFixed(2)}%`
-            return `${label}: ${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+            if (row && label === '退货金额（真实）') {
+              const refund = deriveRefundParts(row)
+              const sales = Number(row.sales_amount)
+              const displayValue = Math.max(0, Math.min(refund.actual, Number.isFinite(sales) && sales > 0 ? sales : 0))
+              return `${label}: ${displayValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+            }
+            if (row && label === '退货金额（预估）') {
+              const refund = deriveRefundParts(row)
+              const sales = Number(row.sales_amount)
+              const salesSafe = Number.isFinite(sales) && sales > 0 ? sales : 0
+              const actual = Math.max(0, Math.min(refund.actual, salesSafe))
+              const displayValue = Math.max(0, Math.min(refund.predicted, Math.max(0, salesSafe - actual)))
+              return `${label}: ${displayValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+            }
+            const money = value
+            return `${label}: ${money.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
           },
           afterBody: (items) => {
             const idx = Number(items?.[0]?.dataIndex ?? -1)
@@ -348,16 +416,14 @@ export function AdsProfitPage() {
     },
     scales: {
       x: {
-        stacked: true,
         ticks: { maxRotation: 45, minRotation: 0 },
       },
       yMoney: {
         type: 'linear' as const,
         position: 'left',
-        stacked: true,
         beginAtZero: true,
         max: moneyMax,
-        title: { display: true, text: '净收益额 / 退货金额（堆叠）' },
+        title: { display: true, text: '销售收入(不含退货) / 退货金额（柱内显示）' },
       },
       yRate: {
         type: 'linear' as const,
@@ -394,7 +460,7 @@ export function AdsProfitPage() {
 
   const metricCards = [
     {
-      label: '净收益额',
+      label: '销售收入(不含退货)',
       value: summary.sales_amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
       accent: 'blue',
     },
@@ -427,7 +493,7 @@ export function AdsProfitPage() {
     <div className="app">
       <h1>Total Profit</h1>
       <p className="monitor-desc">
-        <strong>净收益额</strong>为当周 <code>order_profit</code> 的 <code>net_revenue</code> 汇总（不扣广告）；<strong>毛利</strong>与<strong>含退货毛利</strong>仅在毛利上减去当周本币广告费；毛利率分母仍为未扣广告的净收益额 / 成熟销售额。<strong>费销比</strong> = 本币广告费 ÷ 当周净收益额。
+        <strong>销售收入(不含退货)</strong>为当周 <code>order_profit</code> 的 <code>net_revenue</code> 汇总（不扣广告）；<strong>毛利</strong>与<strong>含退货毛利</strong>销售收入(不含退货) / 成熟销售额。<strong>费销比</strong> = 本币广告费 ÷ 当周。
         当前最新 invoice_date：<code>{latestInvoiceDate || '–'}</code>
       </p>
 
@@ -471,7 +537,7 @@ export function AdsProfitPage() {
           </div>
         </div>
         <div className="ads-line-chart-wrap">
-          <Chart type="bar" data={profitChartData} options={profitChartOptions} />
+          <Chart type="bar" data={profitChartData} options={profitChartOptions} plugins={[salesTopBorderPlugin]} />
         </div>
       </div>
 
