@@ -13,7 +13,7 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from app.config import settings
 from app.online_engine import dispose_all_online_engines
-from app.controllers import asin_router, ads_router
+from app.controllers import asin_router, ads_router, revenue_router
 from app.controllers.asin_controller import get_trend_data
 from app.controllers.sync_controller import router as sync_router
 from app.controllers.trend_reports import router as trend_reports_router
@@ -498,6 +498,7 @@ app.add_middleware(
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.include_router(asin_router)
 app.include_router(ads_router)
+app.include_router(revenue_router)
 app.include_router(sync_router)
 app.include_router(trend_reports_router, prefix="/api/trend")
 app.add_api_route(

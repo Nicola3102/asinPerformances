@@ -39,6 +39,23 @@ function deriveWeeklyProfitAmount(row: AdsProfitWeeklyPoint): number {
   return (Number.isFinite(grossProfitAfterAd) ? grossProfitAfterAd : 0) - refund.actual - refund.predicted
 }
 
+function deriveActualReturnRate(row: AdsProfitWeeklyPoint): number | null {
+  if (row.return_rate_curve_type === 'predicted') return null
+  const actualFromApi = Number(row.return_rate_actual)
+  if (Number.isFinite(actualFromApi)) return actualFromApi
+  const sales = Number(row.sales_amount)
+  const actualRefund = deriveRefundParts(row).actual
+  if (!(Number.isFinite(sales) && sales > 0)) return null
+  return (actualRefund / sales) * 100
+}
+
+function derivePredictedReturnRate(row: AdsProfitWeeklyPoint): number | null {
+  if (row.return_rate_curve_type && row.return_rate_curve_type !== 'predicted') return null
+  const predictedFromApi = Number(row.return_rate_predicted)
+  if (Number.isFinite(predictedFromApi)) return predictedFromApi
+  return null
+}
+
 const salesTopBorderPlugin: Plugin<'bar'> = {
   id: 'ads-profit-sales-top-border',
   afterDatasetsDraw(chart) {
@@ -136,7 +153,11 @@ export function AdsProfitPage() {
       if (!(adjustedSales > 0)) return null
       return (deriveWeeklyProfitAmount(row) / adjustedSales) * 100
     })
+    const returnRateActualData = weeklySeries.map((row) => deriveActualReturnRate(row))
+    const returnRatePredictedData = weeklySeries.map((row) => derivePredictedReturnRate(row))
     const hasGrossMarginAfterReturnData = grossMarginAfterReturnData.some((value) => value != null && Number.isFinite(value))
+    const hasReturnRateActualData = returnRateActualData.some((value) => value != null && Number.isFinite(value))
+    const hasReturnRatePredictedData = returnRatePredictedData.some((value) => value != null && Number.isFinite(value))
     return {
       labels,
       datasets: [
@@ -200,6 +221,35 @@ export function AdsProfitPage() {
               order: 0,
             }]
           : []),
+        ...(hasReturnRateActualData
+          ? [{
+              type: 'line' as const,
+              label: '退货率（真实）',
+              data: returnRateActualData,
+              borderColor: '#0f766e',
+              backgroundColor: 'rgba(15, 118, 110, 0.12)',
+              yAxisID: 'yRate',
+              tension: 0.25,
+              pointRadius: 3,
+              pointHoverRadius: 5,
+              order: 1,
+            }]
+          : []),
+        ...(hasReturnRatePredictedData
+          ? [{
+              type: 'line' as const,
+              label: '退货率（预估）',
+              data: returnRatePredictedData,
+              borderColor: '#14b8a6',
+              backgroundColor: 'rgba(20, 184, 166, 0.12)',
+              yAxisID: 'yRate',
+              tension: 0.25,
+              pointRadius: 3,
+              pointHoverRadius: 5,
+              borderDash: [6, 6],
+              order: 1,
+            }]
+          : []),
       ],
       // Mixed bar/line：Chart.js 泛型过窄，用断言生成选项对象
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- ChartConfiguration 混合数据集
@@ -216,10 +266,10 @@ export function AdsProfitPage() {
 
   const rateMinMax = useMemo(() => {
     const vals = weeklySeries
-      .map((row) => {
+      .flatMap((row) => {
         const adjustedSales = deriveAdjustedSalesAmount(row)
-        if (!(adjustedSales > 0)) return null
-        return (deriveWeeklyProfitAmount(row) / adjustedSales) * 100
+        const grossMargin = adjustedSales > 0 ? (deriveWeeklyProfitAmount(row) / adjustedSales) * 100 : null
+        return [grossMargin, deriveActualReturnRate(row), derivePredictedReturnRate(row)]
       })
       .filter((v): v is number => v != null && Number.isFinite(v))
     if (!vals.length) return { min: -10, max: 20 }
@@ -268,7 +318,6 @@ export function AdsProfitPage() {
               `销售收入(扣退货): ${deriveAdjustedSalesAmount(row).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
               `当周毛利: ${deriveWeeklyProfitAmount(row).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
               `广告费用(本币): ${(row.ad_cost ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
-              `广告费用(USD): ${(row.ad_cost_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
               `当周加权汇率: ${(row.ad_fx_rate ?? 1).toFixed(6)}`,
             ]
           },
@@ -292,7 +341,7 @@ export function AdsProfitPage() {
         min: rateMinMax.min,
         max: rateMinMax.max,
         grid: { drawOnChartArea: false },
-        title: { display: true, text: '毛利率（含退货） (%)' },
+        title: { display: true, text: '毛利率 / 退货率 (%)' },
         ticks: {
           callback: (value) => `${value}%`,
         },
@@ -333,7 +382,12 @@ export function AdsProfitPage() {
     <div className="app">
       <h1>Revenue</h1>
       <p className="monitor-desc">
-        <strong>销售收入</strong>为 <code>order_profit.net_revenue</code> 汇总减去真实+预估退货金额；<strong>毛利</strong>为 <code>order_profit.gross_profit</code> 汇总减去真实+预估退货金额，再减去广告费用。
+        <strong>销售收入</strong>为 <code>order_profit.net_revenue</code> 汇总减去真实+预估退货金额；
+        <br />
+        <strong>毛利</strong>为 <code>order_profit.gross_profit</code> 汇总减去真实+预估退货金额，再减去广告费用。
+        <br />
+        <strong>退货金额</strong>为 45 天前真实退货金额与 45 天至今预估退货金额之和。
+        <br />
         当前最新 invoice_date：<code>{latestInvoiceDate || '–'}</code>
       </p>
 

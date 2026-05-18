@@ -24,6 +24,7 @@ from app.services.weekly_profit import (
 from app.services.daily_ad_cost_sales import ensure_latest_ad_cost_sales_data
 
 router = APIRouter(prefix="/api/ads", tags=["ads"])
+revenue_router = APIRouter(prefix="/api", tags=["revenue"])
 logger = logging.getLogger(__name__)
 
 
@@ -697,7 +698,8 @@ def export_ad_sales(
     )
 
 
-@router.get("/revenue")
+@revenue_router.get("/revenue")
+@router.get("/revenue", include_in_schema=False)
 def get_ads_profit(
     store_id: Optional[int] = Query(None, description="按 order_profit.store_id / 线上广告报表 store_id 过滤"),
     start_date: Optional[str] = Query(None, description="invoice_date 起始 YYYY-MM-DD（含），默认 2026-02-23"),

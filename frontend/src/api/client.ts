@@ -159,7 +159,7 @@ export async function getAdsProfit(params: {
   if (params.store_id != null && !Number.isNaN(Number(params.store_id))) qs.set('store_id', String(params.store_id))
   if (params.start_date) qs.set('start_date', params.start_date)
   if (params.end_date) qs.set('end_date', params.end_date)
-  return apiFetch<AdsProfitResponse>(`/ads/revenue?${qs.toString()}`)
+  return apiFetch<AdsProfitResponse>(`/revenue?${qs.toString()}`)
 }
 
 export async function syncFromOnline(): Promise<SyncFromOnlineResponse> {
