@@ -401,20 +401,20 @@ export function AdsProfitPage() {
     {
       label: '销售收入',
       value: summary.sales_amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
-      accent: 'blue',
+      accent: 'sales',
     },
-    { label: '毛利', value: summary.gross_profit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }), accent: 'green' },
-    { label: '毛利率', value: `${summary.gross_margin_rate.toFixed(2)}%`, accent: 'teal' },
+    { label: '毛利', value: summary.gross_profit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }), accent: 'profit' },
+    { label: '毛利率', value: `${summary.gross_margin_rate.toFixed(2)}%`, accent: 'margin' },
     {
       label: '退货金额',
       // 页面顶部口径：按周汇总真实退货 + 预估退货（weekly_series.refund_amount）
       value: refundAmountTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
-      accent: 'orange',
+      accent: 'refund',
     },
     {
       label: '广告费用',
       value: (summary.ad_cost ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
-      accent: 'purple',
+      accent: 'ad-cost',
     },
   ]
 
