@@ -56,6 +56,34 @@ function derivePredictedReturnRate(row: AdsProfitWeeklyPoint): number | null {
   return null
 }
 
+function alignBoundsToZeroRatio(rawMin: number, rawMax: number, zeroRatio: number): { min: number; max: number } {
+  const safeMin = Number.isFinite(rawMin) ? rawMin : 0
+  const safeMax = Number.isFinite(rawMax) ? rawMax : 0
+  const ratio = Number.isFinite(zeroRatio) ? Math.min(0.95, Math.max(0.05, zeroRatio)) : 0.5
+
+  if (safeMin === 0 && safeMax === 0) return { min: -1, max: 1 }
+
+  if (safeMin >= 0) {
+    const max = safeMax > 0 ? safeMax : 1
+    return { min: -max * ratio / (1 - ratio), max }
+  }
+
+  if (safeMax <= 0) {
+    const min = safeMin < 0 ? safeMin : -1
+    return { min, max: (-min * (1 - ratio)) / ratio }
+  }
+
+  const maxFromMin = (-safeMin * (1 - ratio)) / ratio
+  if (maxFromMin >= safeMax) {
+    return { min: safeMin, max: maxFromMin }
+  }
+
+  return {
+    min: (-safeMax * ratio) / (1 - ratio),
+    max: safeMax,
+  }
+}
+
 const salesTopBorderPlugin: Plugin<'bar'> = {
   id: 'ads-profit-sales-top-border',
   afterDatasetsDraw(chart) {
@@ -256,15 +284,29 @@ export function AdsProfitPage() {
     } as any
   }, [weeklySeries])
 
-  const moneyMax = useMemo(() => {
-    const vals = weeklySeries
-      .map((row) => deriveAdjustedSalesAmount(row))
-      .filter((v) => Number.isFinite(v))
-    const max = vals.length ? Math.max(...vals) : 0
-    return Math.max(1000, Math.ceil(max / 50000) * 50000)
+  const moneyAxisBounds = useMemo(() => {
+    const values = weeklySeries.flatMap((row) => [
+      deriveAdjustedSalesAmount(row),
+      deriveWeeklyProfitAmount(row),
+      Number(row.ad_cost ?? 0),
+      Number(row.refund_amount ?? 0),
+    ]).filter((v) => Number.isFinite(v))
+    if (!values.length) return { min: -1000, max: 1000, zeroRatio: 0.5 }
+
+    const rawMin = Math.min(...values, 0)
+    const rawMax = Math.max(...values, 0)
+    const span = Math.max(rawMax - rawMin, 1)
+    const paddedMin = rawMin < 0 ? rawMin - span * 0.08 : 0
+    const paddedMax = rawMax > 0 ? rawMax + span * 0.08 : 0
+    const maxAbs = Math.max(Math.abs(paddedMin), Math.abs(paddedMax))
+    const step = maxAbs >= 100000 ? 50000 : maxAbs >= 20000 ? 10000 : maxAbs >= 5000 ? 5000 : 1000
+    const min = paddedMin < 0 ? Math.floor(paddedMin / step) * step : 0
+    const max = paddedMax > 0 ? Math.ceil(paddedMax / step) * step : step
+    const zeroRatio = min < 0 && max > 0 ? (-min / (max - min)) : 0.5
+    return { min, max, zeroRatio }
   }, [weeklySeries])
 
-  const rateMinMax = useMemo(() => {
+  const rateAxisBounds = useMemo(() => {
     const vals = weeklySeries
       .flatMap((row) => {
         const adjustedSales = deriveAdjustedSalesAmount(row)
@@ -272,14 +314,16 @@ export function AdsProfitPage() {
         return [grossMargin, deriveActualReturnRate(row), derivePredictedReturnRate(row)]
       })
       .filter((v): v is number => v != null && Number.isFinite(v))
-    if (!vals.length) return { min: -10, max: 20 }
-    const min = Math.min(...vals, 0)
-    const max = Math.max(...vals, 0)
+    if (!vals.length) return { min: -10, max: 10 }
+
+    const rawMin = Math.min(...vals)
+    const rawMax = Math.max(...vals)
+    const aligned = alignBoundsToZeroRatio(rawMin, rawMax, moneyAxisBounds.zeroRatio)
     return {
-      min: Math.floor(min / 5) * 5,
-      max: Math.max(5, Math.ceil(max / 5) * 5),
+      min: Math.floor(aligned.min / 5) * 5,
+      max: Math.ceil(aligned.max / 5) * 5,
     }
-  }, [weeklySeries])
+  }, [moneyAxisBounds.zeroRatio, weeklySeries])
 
   const profitChartOptions = useMemo<ChartOptions<'bar'>>(() => ({
     responsive: true,
@@ -314,10 +358,6 @@ export function AdsProfitPage() {
               `退货订单数: ${row.returned_order_count.toLocaleString()}`,
               `退货金额(真实): ${refundParts.actual.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
               `退货金额(预估): ${refundParts.predicted.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
-              `销售收入(原始): ${Number(row.sales_amount ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
-              `销售收入(扣退货): ${deriveAdjustedSalesAmount(row).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
-              `当周毛利: ${deriveWeeklyProfitAmount(row).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
-              `广告费用(本币): ${(row.ad_cost ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
               `当周加权汇率: ${(row.ad_fx_rate ?? 1).toFixed(6)}`,
             ]
           },
@@ -331,15 +371,15 @@ export function AdsProfitPage() {
       yMoney: {
         type: 'linear' as const,
         position: 'left',
-        beginAtZero: true,
-        max: moneyMax,
+        min: moneyAxisBounds.min,
+        max: moneyAxisBounds.max,
         title: { display: true, text: '销售收入（已扣真实+预估退货）' },
       },
       yRate: {
         type: 'linear' as const,
         position: 'right',
-        min: rateMinMax.min,
-        max: rateMinMax.max,
+        min: rateAxisBounds.min,
+        max: rateAxisBounds.max,
         grid: { drawOnChartArea: false },
         title: { display: true, text: '毛利率 / 退货率 (%)' },
         ticks: {
@@ -347,7 +387,7 @@ export function AdsProfitPage() {
         },
       },
     },
-  }), [moneyMax, rateMinMax.max, rateMinMax.min, weeklySeries])
+  }), [moneyAxisBounds.max, moneyAxisBounds.min, rateAxisBounds.max, rateAxisBounds.min, weeklySeries])
 
   const refundAmountTotal = useMemo(() => {
     if (weeklySeries.length === 0) return Number(summary.refund_amount ?? 0)
@@ -382,9 +422,9 @@ export function AdsProfitPage() {
     <div className="app">
       <h1>Revenue</h1>
       <p className="monitor-desc">
-        <strong>销售收入</strong>为 <code>order_profit.net_revenue</code> 汇总减去真实+预估退货金额；
+        <strong>销售收入</strong>为 <code>order_profit.net_revenue</code> 汇总扣除平台费后减去真实+预估退货金额；
         <br />
-        <strong>毛利</strong>为 <code>order_profit.gross_profit</code> 汇总减去真实+预估退货金额，再减去广告费用。
+        <strong>毛利</strong>为 <code>order_profit.gross_profit</code> 汇总扣除运费后，再减去真实+预估退货金额，再减去广告费用。
         <br />
         <strong>退货金额</strong>为 45 天前真实退货金额与 45 天至今预估退货金额之和。
         <br />
