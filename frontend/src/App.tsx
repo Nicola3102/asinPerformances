@@ -9,7 +9,7 @@ const GroupBPageRoute = lazy(() => import('./pages/group/B'))
 const GroupFPage = lazy(() => import('./pages/group/F'))
 const MonitorPage = lazy(() => import('./pages/monitor'))
 const AdSalesPage = lazy(() => import('./pages/ads/ad-sales'))
-const AdsProfitPage = lazy(() => import('./pages/ads/profit'))
+const RevenuePage = lazy(() => import('./pages/ads/profit'))
 const TrendNewListingEmbeddedPage = lazy(() => import('./pages/trend/new-listing'))
 const TrendPage = lazy(() => import('./pages/trend/weekly'))
 const TrendSessionImpressionEmbeddedPage = lazy(() => import('./pages/trend/session-impression'))
@@ -31,8 +31,10 @@ export default function App() {
         <Route path="/grpup/A" element={<Navigate to="/group/A" replace />} />
           <Route path="/tasks" element={<TasksPageRoute />} />
         <Route path="/monitor" element={<MonitorPage />} />
+        <Route path="/revenue" element={<RevenuePage />} />
         <Route path="/ads/ad-sales" element={<AdSalesPage />} />
-        <Route path="/ads/profit" element={<AdsProfitPage />} />
+        <Route path="/ads/revenue" element={<Navigate to="/revenue" replace />} />
+        <Route path="/ads/profit" element={<Navigate to="/revenue" replace />} />
         <Route path="/trend" element={<TrendPage />} />
         <Route path="/trend/session-impression" element={<TrendSessionImpressionEmbeddedPage />} />
         <Route path="/trend/session&impression" element={<Navigate to="/trend/session-impression" replace />} />

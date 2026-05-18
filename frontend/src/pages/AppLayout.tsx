@@ -61,6 +61,9 @@ export default function AppLayout() {
         <NavLink to="/monitor" className={({ isActive }) => `top-nav-link ${isActive ? 'is-active' : ''}`}>
           Monitor
         </NavLink>
+        <NavLink to="/revenue" className={({ isActive }) => `top-nav-link ${isActive ? 'is-active' : ''}`}>
+          Revenue
+        </NavLink>
         <div className="top-nav-group" ref={adsRef}>
           <button
             type="button"
@@ -78,13 +81,6 @@ export default function AppLayout() {
               onClick={() => setAdsOpen(false)}
             >
               Ad-Sales
-            </NavLink>
-            <NavLink
-              to="/ads/profit"
-              className="top-nav-menu-link"
-              onClick={() => setAdsOpen(false)}
-            >
-              Total Profit
             </NavLink>
           </div>
         </div>

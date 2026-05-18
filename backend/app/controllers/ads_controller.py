@@ -111,6 +111,7 @@ def _fetch_weekly_weighted_fx_order_profit_online(
     """
     线上 order_profit：按 invoice_date 所在自然周（周一）汇总，
     销售额加权汇率 = SUM(net_revenue*qty*exchange_rate) / SUM(net_revenue*qty)，
+    仅使用 exchange_rate > 6 的记录参与加权，
     用于将广告美元花费换算到与订单一致的本币口径。
     """
     if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
@@ -120,9 +121,19 @@ def _fetch_weekly_weighted_fx_order_profit_online(
         f"""
         SELECT
             DATE_SUB(op.invoice_date, INTERVAL WEEKDAY(op.invoice_date) DAY) AS week_start,
-            SUM(COALESCE(op.net_revenue, 0) * COALESCE(op.qty, 0)) AS rev_sum,
             SUM(
-                COALESCE(op.net_revenue, 0) * COALESCE(op.qty, 0) * COALESCE(op.exchange_rate, 1)
+                CASE
+                    WHEN COALESCE(op.exchange_rate, 0) > 6
+                    THEN COALESCE(op.net_revenue, 0) * COALESCE(op.qty, 0)
+                    ELSE 0
+                END
+            ) AS rev_sum,
+            SUM(
+                CASE
+                    WHEN COALESCE(op.exchange_rate, 0) > 6
+                    THEN COALESCE(op.net_revenue, 0) * COALESCE(op.qty, 0) * COALESCE(op.exchange_rate, 1)
+                    ELSE 0
+                END
             ) AS rev_fx_sum
         FROM order_profit op
         WHERE op.invoice_date >= :start_date
@@ -251,7 +262,6 @@ def _merge_weekly_ad_cost_into_report(
         round((total_local / sales_orig_summary * 100.0), 2) if sales_orig_summary > 0 else 0.0
     )
 
-    mature_sum = 0.0
     for row in weekly:
         ws = row.get("week_start")
         key = _normalize_week_start_key(ws)
@@ -268,7 +278,6 @@ def _merge_weekly_ad_cost_into_report(
 
         sa0 = float(row.get("sales_amount") or 0)
         ms0 = float(row.get("mature_sales_amount") or 0)
-        mature_sum += ms0
         gp0 = float(row.get("gross_profit") or 0)
         gpar0 = float(row.get("gross_profit_after_return") or 0)
         refund_total = float(row.get("refund_amount") or 0)
@@ -291,15 +300,19 @@ def _merge_weekly_ad_cost_into_report(
         row["gross_margin_after_return_rate_display"] = round((gpar_display / sa0 * 100.0), 2) if sa0 > 0 else 0.0
 
     if weekly:
-        s_sales = sum(float(r.get("sales_amount") or 0) for r in weekly)
-        s_gp = sum(float(r.get("gross_profit") or 0) for r in weekly)
-        s_gpar = sum(float(r.get("gross_profit_after_return") or 0) for r in weekly)
+        s_sales_raw = sum(float(r.get("sales_amount") or 0) for r in weekly)
+        s_refund = sum(float(r.get("refund_amount") or 0) for r in weekly)
+        s_sales = s_sales_raw - s_refund
+        s_gp_before_refund = sum(float(r.get("gross_profit") or 0) for r in weekly)
+        s_gp = s_gp_before_refund - s_refund
+        s_gpar = sum(float(r.get("gross_profit_after_return_display") or 0) for r in weekly)
+        summary["sales_amount"] = round(s_sales, 2)
+        summary["refund_amount"] = round(s_refund, 2)
         summary["gross_profit"] = round(s_gp, 2)
         summary["gross_profit_after_return"] = round(s_gpar, 2)
         summary["gross_margin_rate"] = round((s_gp / s_sales * 100.0), 2) if s_sales > 0 else 0.0
-        summary["gross_margin_after_return_rate"] = (
-            round((s_gpar / mature_sum * 100.0), 2) if mature_sum > 0 else 0.0
-        )
+        summary["return_rate"] = round((s_refund / s_sales * 100.0), 2) if s_sales > 0 else 0.0
+        summary["gross_margin_after_return_rate"] = round((s_gpar / s_sales * 100.0), 2) if s_sales > 0 else 0.0
 
 
 def _parse_ymd_or_400(raw: str | None, field: str) -> date | None:
@@ -684,7 +697,7 @@ def export_ad_sales(
     )
 
 
-@router.get("/profit")
+@router.get("/revenue")
 def get_ads_profit(
     store_id: Optional[int] = Query(None, description="按 order_profit.store_id / 线上广告报表 store_id 过滤"),
     start_date: Optional[str] = Query(None, description="invoice_date 起始 YYYY-MM-DD（含），默认 2026-02-23"),
@@ -707,4 +720,13 @@ def get_ads_profit(
         logger.warning("[Ads] weekly ad_cost (online USD × FX) merge failed: %s", exc)
         _merge_weekly_ad_cost_into_report(report, {}, ad_usd_by_week=None, fx_by_week=None)
     return report
+
+
+@router.get("/profit", include_in_schema=False)
+def get_ads_profit_legacy(
+    store_id: Optional[int] = Query(None, description="按 order_profit.store_id / 线上广告报表 store_id 过滤"),
+    start_date: Optional[str] = Query(None, description="invoice_date 起始 YYYY-MM-DD（含），默认 2026-02-23"),
+    end_date: Optional[str] = Query(None, description="invoice_date 结束 YYYY-MM-DD（含），默认最新 invoice_date"),
+):
+    return get_ads_profit(store_id=store_id, start_date=start_date, end_date=end_date)
 

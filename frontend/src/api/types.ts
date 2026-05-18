@@ -352,6 +352,7 @@ export type AdsProfitSummary = {
   return_row_count: number
   /** 区间内净收益额合计（order_profit net_revenue，不扣广告） */
   sales_amount: number
+  /** 区间内总退货金额（真实+预估） */
   refund_amount: number
   /** 区间内毛利合计（已按周扣本币广告费） */
   gross_profit: number
@@ -359,6 +360,7 @@ export type AdsProfitSummary = {
   gross_profit_after_return: number
   gross_margin_rate: number
   gross_margin_after_return_rate: number
+  /** 区间总退货率（真实+预估） */
   return_rate: number
   /** 广告本币花费（线上报表美元 × 当周 order_profit 加权汇率），区间内按周汇总合计 */
   ad_cost?: number
