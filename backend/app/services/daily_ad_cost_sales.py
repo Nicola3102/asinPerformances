@@ -8,8 +8,8 @@
 - 否则使用 ``DATE(r.`current_date`)``（与 weekly_upload 中广告汇总一致）。
 
 用法（在 backend 目录下）：
-  python3 -m app.services.daily_ad_cost_sales --start-date 2026-03-01 --end-date 2026-03-31
-  python3 -m app.services.daily_ad_cost_sales
+  python3.11 -m app.services.daily_ad_cost_sales --start-date 2026-03-01 --end-date 2026-03-31
+  python3.11 -m app.services.daily_ad_cost_sales
       # 无参：对比本地 purchase_date 与线上报表日，仅同步「线上有而本地尚无」的日期（默认回看窗口见 default_gap_day_bounds）
 """
 
@@ -31,6 +31,7 @@ from app.logging_config import setup_logging
 from app.models.daily_ad_cost_sales import DailyAdCostSales
 from app.online_engine import get_online_engine
 from app.sync_run_record import (
+    now_asia,
     record_daily_ad_cost_sales_run,
     should_run_daily_ad_cost_sales_sync,
 )
@@ -621,6 +622,17 @@ def sync_ad_cost_sales(
 _scheduled_ad_sales_lock = threading.Lock()
 
 
+def _scheduled_range_bounds_asia() -> tuple[date, date]:
+    """
+    定时任务固定区间（东八区）：
+    - start_date = 当前日期 - 30 天
+    - end_date = 当前日期
+    """
+    end_d = now_asia().date()
+    start_d = end_d - timedelta(days=30)
+    return start_d, end_d
+
+
 def ensure_latest_ad_cost_sales_data() -> dict:
     """
     页面/接口触发的轻量增量同步入口。
@@ -665,7 +677,10 @@ def ensure_latest_ad_cost_sales_data() -> dict:
 
 def run_daily_ad_cost_sales_scheduled(*, force: bool = False) -> dict | None:
     """
-    定时任务入口：与命令行无参一致，仅同步「线上有而本地尚无」的报表日（gap）。
+    定时任务入口：固定按东八区区间模式执行。
+
+    - start_date = 当前日期 - 30 天
+    - end_date = 当前日期
     force=True 时跳过「本分钟已跑」检查；仍受锁约束。
     """
     if not _scheduled_ad_sales_lock.acquire(blocking=False):
@@ -680,20 +695,13 @@ def run_daily_ad_cost_sales_scheduled(*, force: bool = False) -> dict | None:
         if not settings.ONLINE_DB_HOST or not settings.ONLINE_DB_USER:
             logger.warning("[DailyAdCostSales] scheduled job skipped: online DB not configured")
             return None
-        init_db()
-        ldb = SessionLocal()
-        try:
-            online_engine = get_online_engine()
-            with online_engine.connect() as oc:
-                day_sql = _resolve_report_day_sql(oc)
-                missing = default_gap_days_to_sync(ldb, oc, day_sql)
-        finally:
-            ldb.close()
-        if not missing:
-            logger.info("[DailyAdCostSales] scheduled job: no gap days to sync")
-            record_daily_ad_cost_sales_run()
-            return {"mode": "gap", "rows_upsert": 0, "skipped": True}
-        out = sync_ad_cost_sales(gap_days=missing)
+        start_d, end_d = _scheduled_range_bounds_asia()
+        logger.info(
+            "[DailyAdCostSales] scheduled job starting: mode=range start_date=%s end_date=%s",
+            start_d.isoformat(),
+            end_d.isoformat(),
+        )
+        out = sync_ad_cost_sales(start_date=start_d, end_date=end_d)
         record_daily_ad_cost_sales_run()
         return out
     except Exception as e:

@@ -174,7 +174,7 @@ def _run_scheduled_daily_upload_ds():
 
 
 def _run_scheduled_daily_ad_cost_sales():
-    """按 .env：daily_ad_cost_sales_first_run_* / daily_times 在 SYNC_TIMEZONE 执行广告日花费/销售额 gap 同步。"""
+    """按 .env 时刻触发，但每次固定执行东八区 [当前日期-30天, 当前日期] 区间同步。"""
     run_daily_ad_cost_sales_scheduled(force=False)
 
 

@@ -9,7 +9,7 @@ import {
 import { Chart } from "../../lib/chartRegister"
 import "./adsRoutes.css"
 
-/** 退货率与广告费销比共用纵轴：按 0–100% 显示，避免费销比异常值把刻度拉到数千 */
+/** 退货率曲线纵轴：按 0–100% 显示，避免异常值把刻度拉到数千 */
 const SHARED_RETURN_AXIS_PCT_CAP = 100
 
 function pctForSharedReturnAxisChart(raw: number | null | undefined): number {
@@ -270,17 +270,6 @@ export function AdsProfitPage() {
               order: 0,
             }]
           : []),
-        {
-          type: 'line' as const,
-          label: '广告费销比',
-          data: weeklySeries.map((row) => pctForSharedReturnAxisChart(row.ad_cost_to_sales_pct)),
-          borderColor: '#ec4899',
-          backgroundColor: 'rgba(236, 72, 153, 0.12)',
-          yAxisID: 'yReturnRate',
-          tension: 0.2,
-          pointRadius: 3,
-          order: 0,
-        },
         ...(hasReturnRateActualData
           ? [{
               type: 'line' as const,
@@ -342,7 +331,6 @@ export function AdsProfitPage() {
   const returnRateMinMax = useMemo(() => {
     const vals: number[] = []
     for (const row of weeklySeries) {
-      vals.push(pctForSharedReturnAxisChart(row.ad_cost_to_sales_pct))
       const { actual, predicted } = deriveReturnCurveValue(row)
       if (actual != null && Number.isFinite(actual)) vals.push(pctForSharedReturnAxisChart(actual))
       if (predicted != null && Number.isFinite(predicted)) vals.push(pctForSharedReturnAxisChart(predicted))
@@ -401,11 +389,6 @@ export function AdsProfitPage() {
               `广告费用(本币): ${(row.ad_cost ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
               `广告费用(USD): ${(row.ad_cost_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
               `当周加权汇率: ${(row.ad_fx_rate ?? 1).toFixed(6)}`,
-              `广告费销比: ${(row.ad_cost_to_sales_pct ?? 0).toFixed(2)}%${
-                (row.ad_cost_to_sales_pct ?? 0) > SHARED_RETURN_AXIS_PCT_CAP
-                  ? `（图中纵轴以 ${SHARED_RETURN_AXIS_PCT_CAP}% 封顶）`
-                  : ''
-              }`,
               `退货率(展示): ${row.return_rate.toFixed(2)}%`,
               `退货率(真实): ${deriveReturnCurveValue(row).actual != null ? `${Number(deriveReturnCurveValue(row).actual).toFixed(2)}%` : '–'}`,
               `退货率(预测): ${deriveReturnCurveValue(row).predicted != null ? `${Number(deriveReturnCurveValue(row).predicted).toFixed(2)}%` : '–'}`,
@@ -446,7 +429,7 @@ export function AdsProfitPage() {
         grid: { drawOnChartArea: false },
         title: {
           display: true,
-          text: '退货率与广告费销比（同一纵轴，%）',
+          text: '退货率（%）',
         },
         ticks: {
           stepSize: 5,
@@ -458,34 +441,32 @@ export function AdsProfitPage() {
     },
   }), [deriveReturnCurveValue, moneyMax, rateMinMax.max, rateMinMax.min, returnRateMinMax.max, returnRateMinMax.min, weeklySeries])
 
+  const refundAmountTotal = useMemo(() => {
+    if (weeklySeries.length === 0) return Number(summary.refund_amount ?? 0)
+    return weeklySeries.reduce((acc, row) => {
+      const refund = Number(row.refund_amount ?? 0)
+      return acc + (Number.isFinite(refund) ? refund : 0)
+    }, 0)
+  }, [summary.refund_amount, weeklySeries])
+
   const metricCards = [
     {
       label: '销售收入(不含退货)',
       value: summary.sales_amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
       accent: 'blue',
     },
-    {
-      label: '退货金额',
-      value: summary.refund_amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
-      accent: 'orange',
-    },
     { label: '毛利', value: summary.gross_profit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }), accent: 'green' },
     { label: '毛利率（不含退货）', value: `${summary.gross_margin_rate.toFixed(2)}%`, accent: 'teal' },
-    { label: '毛利率（含退货）', value: `${summary.gross_margin_after_return_rate.toFixed(2)}%`, accent: 'red' },
+    {
+      label: '退货金额',
+      // 页面顶部口径：按周汇总真实退货 + 预估退货（weekly_series.refund_amount）
+      value: refundAmountTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+      accent: 'orange',
+    },
     {
       label: '广告费用',
       value: (summary.ad_cost ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
       accent: 'purple',
-    },
-    {
-      label: '广告费用（USD）',
-      value: (summary.ad_cost_usd ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
-      accent: 'purple',
-    },
-    {
-      label: '广告费销比',
-      value: `${(summary.ad_cost_to_sales_pct ?? 0).toFixed(2)}%`,
-      accent: 'sky',
     },
   ]
 
@@ -493,7 +474,7 @@ export function AdsProfitPage() {
     <div className="app">
       <h1>Total Profit</h1>
       <p className="monitor-desc">
-        <strong>销售收入(不含退货)</strong>为当周 <code>order_profit</code> 的 <code>net_revenue</code> 汇总（不扣广告）；<strong>毛利</strong>与<strong>含退货毛利</strong>销售收入(不含退货) / 成熟销售额。<strong>费销比</strong> = 本币广告费 ÷ 当周。
+        <strong>销售收入(不含退货)</strong>为当周 <code>order_profit</code> 的 <code>net_revenue</code> 汇总（不扣广告）；<strong>毛利</strong>与<strong>含退货毛利</strong>基于同周期销售收入与退货金额计算。
         当前最新 invoice_date：<code>{latestInvoiceDate || '–'}</code>
       </p>
 
