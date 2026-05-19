@@ -23,7 +23,6 @@ import {
   NL_ORDER_FLAGS_MAX_POSTS_PER_DAY,
   persistNlOrderPositiveKeys,
   readNlOrderFlagsPostsToday,
-  remainingNlOrderFlagPostsToday,
 } from '../../lib/nlOrderFlagsStorage'
 
 /** Dev：StrictMode 双挂载合并首屏 json_views=all；见 fetchNewListingJson dedupe */
@@ -1310,9 +1309,8 @@ export function TrendNewListingEmbeddedPage() {
   useEffect(() => {
     const p = nlDayPopover
     if (!p || !Array.isArray(p.items) || p.items.length === 0) return
-    // 仅在弹层打开后拉取一次缺失项；固定/非固定都需要高亮（复制时也希望看到）
-    // 大区间查询时后端负载高；限制弹层触发的 order-flags 请求规模，避免与主报表请求抢 online pool。
-    if (p.items.length > 450) return
+    // 仅在弹层打开后拉取一次缺失项；固定/非固定都需要高亮（复制时也希望看到）。
+    // 对用户正在查看的单元格，不再因条数过大而硬跳过；改为按批次查询，确保有订单的 ASIN 能够高亮。
     const uniq: Array<{ asin: string; store_id: number }> = []
     const seen = new Set<string>()
     for (const it of p.items) {
@@ -1327,32 +1325,29 @@ export function TrendNewListingEmbeddedPage() {
       uniq.push({ asin, store_id: sid })
     }
     if (!uniq.length) return
-    /** 与主报表联动：每日最多 2 次 order-flags POST；配额用尽时仅用缓存高亮 */
-    if (remainingNlOrderFlagPostsToday() <= 0) return
-    // 限制单次请求大小
-    const batch = uniq.slice(0, 400)
     // 避免并发打多次（鼠标移动/反复开关弹层）；在上一请求完成前不再发起新请求
     if (nlOrderFetchInFlightRef.current) return
     const ac = new AbortController()
     nlOrderFetchInFlightRef.current = ac
-    fetch('/api/trend/new-listing/order-flags', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ items: batch }),
-      signal: ac.signal,
-    })
-      .then(async (res) => {
+    ;(async () => {
+      const positiveKeys: string[] = []
+      for (let i = 0; i < uniq.length; i += NL_ORDER_FLAGS_BATCH_MAX) {
+        if (ac.signal.aborted) return
+        const batch = uniq.slice(i, i + NL_ORDER_FLAGS_BATCH_MAX)
+        const res = await fetch('/api/trend/new-listing/order-flags', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: batch }),
+          signal: ac.signal,
+        })
         const text = await res.text()
         if (!res.ok) throw new Error(text || `HTTP ${res.status}`)
-        return JSON.parse(text) as { has_orders?: Array<{ asin: string; store_id: number }> }
-      })
-      .then((data) => {
+        const data = JSON.parse(text) as { has_orders?: Array<{ asin: string; store_id: number }> }
         const rows = Array.isArray(data?.has_orders) ? data.has_orders : []
         // 与本批请求对齐：先视为无订单，再把服务端返回的有订单标 true（false 不持久化，下次仍会再审）
         for (const it of batch) {
           nlHasOrderRef.current.set(`${it.asin}||${it.store_id}`, false)
         }
-        const positiveKeys: string[] = []
         for (const r of rows) {
           const asin = String(r?.asin ?? '').trim()
           const sidRaw = r && typeof r === 'object' && 'store_id' in r ? (r as { store_id?: unknown }).store_id : undefined
@@ -1362,10 +1357,10 @@ export function TrendNewListingEmbeddedPage() {
           nlHasOrderRef.current.set(kk, true)
           positiveKeys.push(kk)
         }
-        if (positiveKeys.length) persistNlOrderPositiveKeys(positiveKeys)
-        incrementNlOrderFlagsDailyCount()
-        setNlOrderCacheEpoch((x) => x + 1)
-      })
+      }
+      if (positiveKeys.length) persistNlOrderPositiveKeys(positiveKeys)
+      setNlOrderCacheEpoch((x) => x + 1)
+    })()
       .catch((e: unknown) => {
         if (e instanceof Error && e.name === 'AbortError') return
         // 静默失败：不影响弹层展示

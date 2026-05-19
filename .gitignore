@@ -27,6 +27,7 @@ backend/docs/
 
 # Backend tests (do not track)
 backend/tests/
+test/
 
 # Node / frontend (keep in sync with frontend/.gitignore)
 node_modules/

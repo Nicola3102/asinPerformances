@@ -428,6 +428,8 @@ export function AdsProfitPage() {
         <br />
         <strong>退货金额</strong>为 45 天前真实退货金额与 45 天至今预估退货金额之和。
         <br />
+        <strong>说明</strong>：本页面中所有金额单位均为人民币 <code>¥</code>。
+        <br />
         当前最新 invoice_date：<code>{latestInvoiceDate || '–'}</code>
       </p>
 
