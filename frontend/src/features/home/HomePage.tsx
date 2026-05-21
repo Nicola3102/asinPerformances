@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   listSummaryConsolidatedByWeek,
   listWeeks,
@@ -12,6 +12,7 @@ import {
   type SummaryRowConsolidated,
   type DetailResponse,
 } from '../../api/client'
+import { devRequestSingleFlight } from '../../lib/devRequestSingleFlight'
 import { formatCreatedAt, formatNum, formatParentOrderTotal } from '../../lib/formatters'
 import { DetailModal } from './DetailModal'
 import './homeRoutes.css'
@@ -53,7 +54,7 @@ export default function AsinHomePage() {
     }
   }, [summary, selectedWeek])
 
-  const loadSummary = async (weekOverride?: number | '') => {
+  const loadSummary = useCallback(async (weekOverride?: number | '') => {
     setLoading(true)
     setError(null)
     const timeoutMs = 15000
@@ -63,13 +64,19 @@ export default function AsinHomePage() {
     })
     try {
       const [weeksData, stats] = await Promise.race([
-        Promise.all([listWeeks(), getTableStats()]),
+        Promise.all([
+          devRequestSingleFlight('home:list-weeks', () => listWeeks()),
+          devRequestSingleFlight('home:table-stats', () => getTableStats()),
+        ]),
         timeoutPromise,
       ]) as [Awaited<ReturnType<typeof listWeeks>>, Awaited<ReturnType<typeof getTableStats>>]
       clearTimeout(timeoutId!)
       const fallbackWeek = weeksData.length > 0 ? weeksData[0] : ''
       const effectiveWeek = weekOverride !== undefined ? weekOverride : (selectedWeek !== '' ? selectedWeek : fallbackWeek)
-      const summaryData = typeof effectiveWeek === 'number' ? await listSummaryConsolidatedByWeek(effectiveWeek) : []
+      const summaryData =
+        typeof effectiveWeek === 'number'
+          ? await devRequestSingleFlight(`home:summary:${effectiveWeek}`, () => listSummaryConsolidatedByWeek(effectiveWeek))
+          : []
       const asinSet = new Set(summaryData.map((r) => (r.parent_asin || '').trim()).filter((x) => x !== ''))
       setSelectedParentAsins((prev) => {
         const next = new Set<string>()
@@ -93,7 +100,13 @@ export default function AsinHomePage() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [selectedWeek])
+
+  const loadSummaryRef = useRef(loadSummary)
+
+  useEffect(() => {
+    loadSummaryRef.current = loadSummary
+  }, [loadSummary])
 
   const handleWeekChange = async (v: string) => {
     const nextWeek = v ? Number(v) : ''
@@ -134,7 +147,7 @@ export default function AsinHomePage() {
     setSelectedParentAsins(new Set())
   }
 
-  const triggerRefreshQueryStatus = async (week: number) => {
+  const triggerRefreshQueryStatus = useCallback(async (week: number) => {
     if (queryRefreshInFlightRef.current) return
     queryRefreshInFlightRef.current = true
     setRefreshingQueryStatus(true)
@@ -151,7 +164,7 @@ export default function AsinHomePage() {
       setRefreshingQueryStatus(false)
       queryRefreshInFlightRef.current = false
     }
-  }
+  }, [])
 
   const handleOperate = async (parent_asin: string | null, week_no: number | null) => {
     if (parent_asin == null || week_no == null) return
@@ -190,7 +203,7 @@ export default function AsinHomePage() {
   }
 
   useEffect(() => {
-    loadSummary()
+    void loadSummaryRef.current()
   }, [])
 
   useEffect(() => {
@@ -200,7 +213,7 @@ export default function AsinHomePage() {
       void triggerRefreshQueryStatus(selectedWeek)
     }, 30 * 60 * 1000) // 30 分钟
     return () => clearInterval(timer)
-  }, [selectedWeek])
+  }, [selectedWeek, triggerRefreshQueryStatus])
 
   const handleSync = async () => {
     setSyncing(true)

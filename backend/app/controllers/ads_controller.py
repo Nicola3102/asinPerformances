@@ -719,8 +719,11 @@ def get_ads_profit(
             fx_by_week=fx_map,
         )
     except Exception as exc:
-        logger.warning("[Ads] weekly ad_cost (online USD × FX) merge failed: %s", exc)
-        _merge_weekly_ad_cost_into_report(report, {}, ad_usd_by_week=None, fx_by_week=None)
+        logger.exception("[Ads] weekly ad_cost (online USD × FX) merge failed")
+        raise HTTPException(
+            status_code=503,
+            detail="广告成本数据暂时不可用，请稍后重试",
+        ) from exc
     return report
 
 

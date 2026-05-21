@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   listGroupAWeeks,
   getGroupASummary,
@@ -143,6 +143,7 @@ export default function GroupAPage() {
   const [downloading, setDownloading] = useState(false)
   const [selectAllMode, setSelectAllMode] = useState(false)
   const [selectedRowKeys, setSelectedRowKeys] = useState<Set<string>>(new Set())
+  const loadGroupARef = useRef<(opts?: { weekNo?: number | ''; page?: number }) => Promise<void>>(async () => {})
 
   const loadGroupA = async (opts?: { weekNo?: number | ''; page?: number }) => {
     setLoading(true)
@@ -167,8 +168,10 @@ export default function GroupAPage() {
     }
   }
 
+  loadGroupARef.current = loadGroupA
+
   useEffect(() => {
-    void loadGroupA({ weekNo: '', page: 1 })
+    void loadGroupARef.current({ weekNo: '', page: 1 })
   }, [])
 
   const handleWeekChange = async (v: string) => {

@@ -9,22 +9,24 @@ import {
   type AdSalesSummary,
 } from "../../api/client"
 import { Chart } from "../../lib/chartRegister"
+import { devRequestSingleFlight } from "../../lib/devRequestSingleFlight"
 import './adsRoutes.css'
 
+const EMPTY_AD_SALES_SUMMARY: AdSalesSummary = {
+  clicks: 0,
+  impressions: 0,
+  ad_cost: 0,
+  sales_1d: 0,
+  order_item_sales: 0,
+  tacos: 0,
+  ad_asin_count: 0,
+  cpc: 0,
+  acos: 0,
+  cvr: 0,
+  purchases: 0,
+}
+
 export function AdSalesPage() {
-  const emptyAdSalesSummary: AdSalesSummary = {
-    clicks: 0,
-    impressions: 0,
-    ad_cost: 0,
-    sales_1d: 0,
-    order_item_sales: 0,
-    tacos: 0,
-    ad_asin_count: 0,
-    cpc: 0,
-    acos: 0,
-    cvr: 0,
-    purchases: 0,
-  }
   const [storeId, setStoreId] = useState<string>('')
   const [startDate, setStartDate] = useState<string>('')
   const [endDate, setEndDate] = useState<string>('')
@@ -35,13 +37,15 @@ export function AdSalesPage() {
   const [total, setTotal] = useState<number>(0)
   const [loading, setLoading] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
-  const [summary, setSummary] = useState<AdSalesSummary>(emptyAdSalesSummary)
+  const [summary, setSummary] = useState<AdSalesSummary>(EMPTY_AD_SALES_SUMMARY)
   const [dailySeries, setDailySeries] = useState<AdSalesDailyPoint[]>([])
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [sorts, setSorts] = useState<Array<{ field: string; dir: 'asc' | 'desc' }>>([])
   const [syncNotice, setSyncNotice] = useState<string | null>(null)
   const [syncRefreshing, setSyncRefreshing] = useState<boolean>(false)
   const adSalesSortEffectReadyRef = useRef(false)
+  const loadRef = useRef<(nextPage: number, ensureLatest?: boolean) => Promise<void>>(async () => {})
+  const triggerLatestRefreshRef = useRef<() => Promise<void>>(async () => {})
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
 
@@ -55,19 +59,33 @@ export function AdSalesPage() {
     setError(null)
     try {
       const sid = storeId.trim() ? Number(storeId.trim()) : null
-      const res = await listAdSales({
-        store_id: Number.isFinite(sid as number) ? (sid as number) : null,
-        start_date: startDate.trim() || null,
-        end_date: endDate.trim() || null,
-        ensure_latest: ensureLatest,
-        sort: sortQuery,
-        page: nextPage,
-        page_size: pageSize,
-      })
+      const requestStoreId = Number.isFinite(sid as number) ? (sid as number) : null
+      const requestStartDate = startDate.trim() || null
+      const requestEndDate = endDate.trim() || null
+      const requestKey = [
+        'ad-sales',
+        requestStoreId ?? 'all',
+        requestStartDate ?? '',
+        requestEndDate ?? '',
+        sortQuery ?? '',
+        nextPage,
+        ensureLatest ? '1' : '0',
+      ].join(':')
+      const res = await devRequestSingleFlight(requestKey, () =>
+        listAdSales({
+          store_id: requestStoreId,
+          start_date: requestStartDate,
+          end_date: requestEndDate,
+          ensure_latest: ensureLatest,
+          sort: sortQuery,
+          page: nextPage,
+          page_size: pageSize,
+        }),
+      )
       setItems(res.items || [])
       setTotal(res.total || 0)
       setPage(res.page || nextPage)
-      setSummary(res.summary || emptyAdSalesSummary)
+      setSummary(res.summary || EMPTY_AD_SALES_SUMMARY)
       setDailySeries(res.daily_series || [])
     } catch (e) {
       setError(e instanceof Error ? e.message : '加载失败')
@@ -91,17 +109,25 @@ export function AdSalesPage() {
   }, [])
 
   useEffect(() => {
+    loadRef.current = load
+  }, [load])
+
+  useEffect(() => {
+    triggerLatestRefreshRef.current = triggerLatestRefresh
+  }, [triggerLatestRefresh])
+
+  useEffect(() => {
     let cancelled = false
     const boot = async () => {
-      await load(1)
+      await loadRef.current(1)
       if (cancelled) return
-      void triggerLatestRefresh()
+      void triggerLatestRefreshRef.current()
     }
     void boot()
     return () => {
       cancelled = true
     }
-  }, [load, triggerLatestRefresh])
+  }, [])
 
   // 排序变化后立即重新拉取（回到第 1 页）
   useEffect(() => {
@@ -109,7 +135,7 @@ export function AdSalesPage() {
       adSalesSortEffectReadyRef.current = true
       return
     }
-    void load(1)
+    void loadRef.current(1)
   }, [sortQuery])
 
   const toggleSelected = (id: number) => {

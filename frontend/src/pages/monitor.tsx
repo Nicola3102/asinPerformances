@@ -75,15 +75,24 @@ export default function MonitorPage() {
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
+    let cancelled = false
     setLoadingParents(true)
     setError(null)
     getMonitorParents()
       .then((list) => {
+        if (cancelled) return
         setParents(list)
-        if (list.length > 0 && !selectedParent) setSelectedParent(list[0].parent_asin ?? '')
+        setSelectedParent((prev) => prev || (list[0]?.parent_asin ?? ''))
       })
-      .catch((e) => setError(e instanceof Error ? e.message : 'Failed to load parents'))
-      .finally(() => setLoadingParents(false))
+      .catch((e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load parents')
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingParents(false)
+      })
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   useEffect(() => {

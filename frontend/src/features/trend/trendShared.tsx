@@ -1197,8 +1197,11 @@ export function TrendLineChartCard({
 }
 export function TrendNewListingEmbeddedPage() {
   type TrendHttpError = Error & { status?: number; retryAfterSec?: number }
-  const isTrendHttpStatus = (e: unknown, status: number): e is TrendHttpError =>
-    typeof e === 'object' && e !== null && Number((e as { status?: number }).status) === status
+  const isTrendHttpStatus = useCallback(
+    (e: unknown, status: number): e is TrendHttpError =>
+      typeof e === 'object' && e !== null && Number((e as { status?: number }).status) === status,
+    [],
+  )
   const waitWithAbort = (ms: number, signal?: AbortSignal): Promise<void> =>
     new Promise((resolve, reject) => {
       if (signal?.aborted) {
@@ -1233,6 +1236,7 @@ export function TrendNewListingEmbeddedPage() {
     }
   }, [])
   const [payload, setPayload] = useState<TrendNewListingJsonPayload | null>(boot.payload)
+  const payloadStoreIds = useMemo(() => payload?.storeIds ?? [], [payload?.storeIds])
   const [fromCache, setFromCache] = useState(boot.useCacheOnly)
   const [storeKey, setStoreKey] = useState<string>('all')
   const [displayStoreKey, setDisplayStoreKey] = useState<string>('all')
@@ -1284,7 +1288,7 @@ export function TrendNewListingEmbeddedPage() {
   const nlDayPopoverRef = useRef<NlDaySessionPopoverAnchor | null>(null)
   const nlHasOrderRef = useRef<Map<string, boolean>>(new Map())
   const nlOrderFetchInFlightRef = useRef<AbortController | null>(null)
-  const [nlOrderCacheEpoch, setNlOrderCacheEpoch] = useState(0)
+  const [, setNlOrderCacheEpoch] = useState(0)
 
   /** 持久化缓存：曾判定有订单的 asin||store_id 载入内存，减少 POST */
   useEffect(() => {
@@ -1303,7 +1307,7 @@ export function TrendNewListingEmbeddedPage() {
       const key = `${String(asin || '').trim()}||${Number(storeId)}`
       return Boolean(nlHasOrderRef.current.get(key))
     },
-    [nlOrderCacheEpoch],
+    [],
   )
 
   useEffect(() => {
@@ -1843,7 +1847,7 @@ export function TrendNewListingEmbeddedPage() {
         }
       }
     },
-    [fetchNewListingJson],
+    [fetchNewListingJson, isTrendHttpStatus],
   )
 
   const runNewListingAllViewFetch = useCallback(
@@ -1956,7 +1960,7 @@ export function TrendNewListingEmbeddedPage() {
     // 自定义起止日期往往区间较大，预取各店会触发多次后端重算/online 查询，容易变慢或把 online pool 打满。
     // 默认 35 天窗口才做 idle 预取加速「切换店铺」。
     if (!useDefaultDateRange) return
-    const ids = payload.storeIds || []
+    const ids = payloadStoreIds
     if (!ids.length) return
 
     const gen = ++nlPrefetchGenRef.current
@@ -2049,7 +2053,7 @@ export function TrendNewListingEmbeddedPage() {
     payload?.views?.all,
     payload?.sessionChartStart,
     payload?.sessionChartEnd,
-    (payload?.storeIds || []).join(','),
+    payloadStoreIds,
     endDateInput,
     startDateInput,
     useDefaultDateRange,

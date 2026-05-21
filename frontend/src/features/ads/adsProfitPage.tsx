@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import type { ChartOptions, Plugin, TooltipItem } from "chart.js"
 import {
   getAdsProfit,
@@ -7,6 +7,7 @@ import {
   type AdsProfitWeeklyPoint,
 } from "../../api/client"
 import { Chart } from "../../lib/chartRegister"
+import { devRequestSingleFlight } from "../../lib/devRequestSingleFlight"
 import "./adsRoutes.css"
 
 function deriveRefundParts(row: AdsProfitWeeklyPoint): { actual: number; predicted: number } {
@@ -111,25 +112,26 @@ const salesTopBorderPlugin: Plugin<'bar'> = {
   },
 }
 
+const EMPTY_SUMMARY: AdsProfitSummary = {
+  start_date: '2026-02-23',
+  end_date: '',
+  store_id: null,
+  order_count: 0,
+  returned_order_count: 0,
+  return_row_count: 0,
+  sales_amount: 0,
+  refund_amount: 0,
+  gross_profit: 0,
+  gross_profit_after_return: 0,
+  gross_margin_rate: 0,
+  gross_margin_after_return_rate: 0,
+  return_rate: 0,
+  ad_cost: 0,
+  ad_cost_to_sales_pct: 0,
+  ad_cost_usd: 0,
+}
+
 export function AdsProfitPage() {
-  const emptySummary: AdsProfitSummary = {
-    start_date: '2026-02-23',
-    end_date: '',
-    store_id: null,
-    order_count: 0,
-    returned_order_count: 0,
-    return_row_count: 0,
-    sales_amount: 0,
-    refund_amount: 0,
-    gross_profit: 0,
-    gross_profit_after_return: 0,
-    gross_margin_rate: 0,
-    gross_margin_after_return_rate: 0,
-    return_rate: 0,
-    ad_cost: 0,
-    ad_cost_to_sales_pct: 0,
-    ad_cost_usd: 0,
-  }
   const [storeId, setStoreId] = useState<string>('all')
   const [storeIds, setStoreIds] = useState<number[]>([])
   const [startDate, setStartDate] = useState<string>('2026-02-23')
@@ -137,21 +139,33 @@ export function AdsProfitPage() {
   const [latestInvoiceDate, setLatestInvoiceDate] = useState<string>('')
   const [loading, setLoading] = useState<boolean>(false)
   const [error, setError] = useState<string | null>(null)
-  const [summary, setSummary] = useState<AdsProfitSummary>(emptySummary)
+  const [summary, setSummary] = useState<AdsProfitSummary>(EMPTY_SUMMARY)
   const [weeklySeries, setWeeklySeries] = useState<AdsProfitWeeklyPoint[]>([])
+  const loadRef = useRef<() => Promise<void>>(async () => {})
 
   const load = useCallback(async () => {
     setLoading(true)
     setError(null)
     try {
       const sid = storeId === 'all' ? null : Number(storeId)
-      const res: AdsProfitResponse = await getAdsProfit({
-        store_id: Number.isFinite(sid as number) ? (sid as number) : null,
-        start_date: startDate || null,
-        end_date: endDate || null,
-      })
+      const requestStoreId = Number.isFinite(sid as number) ? (sid as number) : null
+      const requestStartDate = startDate || null
+      const requestEndDate = endDate || null
+      const requestKey = [
+        'ads-profit',
+        requestStoreId ?? 'all',
+        requestStartDate ?? '',
+        requestEndDate ?? '',
+      ].join(':')
+      const res: AdsProfitResponse = await devRequestSingleFlight(requestKey, () =>
+        getAdsProfit({
+          store_id: requestStoreId,
+          start_date: requestStartDate,
+          end_date: requestEndDate,
+        }),
+      )
       setStoreIds(Array.isArray(res.store_ids) ? res.store_ids : [])
-      setSummary(res.summary || emptySummary)
+      setSummary(res.summary || EMPTY_SUMMARY)
       setWeeklySeries(Array.isArray(res.weekly_series) ? res.weekly_series : [])
       setLatestInvoiceDate(res.latest_invoice_date || '')
       if (!endDate && res.end_date) setEndDate(res.end_date)
@@ -164,7 +178,11 @@ export function AdsProfitPage() {
   }, [endDate, startDate, storeId])
 
   useEffect(() => {
-    void load()
+    loadRef.current = load
+  }, [load])
+
+  useEffect(() => {
+    void loadRef.current()
   }, [])
 
   const profitChartData = useMemo(() => {

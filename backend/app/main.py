@@ -347,11 +347,11 @@ async def lifespan(app: FastAPI):
                     t.start()
                 except Exception as e:
                     logger.exception("[Monitor] Startup track failed: %s", e)
-            if now.hour % settings.GROUP_A_SYNC_INTERVAL_HOURS == 0:
+            if is_n_hour_slot(now, group_a_interval):
                 logger.info(
                     "[GroupA] Scheduled sync: current hour %s matches %sh window (Asia/Shanghai) — running once in background.",
                     now.hour,
-                    settings.GROUP_A_SYNC_INTERVAL_HOURS,
+                    group_a_interval,
                 )
                 try:
                     t = threading.Thread(target=_run_scheduled_group_a_sync, daemon=True)

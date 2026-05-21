@@ -11,4 +11,10 @@ if [ -f package-lock.json ]; then
 else
   npm install --no-audit --no-fund
 fi
+# Vite 开发态的优化依赖缓存位于 node_modules/.vite；容器重建、HMR 中断或浏览器旧会话
+# 偶发会导致依赖图与 browserHash 短暂失配。每次启动前清理，可显著降低脏缓存复发概率。
+if [ -d node_modules/.vite ]; then
+  echo "docker-entrypoint: 清理 Vite 预构建缓存 node_modules/.vite"
+  rm -rf node_modules/.vite
+fi
 exec "$@"

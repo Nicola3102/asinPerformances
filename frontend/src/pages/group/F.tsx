@@ -50,8 +50,9 @@ export default function GroupFPage() {
       .filter((n) => !Number.isNaN(n) && n >= 100000 && n <= 999999)
     return nums.length > 0 ? nums : null
   }, [submittedSpecificWeeks])
+  const weekNosKey = useMemo(() => (weekNos == null ? null : JSON.stringify(weekNos)), [weekNos])
 
-  const requestKey = weekNos == null ? `scan:${scanWeeks}` : `weeks:${JSON.stringify(weekNos)}`
+  const requestKey = weekNosKey == null ? `scan:${scanWeeks}` : `weeks:${weekNosKey}`
   const cachedEntry = cacheByKey[requestKey] ?? null
   const displayData = dataRequestKey === requestKey ? data : (cachedEntry?.data ?? null)
   const isShowingCachedData = dataRequestKey !== requestKey && cachedEntry != null
@@ -104,7 +105,7 @@ export default function GroupFPage() {
       })
       .finally(() => setLoading(false))
     return () => ctrl.abort()
-  }, [scanWeeks, weekNos === null ? null : JSON.stringify(weekNos), reloadNonce, requestKey])
+  }, [scanWeeks, weekNos, reloadNonce, requestKey])
 
   useEffect(() => {
     if (!waitingForLock) {
@@ -169,7 +170,7 @@ export default function GroupFPage() {
     }
   }
 
-  const rawRows = displayData?.rows ?? []
+  const rawRows = useMemo(() => displayData?.rows ?? [], [displayData?.rows])
   const filteredRows = useMemo(() => {
     let filtered = rawRows
     if (storeIdFilter.trim()) {

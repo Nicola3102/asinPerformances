@@ -3,8 +3,10 @@
  */
 import {
   Chart as ChartJS,
+  BarController,
   CategoryScale,
   LinearScale,
+  LineController,
   BarElement,
   LineElement,
   PointElement,
@@ -13,6 +15,16 @@ import {
 } from 'chart.js'
 import { Chart } from 'react-chartjs-2'
 
-ChartJS.register(CategoryScale, LinearScale, BarElement, LineElement, PointElement, Legend, Tooltip)
+ChartJS.register(
+  BarController,
+  LineController,
+  CategoryScale,
+  LinearScale,
+  BarElement,
+  LineElement,
+  PointElement,
+  Legend,
+  Tooltip,
+)
 
 export { Chart, ChartJS }
