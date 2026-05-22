@@ -68,7 +68,6 @@ _matrix_bulk_cache_lock = threading.Lock()
 _matrix_bulk_cache: "OrderedDict[tuple[str, str], tuple[float, dict, dict]]" = OrderedDict()
 
 NewListingKey = tuple[str, int, int, date, date]
-AMAZON_LISTING_NEW_ONLY_SQL = "al.asin_category = 0"
 
 
 def _matrix_bulk_cache_get(d0: date, d1: date):
@@ -392,8 +391,8 @@ def _fetch_matrix_rows_online(
     线上按「纯上新 asin + store + open_date」聚合 session。
 
     本地 daily_upload_asin_dates 是按 created_at 窗口同步的，无法稳定覆盖按 open_date
-    回看的纯上新 cohort，因此 online 可用时直接联查 amazon_listing
-    与 amazon_sales_and_traffic_daily；纯上新口径以 ``amazon_listing.asin_category = 0`` 为准。
+    回看的纯上新 cohort，因此 online 可用时直接联查 amazon_listing/amazon_variation
+    与 amazon_sales_and_traffic_daily。
     """
     params: dict[str, object] = {"d0": d0, "d1x": d1 + timedelta(days=1)}
     extra = ""
@@ -417,9 +416,12 @@ def _fetch_matrix_rows_online(
                    al.store_id,
                    DATE(al.open_date) AS open_day
             FROM amazon_listing al
-            WHERE al.asin <> ''
+            INNER JOIN amazon_variation av
+                ON av.id = al.variation_id
+            WHERE al.asin IS NOT NULL
+              AND al.asin <> ''
               AND al.open_date IS NOT NULL
-              AND {AMAZON_LISTING_NEW_ONLY_SQL}
+              AND ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
               {extra}
         ) AS nl
         INNER JOIN (
@@ -460,7 +462,7 @@ def _cohort_day_asin_breakdown_online(
     open_date_end: date | None,
 ) -> dict[tuple[date, date], list[dict]]:
     """
-    与 ``_fetch_matrix_rows_online`` 同源（listing 定批次 + traffic_daily 取 session）。
+    与 ``_fetch_matrix_rows_online`` 同源（listing×variation 定批次 + traffic_daily 取 session）。
     cohort 表每日合计若来自线上矩阵，悬停明细必须走此函数；否则本地 ``daily_upload_asin_dates``
     与线上 traffic 不一致会导致「格子合计 ≠ 明细之和」。
     """
@@ -499,9 +501,12 @@ def _cohort_day_asin_breakdown_online(
                    al.store_id,
                    DATE(al.open_date) AS open_day
             FROM amazon_listing al
-            WHERE al.asin <> ''
+            INNER JOIN amazon_variation av
+                ON av.id = al.variation_id
+            WHERE al.asin IS NOT NULL
+              AND al.asin <> ''
               AND al.open_date IS NOT NULL
-              AND {AMAZON_LISTING_NEW_ONLY_SQL}
+              AND ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
               AND DATE(al.open_date) IN ({ph})
               {extra_nl}
         ) AS nl
@@ -579,9 +584,12 @@ def _fetch_matrix_rows_online_bulk(
                    al.store_id,
                    DATE(al.open_date) AS open_day
             FROM amazon_listing al
-            WHERE al.asin <> ''
+            INNER JOIN amazon_variation av
+                ON av.id = al.variation_id
+            WHERE al.asin IS NOT NULL
+              AND al.asin <> ''
               AND al.open_date IS NOT NULL
-              AND {AMAZON_LISTING_NEW_ONLY_SQL}
+              AND ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
               {extra}
         ) AS nl
         INNER JOIN amazon_sales_and_traffic_daily AS d
@@ -799,70 +807,66 @@ def _fetch_listing_new_refurb_by_day_online(
     按 open_date 统计 amazon_listing 每日总数 / 上新数 / 尺寸补录数。
 
     判定规则：
-    - ``amazon_listing.asin_category = 0`` 记为上新；
-    - 其余（含 NULL、非 0）记为补录。
-
-    优化说明：
-    - ``new`` 单独走 ``WHERE asin_category = 0``，单店时更容易命中 ``(store_id, asin_category)`` 组合索引；
-    - ``refurbished`` 直接用 ``total - new`` 推导，避免在同一条 SQL 里对 ``asin_category`` 做 CASE 计算。
+    - 通过 ``amazon_listing.variation_id = amazon_variation.id`` 关联；
+    - 若两侧 ``created_at`` 均非空且 ``ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2``（即日历日相差 0 或 1 天），记为上新；
+    - 否则记为补录（含任一侧为空、或日历日相差 ≥2 天）。
     """
     d1_exclusive = d1 + timedelta(days=1)
     day_col = "DATE(al.open_date)"
     asin_ok = "al.asin IS NOT NULL "
-    params: dict[str, object] = {"d0": d0, "d1x": d1_exclusive}
-    extra = ""
     if store_id is not None:
-        extra += " AND al.store_id = :sid"
-        params["sid"] = int(store_id)
-
-    total_rows = conn.execute(
-        text(
+        q = text(
             f"""
-            SELECT {day_col} AS cd, COUNT(*) AS total_n
+            SELECT {day_col} AS cd,
+                   COUNT(*) AS total_n,
+                   COALESCE(SUM(CASE
+                       WHEN ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
+                       THEN 1 ELSE 0 END), 0) AS new_n,
+                   COALESCE(SUM(CASE
+                       WHEN al.created_at IS NULL
+                         OR av.created_at IS NULL
+                         OR ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) >= 2
+                       THEN 1 ELSE 0 END), 0) AS refurb_n
             FROM amazon_listing al
+            LEFT JOIN amazon_variation av ON av.id = al.variation_id
             WHERE {asin_ok}
-              AND al.open_date >= :d0 AND al.open_date < :d1x
-              {extra}
+              AND al.store_id = :sid
+              AND al.open_date >= :d0 AND al.open_date < :d1x 
             GROUP BY cd
             """
-        ),
-        params,
-    ).fetchall()
-    new_rows = conn.execute(
-        text(
+        )
+        rows = conn.execute(q, {"d0": d0, "d1x": d1_exclusive, "sid": store_id}).fetchall()
+    else:
+        q = text(
             f"""
-            SELECT {day_col} AS cd, COUNT(*) AS new_n
+            SELECT {day_col} AS cd,
+                   COUNT(*) AS total_n,
+                   COALESCE(SUM(CASE
+                       WHEN ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
+                       THEN 1 ELSE 0 END), 0) AS new_n,
+                   COALESCE(SUM(CASE
+                       WHEN al.created_at IS NULL
+                         OR av.created_at IS NULL
+                         OR ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) >= 2
+                       THEN 1 ELSE 0 END), 0) AS refurb_n
             FROM amazon_listing al
+            LEFT JOIN amazon_variation av ON av.id = al.variation_id
             WHERE {asin_ok}
-              AND {AMAZON_LISTING_NEW_ONLY_SQL}
               AND al.open_date >= :d0 AND al.open_date < :d1x
-              {extra}
             GROUP BY cd
             """
-        ),
-        params,
-    ).fetchall()
-
+        )
+        rows = conn.execute(q, {"d0": d0, "d1x": d1_exclusive}).fetchall()
     out: dict[date, dict[str, int]] = {}
-    for r in total_rows:
+    for r in rows:
         cd = _coerce_listing_calendar_day(r[0])
         if cd is None:
             continue
         out[cd] = {
             "total": int(r[1] or 0),
-            "new": 0,
-            "refurbished": 0,
+            "new": int(r[2] or 0),
+            "refurbished": int(r[3] or 0),
         }
-    for r in new_rows:
-        cd = _coerce_listing_calendar_day(r[0])
-        if cd is None:
-            continue
-        slot = out.setdefault(cd, {"total": 0, "new": 0, "refurbished": 0})
-        slot["new"] = int(r[1] or 0)
-    for vals in out.values():
-        total_n = int(vals.get("total", 0) or 0)
-        new_n = int(vals.get("new", 0) or 0)
-        vals["refurbished"] = max(0, total_n - new_n)
     return out
 
 
@@ -888,10 +892,12 @@ def _fetch_new_listing_keys_online(
                DATE(al.created_at) AS created_day,
                DATE(al.open_date) AS open_day
         FROM amazon_listing al
+        INNER JOIN amazon_variation av
+            ON av.id = al.variation_id
         WHERE al.asin IS NOT NULL
           AND al.asin <> ''
           AND al.open_date IS NOT NULL
-          AND al.asin_category = 0
+          AND ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
           AND al.open_date >= :d0 AND al.open_date < :d1x
     """
     params: dict[str, object] = {"d0": d0, "d1x": d1_exclusive}
@@ -2404,7 +2410,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     kpiHint.textContent = '说明：未配置 online_db 时 KPI 来自本地 daily_upload_asin_dates；配置后 KPI 仅来自 amazon_listing。';
   }
   document.getElementById('cohortTableHint').textContent =
-    '上新统计区间：' + P.listingSince + ' ～ ' + P.listingThrough + '（与图表 session 区间无关；listing_through 默认等于本次 session_end）。上新/补录：online 时按 amazon_listing.asin_category 判断，= 0 为上新，非 0（含空值）为补录；表格 sessions 与「第 k 天」仅统计上新 ASIN。图表折线按 session_date 把各批次堆叠相加，与表格某一行的「第几天」口径不同。Online 不可用时第二列回退本地口径估算。';
+    '上新统计区间：' + P.listingSince + ' ～ ' + P.listingThrough + '（与图表 session 区间无关；listing_through 默认等于本次 session_end）。上新/补录：online 时按 amazon_listing.created_at 与 amazon_variation.created_at 的日历日相差小于 2 天（0 或 1 天）为上新，否则为补录；表格 sessions 与「第 k 天」仅统计上新 ASIN。图表折线按 session_date 把各批次堆叠相加，与表格某一行的「第几天」口径不同。Online 不可用时第二列回退本地口径估算。';
 
   sel.innerHTML = '';
   const optAll = document.createElement('option');
