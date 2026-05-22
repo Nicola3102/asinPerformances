@@ -139,7 +139,6 @@ def _fetch_weekly_weighted_fx_order_profit_online(
         FROM order_profit op
         WHERE op.invoice_date >= :start_date
           AND op.invoice_date <= :end_date
-          AND op.order_id IS NOT NULL
           AND op.order_id <> ''
           {store_clause}
         GROUP BY DATE_SUB(op.invoice_date, INTERVAL WEEKDAY(op.invoice_date) DAY)
@@ -184,9 +183,8 @@ def _fetch_weekly_ads_cost_usd_online(
             DATE_SUB(DATE(r.current_date), INTERVAL WEEKDAY(DATE(r.current_date)) DAY) AS week_start,
             COALESCE(SUM(COALESCE(r.cost, 0)), 0) AS cost_usd
         FROM amazon_ads_ad_group_ad_report r
-        WHERE r.current_date IS NOT NULL
-          AND DATE(r.current_date) >= :start_date
-          AND DATE(r.current_date) <= :end_date
+        WHERE r.current_date >= :start_date
+          AND r.current_date <= :end_date
           {store_clause}
         GROUP BY DATE_SUB(DATE(r.current_date), INTERVAL WEEKDAY(DATE(r.current_date)) DAY)
         """
@@ -382,7 +380,6 @@ def _fetch_order_item_ad_asin_sales(
         "oi.order_status != 'Canceled'",
         "COALESCE(oi.is_cancel, 0) = 0",
         "oi.purchase_utc_date IS NOT NULL",
-        "oi.asin IS NOT NULL",
         "oi.asin <> ''",
     ]
     params: dict[str, object] = {}

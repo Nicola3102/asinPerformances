@@ -135,9 +135,8 @@ def _fetch_order_totals_by_day_store_asin(
                    SUM(COALESCE(oi.total_amount, 0)) AS amt
             FROM order_item oi
             WHERE oi.order_status != 'Canceled'
-              AND oi.purchase_utc_date IS NOT NULL
               AND {purchase_day_sql} BETWEEN :a AND :b
-              AND oi.asin IS NOT NULL AND oi.asin <> ''
+              AND oi.asin <> ''
             GROUP BY {purchase_day_sql}, oi.store_id, oi.asin
             """
         ),
@@ -250,7 +249,7 @@ def _distinct_local_purchase_days(local_db, low: date, high: date) -> set[date]:
     rows = local_db.execute(
         text(
             "SELECT DISTINCT purchase_date FROM daily_ad_cost_sales "
-            "WHERE purchase_date IS NOT NULL AND purchase_date BETWEEN :a AND :b"
+            "WHERE  purchase_date BETWEEN :a AND :b"
         ),
         {"a": low, "b": high},
     ).fetchall()
@@ -266,7 +265,7 @@ def _distinct_online_report_days(online_conn, day_sql: str, low: date, high: dat
     rows = online_conn.execute(
         text(
             f"SELECT DISTINCT {day_sql} AS d FROM amazon_ads_ad_group_ad_report r "
-            f"WHERE {day_sql} IS NOT NULL AND {day_sql} BETWEEN :a AND :b"
+            f"WHERE {day_sql} BETWEEN :a AND :b"
         ),
         {"a": low, "b": high},
     ).fetchall()
@@ -362,7 +361,7 @@ def _fetch_aggregated_for_day_filter(
                SUM(COALESCE(r.cost, 0)) AS ad_cost,
                SUM(COALESCE(r.sales_1d, 0)) AS sales_1d
         FROM amazon_ads_ad_group_ad_report r
-        WHERE {asin_trim_sql} IS NOT NULL AND {asin_trim_sql} <> ''
+        WHERE  {asin_trim_sql} <> ''
           AND {where}
         GROUP BY {asin_trim_sql}, r.store_id, {day_sql}
         """

@@ -244,7 +244,6 @@ def _fetch_session_matrix(
         SELECT session_date, created_at, SUM(COALESCE(sessions, 0)) AS s
         FROM {TABLE}
         WHERE store_id = :sid
-          AND created_at IS NOT NULL
           AND session_date >= :d0 AND session_date <= :d1
         GROUP BY session_date, created_at
         """
@@ -281,7 +280,7 @@ def _fetch_daily_new_asin_counts(
         f"""
         SELECT created_at, COUNT(DISTINCT asin) AS n
         FROM {TABLE}
-        WHERE store_id = :sid AND created_at IS NOT NULL
+        WHERE store_id = :sid 
           AND created_at >= :d0 AND created_at <= :d1
         GROUP BY created_at
         """

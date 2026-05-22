@@ -340,10 +340,8 @@ def fetch_impression_weekly(
         WHERE s.week_no IN (
             SELECT DISTINCT asd2.week_no
             FROM amazon_search_data AS asd2
-            WHERE asd2.week_no IS NOT NULL
-              AND DATE(asd2.start_date) >= :d0 AND DATE(asd2.start_date) <= :d1
+            WHERE DATE(asd2.start_date) >= :d0 AND DATE(asd2.start_date) <= :d1
         )
-          AND s.week_no IS NOT NULL
         GROUP BY s.store_id, s.week_no
         ORDER BY s.week_no ASC, s.store_id ASC
         """

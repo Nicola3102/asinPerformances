@@ -183,9 +183,8 @@ def _session_impression_report_week_no_candidates(
         """
         SELECT DISTINCT asd2.week_no
         FROM amazon_search AS asd2
-        WHERE asd2.week_no IS NOT NULL
-          AND DATE(asd2.start_date) >= :d0
-          AND DATE(asd2.start_date) <= :d1
+        WHERE asd2.start_date >= :d0
+          AND asd2.start_date <= :d1
         """
     )
     from_sd: set[str] = set()
@@ -268,10 +267,10 @@ def fetch_traffic_daily_by_store(
         f"""
         SELECT asatd.store_id,
                SUM(COALESCE(asatd.sessions, 0)) AS total_sessions,
-               DATE(asatd.`current_date`) AS d
+               asatd.`current_date` AS d
         FROM amazon_sales_and_traffic_daily AS asatd
         {where_sql}
-        GROUP BY asatd.store_id, DATE(asatd.`current_date`)
+        GROUP BY asatd.store_id, asatd.`current_date`
         ORDER BY d ASC, asatd.store_id ASC
         """
     )
@@ -337,10 +336,10 @@ def fetch_ads_daily_metrics_by_store(
         SELECT aaagar.store_id,
                SUM(COALESCE(aaagar.clicks, 0)) AS total_clicks,
                SUM(COALESCE(aaagar.impressions, 0)) AS total_impressions,
-               DATE(aaagar.`current_date`) AS d
+               aaagar.`current_date` AS d
         FROM amazon_ads_ad_group_ad_report AS aaagar
         {where_sql}
-        GROUP BY aaagar.store_id, DATE(aaagar.`current_date`)
+        GROUP BY aaagar.store_id, aaagar.`current_date`
         ORDER BY d ASC, aaagar.store_id ASC
         """
     )
@@ -443,7 +442,6 @@ def fetch_impression_weekly(
                    SUM(COALESCE(s.impression_count, 0)) AS total_impression
             FROM amazon_search AS s
             WHERE s.week_no IN ({in_sql})
-              AND s.week_no IS NOT NULL
             GROUP BY s.store_id, s.week_no
             ORDER BY s.week_no ASC, s.store_id ASC
             """
@@ -530,16 +528,16 @@ def fetch_ads_impression_weekly_filtered(
     sql_ads_daily = text(
         """
         SELECT aacpr.store_id AS sid,
-               DATE(aacpr.`current_date`) AS d,
+               aacpr.`current_date` AS d,
                SUM(COALESCE(aacpr.impressions, 0)) AS imp
         FROM amazon_ads_campaign_placement_report AS aacpr
-        WHERE DATE(aacpr.`current_date`) >= :d0
-          AND DATE(aacpr.`current_date`) <= :d1
+        WHERE aacpr.`current_date` >= :d0
+          AND aacpr.`current_date` <= :d1
           AND (
             COALESCE(aacpr.placement_classification, '') LIKE '%Top of Search%'
             OR COALESCE(aacpr.placement_classification, '') LIKE '%Other on%'
           )
-        GROUP BY aacpr.store_id, DATE(aacpr.`current_date`)
+        GROUP BY aacpr.store_id, aacpr.`current_date`
         ORDER BY d ASC, aacpr.store_id ASC
         """
     )

@@ -510,7 +510,7 @@ def _build_day_payload(
                 "       DATE(created_at) AS created_at, open_date AS open_date_raw "
                 "FROM amazon_listing "
                 "WHERE created_at >= :d0 AND created_at < :d1 "
-                "  AND asin IS NOT NULL AND asin <> ''"
+                "   AND asin <> ''"
             ),
             {"d0": day_str, "d1": (created_day + timedelta(days=1)).strftime("%Y-%m-%d")},
         ).fetchall()
@@ -678,7 +678,7 @@ def backfill_open_dates_from_online(
                     """
                     SELECT DISTINCT asin, created_at, COALESCE(pid, 0) AS pid, store_id
                     FROM daily_upload_asin_dates
-                    WHERE open_date IS NULL AND created_at IS NOT NULL
+                    WHERE open_date IS NULL 
                     ORDER BY asin, store_id, created_at, pid
                     LIMIT :lim
                     """

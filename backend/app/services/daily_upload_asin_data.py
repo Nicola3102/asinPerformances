@@ -418,7 +418,7 @@ def _build_day_payload(
                 "SELECT asin, pid, variation_id, store_id, status, DATE(created_at) AS created_at "
                 "FROM amazon_listing "
                 "WHERE created_at >= :d0 AND created_at < :d1 "
-                "  AND asin IS NOT NULL AND asin <> ''"
+                "   AND asin <> ''"
             ),
             {"d0": day_str, "d1": (created_day + timedelta(days=1)).strftime("%Y-%m-%d")},
         ).fetchall()

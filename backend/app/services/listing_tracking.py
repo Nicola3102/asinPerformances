@@ -308,82 +308,100 @@ def _fetch_pid_rows_by_conditions(
     started = time.time()
     listing_rows = online_conn.execute(
         text(
-            "SELECT al.store_id, al.pid, al.created_at, al.variation_id, al.asin, al.status "
-            "FROM amazon_listing al "
-            f"WHERE al.pid IS NOT NULL AND ({condition_sql}) "
-            "ORDER BY al.store_id, al.pid, al.created_at, al.variation_id"
+            "WITH filtered AS ( "
+            "  SELECT "
+            "    al.store_id AS store_id, "
+            "    al.pid AS pid, "
+            "    al.created_at AS created_at, "
+            "    al.variation_id AS variation_id, "
+            "    NULLIF(TRIM(al.asin), '') AS asin, "
+            "    LOWER(TRIM(COALESCE(al.status, ''))) AS status_norm "
+            "  FROM amazon_listing al "
+            f"  WHERE ({condition_sql}) "
+            "    AND al.pid IS NOT NULL "
+            "    AND al.store_id IS NOT NULL "
+            "), "
+            "agg AS ( "
+            "  SELECT "
+            "    f.store_id, "
+            "    f.pid, "
+            "    COUNT(DISTINCT f.asin) AS pid_asin_count, "
+            "    COUNT(DISTINCT CASE WHEN f.status_norm = 'active' THEN f.asin END) AS pid_active_asin_count, "
+            "    GROUP_CONCAT(DISTINCT DATE_FORMAT(f.created_at, '%Y-%m-%d %H:%i:%s') "
+            "      ORDER BY f.created_at SEPARATOR ' | ') AS created_at_list "
+            "  FROM filtered f "
+            "  WHERE f.created_at IS NOT NULL "
+            "  GROUP BY f.store_id, f.pid "
+            "), "
+            "ranked AS ( "
+            "  SELECT "
+            "    f.store_id, "
+            "    f.pid, "
+            "    f.created_at, "
+            "    f.variation_id, "
+            "    ROW_NUMBER() OVER ( "
+            "      PARTITION BY f.store_id, f.pid "
+            "      ORDER BY "
+            "        f.created_at ASC, "
+            "        CASE WHEN f.asin IS NULL THEN 1 ELSE 0 END ASC, "
+            "        CASE WHEN f.variation_id IS NULL THEN 1 ELSE 0 END ASC, "
+            "        f.variation_id ASC "
+            "    ) AS rn "
+            "  FROM filtered f "
+            "  WHERE f.created_at IS NOT NULL "
+            ") "
+            "SELECT "
+            "  a.store_id, "
+            "  a.pid, "
+            "  r.created_at, "
+            "  r.variation_id, "
+            "  a.pid_asin_count, "
+            "  a.pid_active_asin_count, "
+            "  a.created_at_list "
+            "FROM agg a "
+            "JOIN ranked r "
+            "  ON r.store_id = a.store_id "
+            " AND r.pid = a.pid "
+            " AND r.rn = 1 "
+            "ORDER BY a.store_id, a.pid"
         ),
         params,
     ).fetchall()
     logger.info(
-        "[ListingTracking] raw listing rows fetched context=%s rows=%s elapsed_sec=%.2f",
+        "[ListingTracking] representative listing rows fetched context=%s rows=%s elapsed_sec=%.2f",
         log_context,
         len(listing_rows),
         time.time() - started,
     )
 
-    grouped: dict[tuple[int, int], list[dict]] = defaultdict(list)
+    representative_rows = []
+    variation_ids = set()
     for row in listing_rows:
         try:
+            store_id = int(row[0])
             pid = int(row[1])
         except (TypeError, ValueError):
             continue
-        store_id = int(row[0]) if row[0] is not None else None
-        if store_id is None:
-            continue
-        grouped[(store_id, pid)].append(
-            {
-                "created_at": row[2],
-                "variation_id": int(row[3]) if row[3] is not None else None,
-                "asin": (row[4] or "").strip() or None,
-                "status": (row[5] or "").strip() or None,
-            }
-        )
-
-    representative_rows = []
-    variation_ids = set()
-    for (store_id, pid), items in grouped.items():
         batch_id = batch_id_by_pid.get(pid, default_batch_id)
         if batch_id is None:
             logger.warning("[ListingTracking] skip pid=%s in %s because batch_id not resolved", pid, log_context)
             continue
-        valid_items = [item for item in items if item["created_at"] is not None]
-        if not valid_items:
+        created_at = row[2]
+        if created_at is None:
             continue
-        picked = min(
-            valid_items,
-            key=lambda item: (
-                item["created_at"],
-                1 if not item["asin"] else 0,
-                item["variation_id"] if item["variation_id"] is not None else 10**18,
-            ),
-        )
-        if picked["variation_id"] is not None:
-            variation_ids.add(int(picked["variation_id"]))
+        variation_id = int(row[3]) if row[3] is not None else None
+        if variation_id is not None:
+            variation_ids.add(variation_id)
         representative_rows.append(
             {
                 "batch_id": int(batch_id),
                 "store_id": store_id,
                 "pid": pid,
-                "created_at": picked["created_at"],
-                "variation_id": picked["variation_id"],
-                "pid_asin_count": len({item["asin"] for item in items if item["asin"]}),
-                "pid_active_asin_count": len(
-                    {
-                        item["asin"]
-                        for item in items
-                        if item["asin"] and (item.get("status") or "").lower() == "active"
-                    }
-                ),
-                "created_at_list": " | ".join(
-                    sorted(
-                        {
-                            item["created_at"].strftime("%Y-%m-%d %H:%M:%S")
-                            for item in valid_items
-                            if item["created_at"] is not None
-                        }
-                    )
-                ),
+                "created_at": created_at,
+                "variation_id": variation_id,
+                "pid_asin_count": int(row[4] or 0),
+                "pid_active_asin_count": int(row[5] or 0),
+                "created_at_list": (row[6] or "").strip(),
             }
         )
 
@@ -452,6 +470,28 @@ def _fetch_pid_rows_by_conditions(
         len(out),
         time.time() - started,
     )
+    return out
+
+
+def _fetch_amazon_listing_store_ids(online_conn) -> list[int]:
+    """
+    amazon_listing 现有 store_id 索引；显式 pid 模式下先取店铺列表，再按店铺拆分查询，
+    避免单条 `pid IN (...)` 在缺少 pid 索引时退化成大范围扫描。
+    """
+    rows = online_conn.execute(
+        text(
+            "SELECT DISTINCT al.store_id "
+            "FROM amazon_listing al "
+            "WHERE al.store_id IS NOT NULL "
+            "ORDER BY al.store_id"
+        )
+    ).fetchall()
+    out: list[int] = []
+    for row in rows:
+        try:
+            out.append(int(row[0]))
+        except (TypeError, ValueError):
+            continue
     return out
 
 
@@ -552,25 +592,31 @@ def _fetch_pid_rows_for_explicit_pids(online_conn, pids: list[int], pid_batch_ma
     out: list[dict] = []
     batch_size = 300
     started = time.time()
+    store_ids = _fetch_amazon_listing_store_ids(online_conn)
+    if not store_ids:
+        logger.warning("[ListingTracking] explicit pid fetch skipped because no amazon_listing.store_id resolved")
+        return []
     for chunk in _chunked(pids, batch_size):
         placeholders = []
-        params = {}
         for idx, pid in enumerate(chunk):
-            params[f"p{idx}"] = int(pid)
             placeholders.append(f":p{idx}")
-        out.extend(
-            _fetch_pid_rows_by_conditions(
-                online_conn,
-                f"al.pid IN ({', '.join(placeholders)})",
-                params,
-                pid_batch_map,
-                f"explicit_pids={chunk}",
+        pid_params = {f"p{idx}": int(pid) for idx, pid in enumerate(chunk)}
+        for store_id in store_ids:
+            params = {"sid": int(store_id), **pid_params}
+            out.extend(
+                _fetch_pid_rows_by_conditions(
+                    online_conn,
+                    f"al.store_id = :sid AND al.pid IN ({', '.join(placeholders)})",
+                    params,
+                    pid_batch_map,
+                    f"explicit_pids store_id={store_id} chunk_size={len(chunk)}",
+                )
             )
-        )
     logger.info(
-        "[ListingTracking] explicit pid fetch resolved rows=%s requested_pids=%s elapsed_sec=%.2f",
+        "[ListingTracking] explicit pid fetch resolved rows=%s requested_pids=%s stores=%s elapsed_sec=%.2f",
         len(out),
         len(pids),
+        len(store_ids),
         time.time() - started,
     )
     return out

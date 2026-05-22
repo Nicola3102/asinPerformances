@@ -111,7 +111,7 @@ def _fetch_matrix_rows(db: Session, store_id: int | None, d0: date, d1: date):
             f"""
             SELECT DATE(session_date) AS sd, DATE(created_at) AS cd, SUM(COALESCE(sessions, 0)) AS s
             FROM {TABLE}
-            WHERE store_id = :sid AND created_at IS NOT NULL
+            WHERE store_id = :sid 
               AND DATE(session_date) >= :d0 AND DATE(session_date) <= :d1
             GROUP BY DATE(session_date), DATE(created_at)
             """
@@ -122,8 +122,7 @@ def _fetch_matrix_rows(db: Session, store_id: int | None, d0: date, d1: date):
             f"""
             SELECT DATE(session_date) AS sd, DATE(created_at) AS cd, SUM(COALESCE(sessions, 0)) AS s
             FROM {TABLE}
-            WHERE created_at IS NOT NULL
-              AND DATE(session_date) >= :d0 AND DATE(session_date) <= :d1
+            WHERE DATE(session_date) >= :d0 AND DATE(session_date) <= :d1
             GROUP BY DATE(session_date), DATE(created_at)
             """
         )
@@ -163,9 +162,8 @@ def _fetch_listing_kpi_online(conn: Connection, since: date, store_id: int | Non
             """
             SELECT COUNT(*) FROM (
               SELECT store_id, asin FROM amazon_listing
-              WHERE asin IS NOT NULL 
+              WHERE store_id = :sid AND asin IS NOT NULL 
                 AND DATE(created_at) >= :since
-                AND store_id = :sid
               GROUP BY store_id, asin
               HAVING SUM(CASE WHEN LOWER(COALESCE(status, '')) = 'active' THEN 1 ELSE 0 END) > 0
             ) t
@@ -323,7 +321,7 @@ def _fetch_new_asin_by_day(db: Session, store_id: int | None, d0: date, d1: date
             f"""
             SELECT created_at, COUNT(*) AS n
             FROM {TABLE}
-            WHERE store_id = :sid AND created_at IS NOT NULL
+            WHERE store_id = :sid 
               AND created_at >= :d0 AND created_at <= :d1
             GROUP BY created_at
             """
@@ -334,8 +332,7 @@ def _fetch_new_asin_by_day(db: Session, store_id: int | None, d0: date, d1: date
             f"""
             SELECT created_at, COUNT(*) AS n
             FROM {TABLE}
-            WHERE created_at IS NOT NULL
-              AND created_at >= :d0 AND created_at <= :d1
+            WHERE created_at >= :d0 AND created_at <= :d1
             GROUP BY created_at
             """
         )

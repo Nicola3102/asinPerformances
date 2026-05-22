@@ -236,7 +236,6 @@ def _fetch_matrix_rows(
                    session_date AS sd, SUM(COALESCE(sessions, 0)) AS s
             FROM {TABLE}
             WHERE open_date IS NOT NULL
-              AND created_at IS NOT NULL
               AND session_date >= :d0 AND session_date < :d1x
               AND session_date >= open_date
               {extra}
@@ -421,22 +420,19 @@ def _fetch_matrix_rows_online(
                 ON av.id = al.variation_id
             WHERE al.asin IS NOT NULL
               AND al.asin <> ''
-              AND al.store_id IS NOT NULL
-              AND al.created_at IS NOT NULL
               AND al.open_date IS NOT NULL
-              AND av.created_at IS NOT NULL
               AND ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
               {extra}
         ) AS nl
         INNER JOIN (
             SELECT d.asin,
                    d.store_id,
-                   DATE(d.`current_date`) AS session_day,
+                   d.`current_date` AS session_day,
                    SUM(COALESCE(d.sessions, 0)) AS sessions
             FROM amazon_sales_and_traffic_daily AS d
             WHERE d.`current_date` >= :d0
               AND d.`current_date` < :d1x
-            GROUP BY d.asin, d.store_id, DATE(d.`current_date`)
+            GROUP BY d.asin, d.store_id, d.`current_date`
         ) AS td
             ON td.asin = nl.asin AND td.store_id = nl.store_id
         WHERE td.session_day >= nl.open_day
@@ -509,10 +505,7 @@ def _cohort_day_asin_breakdown_online(
                 ON av.id = al.variation_id
             WHERE al.asin IS NOT NULL
               AND al.asin <> ''
-              AND al.store_id IS NOT NULL
-              AND al.created_at IS NOT NULL
               AND al.open_date IS NOT NULL
-              AND av.created_at IS NOT NULL
               AND ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
               AND DATE(al.open_date) IN ({ph})
               {extra_nl}
@@ -525,7 +518,7 @@ def _cohort_day_asin_breakdown_online(
             FROM amazon_sales_and_traffic_daily AS d
             WHERE d.`current_date` >= :d0
               AND d.`current_date` < :d1x
-            GROUP BY d.asin, d.store_id, DATE(d.`current_date`)
+            GROUP BY d.asin, d.store_id, d.`current_date`
         ) AS td
             ON td.asin = nl.asin AND td.store_id = nl.store_id
         WHERE td.session_day >= nl.open_day
@@ -595,10 +588,7 @@ def _fetch_matrix_rows_online_bulk(
                 ON av.id = al.variation_id
             WHERE al.asin IS NOT NULL
               AND al.asin <> ''
-              AND al.store_id IS NOT NULL
-              AND al.created_at IS NOT NULL
               AND al.open_date IS NOT NULL
-              AND av.created_at IS NOT NULL
               AND ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
               {extra}
         ) AS nl
@@ -606,8 +596,8 @@ def _fetch_matrix_rows_online_bulk(
             ON d.asin = nl.asin AND d.store_id = nl.store_id
         WHERE d.`current_date` >= :d0
           AND d.`current_date` < :d1x
-          AND DATE(d.`current_date`) >= nl.open_day
-        GROUP BY nl.store_id, nl.open_day, DATE(d.`current_date`)
+          AND d.`current_date` >= nl.open_day
+        GROUP BY nl.store_id, nl.open_day, d.`current_date`
         """
     )
     rows = conn.execute(q, params).fetchall()
@@ -830,9 +820,7 @@ def _fetch_listing_new_refurb_by_day_online(
             SELECT {day_col} AS cd,
                    COUNT(*) AS total_n,
                    COALESCE(SUM(CASE
-                       WHEN al.created_at IS NOT NULL
-                        AND av.created_at IS NOT NULL
-                        AND ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
+                       WHEN ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
                        THEN 1 ELSE 0 END), 0) AS new_n,
                    COALESCE(SUM(CASE
                        WHEN al.created_at IS NULL
@@ -842,10 +830,9 @@ def _fetch_listing_new_refurb_by_day_online(
             FROM amazon_listing al
             LEFT JOIN amazon_variation av ON av.id = al.variation_id
             WHERE {asin_ok}
-              AND al.open_date IS NOT NULL
-              AND al.open_date >= :d0 AND al.open_date < :d1x
               AND al.store_id = :sid
-            GROUP BY {day_col}
+              AND al.open_date >= :d0 AND al.open_date < :d1x 
+            GROUP BY cd
             """
         )
         rows = conn.execute(q, {"d0": d0, "d1x": d1_exclusive, "sid": store_id}).fetchall()
@@ -855,9 +842,7 @@ def _fetch_listing_new_refurb_by_day_online(
             SELECT {day_col} AS cd,
                    COUNT(*) AS total_n,
                    COALESCE(SUM(CASE
-                       WHEN al.created_at IS NOT NULL
-                        AND av.created_at IS NOT NULL
-                        AND ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
+                       WHEN ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
                        THEN 1 ELSE 0 END), 0) AS new_n,
                    COALESCE(SUM(CASE
                        WHEN al.created_at IS NULL
@@ -867,9 +852,8 @@ def _fetch_listing_new_refurb_by_day_online(
             FROM amazon_listing al
             LEFT JOIN amazon_variation av ON av.id = al.variation_id
             WHERE {asin_ok}
-              AND al.open_date IS NOT NULL
               AND al.open_date >= :d0 AND al.open_date < :d1x
-            GROUP BY {day_col}
+            GROUP BY cd
             """
         )
         rows = conn.execute(q, {"d0": d0, "d1x": d1_exclusive}).fetchall()
@@ -912,10 +896,7 @@ def _fetch_new_listing_keys_online(
             ON av.id = al.variation_id
         WHERE al.asin IS NOT NULL
           AND al.asin <> ''
-          AND al.store_id IS NOT NULL
-          AND al.created_at IS NOT NULL
           AND al.open_date IS NOT NULL
-          AND av.created_at IS NOT NULL
           AND ABS(DATEDIFF(DATE(al.created_at), DATE(av.created_at))) < 2
           AND al.open_date >= :d0 AND al.open_date < :d1x
     """
@@ -981,12 +962,10 @@ def _fetch_listing_asin_by_cohort_dates_online(
             f"""
             SELECT {day_col} AS cd, COUNT(*) AS n
             FROM amazon_listing al
-            WHERE {asin_ok}
-              AND al.open_date IS NOT NULL
+            WHERE al.store_id = :sid AND {asin_ok}
               AND al.open_date >= :od_min AND al.open_date < :od_max_x
               AND {day_col} IN ({ph})
-              AND al.store_id = :sid
-            GROUP BY {day_col}
+            GROUP BY cd
             """
         )
         rows = conn.execute(q, params).fetchall()
@@ -996,7 +975,6 @@ def _fetch_listing_asin_by_cohort_dates_online(
             SELECT {day_col} AS cd, COUNT(*) AS n
             FROM amazon_listing al
             WHERE {asin_ok}
-              AND al.open_date IS NOT NULL
               AND al.open_date >= :od_min AND al.open_date < :od_max_x
               AND {day_col} IN ({ph})
             GROUP BY {day_col}
@@ -1073,8 +1051,7 @@ def _fetch_new_asin_by_day(db: Session, store_id: int | None, d0: date, d1: date
             f"""
             SELECT open_date, COUNT(*) AS n
             FROM {TABLE}
-            WHERE store_id = :sid AND open_date IS NOT NULL
-              AND open_date >= :d0 AND open_date <= :d1
+            WHERE store_id = :sid AND open_date >= :d0 AND open_date <= :d1
             GROUP BY open_date
             """
         )
@@ -1084,8 +1061,7 @@ def _fetch_new_asin_by_day(db: Session, store_id: int | None, d0: date, d1: date
             f"""
             SELECT open_date, COUNT(*) AS n
             FROM {TABLE}
-            WHERE open_date IS NOT NULL
-              AND open_date >= :d0 AND open_date <= :d1
+            WHERE AND open_date >= :d0 AND open_date <= :d1
             GROUP BY open_date
             """
         )
@@ -1105,7 +1081,7 @@ def _fetch_total_asin_since(db: Session, store_id: int | None, since: date) -> i
         q = text(
             f"""
             SELECT COUNT(*) FROM {TABLE}
-            WHERE open_date IS NOT NULL AND open_date >= :since AND store_id = :sid
+            WHERE store_id = :sid AND open_date >= :since 
             """
         )
         r = db.execute(q, {"since": since, "sid": store_id}).scalar()
@@ -1113,7 +1089,7 @@ def _fetch_total_asin_since(db: Session, store_id: int | None, since: date) -> i
         q = text(
             f"""
             SELECT COUNT(*) FROM {TABLE}
-            WHERE open_date IS NOT NULL AND open_date >= :since
+            WHERE  open_date >= :since
             """
         )
         r = db.execute(q, {"since": since}).scalar()
@@ -1126,7 +1102,7 @@ def _fetch_active_asin_since(db: Session, store_id: int | None, since: date) -> 
             f"""
             SELECT COUNT(*) FROM (
               SELECT store_id, asin FROM {TABLE}
-              WHERE open_date IS NOT NULL AND open_date >= :since AND store_id = :sid
+              WHERE  open_date >= :since AND store_id = :sid
               GROUP BY store_id, asin
               HAVING SUM(CASE WHEN LOWER(COALESCE(status, '')) = 'active' THEN 1 ELSE 0 END) > 0
             ) t
@@ -1138,7 +1114,7 @@ def _fetch_active_asin_since(db: Session, store_id: int | None, since: date) -> 
             f"""
             SELECT COUNT(*) FROM (
               SELECT store_id, asin FROM {TABLE}
-              WHERE open_date IS NOT NULL AND open_date >= :since
+              WHERE open_date >= :since
               GROUP BY store_id, asin
               HAVING SUM(CASE WHEN LOWER(COALESCE(status, '')) = 'active' THEN 1 ELSE 0 END) > 0
             ) t
@@ -1220,9 +1196,7 @@ def _sum_sessions_by_cohorts_local_batch(
             SELECT asin, COALESCE(pid, 0) AS pid_key, store_id, created_at, open_date AS cd,
                    session_date AS sd, SUM(COALESCE(sessions, 0)) AS s
             FROM {TABLE}
-            WHERE open_date IS NOT NULL
-              AND created_at IS NOT NULL
-              AND open_date IN ({ph})
+            WHERE open_date IN ({ph})
               AND session_date >= open_date
               AND session_date <= DATE_ADD(open_date, INTERVAL {nd} DAY)
               {extra}
@@ -1235,8 +1209,7 @@ def _sum_sessions_by_cohorts_local_batch(
             SELECT open_date AS cd, session_date AS sd,
                    SUM(COALESCE(sessions, 0)) AS s
             FROM {TABLE}
-            WHERE open_date IS NOT NULL
-              AND open_date IN ({ph})
+            WHERE open_date IN ({ph})
               AND session_date >= open_date
               AND session_date <= DATE_ADD(open_date, INTERVAL {nd} DAY)
               {extra}
@@ -1299,9 +1272,7 @@ def _cohort_day_asin_breakdown_batch(
             SELECT asin, COALESCE(pid, 0) AS pid_key, store_id, created_at, open_date AS cd,
                    session_date AS sd, SUM(COALESCE(sessions, 0)) AS s
             FROM {TABLE}
-            WHERE open_date IS NOT NULL
-              AND created_at IS NOT NULL
-              AND open_date IN ({ph})
+            WHERE open_date IN ({ph})
               AND session_date >= open_date
               AND session_date <= DATE_ADD(open_date, INTERVAL {nd} DAY)
               {extra}
@@ -1335,10 +1306,8 @@ def _cohort_day_asin_breakdown_batch(
             SELECT asin AS asin_b, store_id, open_date AS cd, session_date AS sd,
                    SUM(COALESCE(sessions, 0)) AS s
             FROM {TABLE}
-            WHERE open_date IS NOT NULL
-              AND asin IS NOT NULL
+            WHERE asin IS NOT NULL
               AND asin <> ''
-              AND store_id IS NOT NULL
               AND open_date IN ({ph})
               AND session_date >= open_date
               AND session_date <= DATE_ADD(open_date, INTERVAL {nd} DAY)

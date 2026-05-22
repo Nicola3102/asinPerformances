@@ -151,7 +151,6 @@ def fetch_profit_store_ids(
         FROM order_profit op
         WHERE op.invoice_date >= :start_date
           AND op.invoice_date <= :end_date
-          AND op.store_id IS NOT NULL
         ORDER BY op.store_id ASC
         """
     )
@@ -195,7 +194,6 @@ def fetch_profit_summary(
                 FROM order_profit op
                 WHERE op.invoice_date >= :start_date
                   AND op.invoice_date <= :end_date
-                  AND op.order_id IS NOT NULL
                   AND op.order_id <> ''
                   {mature_store_filter}
                 """
@@ -210,7 +208,6 @@ def fetch_profit_summary(
                     FROM order_profit op
                     WHERE op.invoice_date >= :start_date
                       AND op.invoice_date <= :end_date
-                      AND op.order_id IS NOT NULL
                       AND op.order_id <> ''
                       {mature_store_filter}
                     GROUP BY op.store_id, op.order_id
@@ -226,8 +223,7 @@ def fetch_profit_summary(
                     INNER JOIN scoped_orders so
                         ON so.store_id = oi.store_id
                        AND so.amazon_order_id = oi.amazon_order_id
-                    WHERE oi.amazon_order_id IS NOT NULL
-                      AND oi.amazon_order_id <> ''
+                    WHERE oi.amazon_order_id <> ''
                 ) scoped_items
                     ON scoped_items.store_id = r.store_id
                    AND scoped_items.amazon_order_id = r.amazon_order_id
@@ -307,7 +303,6 @@ def fetch_profit_weekly_series(
             FROM order_profit op
             WHERE op.invoice_date >= :start_date
               AND op.invoice_date <= :end_date
-              AND op.order_id IS NOT NULL
               AND op.order_id <> ''
               {store_filter}
         ),

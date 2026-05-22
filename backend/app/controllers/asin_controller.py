@@ -1241,13 +1241,13 @@ def get_group_f_candidates(
                 search_max = conn.execute(
                     text(
                         "SELECT MAX(week_no) FROM amazon_search_data"
-                        " WHERE store_id IN (1,7,12,25) AND week_no IS NOT NULL"
+                        " WHERE store_id IN (1,7,12,25) "
                     )
                 ).scalar()
                 traffic_max = conn.execute(
                     text(
                         "SELECT MAX(week_no) FROM amazon_sales_traffic"
-                        " WHERE store_id IN (1,7,12,25) AND week_no IS NOT NULL"
+                        " WHERE store_id IN (1,7,12,25)"
                     )
                 ).scalar()
             cands = [int(w) for w in (search_max, traffic_max) if w is not None]
